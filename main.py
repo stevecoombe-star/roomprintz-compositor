@@ -21,12 +21,36 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Use your actual model name; if you're calling Nano Banana Pro via "gemini-2.5-flash-image"
-# or "gemini-3-pro-image-preview", you might keep this as-is or swap it for your tuned model ID.
-MODEL_NAME = "gemini-3-pro-image-preview"
+# Default model: Nano Banana Pro
+DEFAULT_MODEL_NAME = "gemini-3-pro-image-preview"
 
 # Toggle prompt logging with env var: DEBUG_ROOMPRINTZ_PROMPT=1
 DEBUG_ROOMPRINTZ_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_PROMPT", "1") == "1"
+
+
+def resolve_model_name(model_version: Optional[str]) -> str:
+  """
+  Map a simple modelVersion string from the frontend into a concrete Gemini model ID.
+
+  Expected values from the frontend:
+  - "gemini-3"   -> "gemini-3-pro-image-preview" (Nano Banana Pro, default)
+  - "gemini-2.5" -> "gemini-2.5-flash-image"    (OG Nano Banana)
+
+  If a full model ID is passed, we just use it as-is.
+  """
+  if not model_version or model_version.strip() == "":
+      return DEFAULT_MODEL_NAME
+
+  v = model_version.strip().lower()
+
+  if v in ("gemini-3", "gemini-3-pro", "gemini-3-pro-image-preview"):
+      return "gemini-3-pro-image-preview"
+
+  if v in ("gemini-2.5", "gemini-2.5-flash-image"):
+      return "gemini-2.5-flash-image"
+
+  # Fallback: assume caller passed a valid full model name
+  return model_version
 
 
 # ---------- PROMPT BUILDING (ROOMPRINTZ ENGINE) ----------
@@ -126,6 +150,7 @@ ROOM_TYPE_HINTS = {
     "bathroom": "This is a bathroom. It must remain a bathroom with fixtures like sink, toilet, and/or shower or tub.",
     "dining-room": "This is a dining room. It should remain a dining room with a dining table as a main element, not a bedroom or living room.",
     "office": "This is a home office / study. It must remain an office space, not a bedroom or living room.",
+    "office-den": "This is a home office / den. It must remain an office / den space, not a bedroom or living room.",  # NEW to match front-end
     "other": "This room has a specific existing function. Preserve that function and do not transform it into a different type of room.",
 }
 
@@ -292,6 +317,9 @@ class StageRoomRequest(BaseModel):
     # Room type (optional; e.g. "living-room", "bedroom", "kitchen", etc.)
     roomType: Optional[str] = None
 
+    # NEW: model version selector from frontend ("gemini-3" | "gemini-2.5" | full model ID)
+    modelVersion: Optional[str] = None
+
 
 class StageRoomResponse(BaseModel):
     imageUrl: str  # data URL (or real URL) to staged / processed result
@@ -309,7 +337,7 @@ StyleId = Literal[
 ]
 
 
-def call_gemini_with_prompt(image_bytes: bytes, prompt: str) -> bytes:
+def call_gemini_with_prompt(image_bytes: bytes, prompt: str, model_name: str) -> bytes:
     """
     Core helper that calls Gemini / Nano Banana with a prompt + a single image.
     Returns raw bytes of the generated image (PNG).
@@ -329,13 +357,13 @@ def call_gemini_with_prompt(image_bytes: bytes, prompt: str) -> bytes:
         if DEBUG_ROOMPRINTZ_PROMPT:
             print(
                 "[call_gemini_with_prompt] Calling model:",
-                MODEL_NAME,
+                model_name,
                 "| PNG bytes:",
                 len(png_bytes),
             )
 
         response = client.models.generate_content(
-            model=MODEL_NAME,
+            model=model_name,
             contents=[
                 prompt,
                 types.Part(
@@ -387,6 +415,7 @@ def run_fusion(
     repaint_walls: bool,
     flooring_preset: Optional[str],
     room_type: Optional[str],
+    model_name: str,
 ) -> bytes:
     prompt = build_roomprintz_prompt(
         enhance_photo=enhance_photo,
@@ -400,7 +429,7 @@ def run_fusion(
         room_type=room_type,
     )
 
-    return call_gemini_with_prompt(image_bytes, prompt)
+    return call_gemini_with_prompt(image_bytes, prompt, model_name)
 
 
 def run_photo_tools(
@@ -413,6 +442,7 @@ def run_photo_tools(
     repaint_walls: bool,
     flooring_preset: Optional[str],
     room_type: Optional[str],
+    model_name: str,
 ) -> bytes:
     return run_fusion(
         image_bytes=image_bytes,
@@ -425,6 +455,7 @@ def run_photo_tools(
         repaint_walls=repaint_walls,
         flooring_preset=flooring_preset,
         room_type=room_type,
+        model_name=model_name,
     )
 
 
@@ -470,6 +501,9 @@ async def stage_room(req: StageRoomRequest):
             detail="No photo tools or styleId provided; nothing to do.",
         )
 
+    # Decide which Gemini / Nano Banana model to use based on modelVersion
+    model_name = resolve_model_name(req.modelVersion)
+
     # 1) Decode base64 input
     try:
         image_bytes = base64.b64decode(req.imageBase64)
@@ -490,6 +524,8 @@ async def stage_room(req: StageRoomRequest):
             "repaintWalls": req.repaintWalls,
             "flooringPreset": req.flooringPreset,
             "roomType": req.roomType,
+            "modelVersion": req.modelVersion,
+            "modelName": model_name,
         },
     )
 
@@ -506,6 +542,7 @@ async def stage_room(req: StageRoomRequest):
                 repaint_walls=req.repaintWalls,
                 flooring_preset=req.flooringPreset,
                 room_type=req.roomType,
+                model_name=model_name,
             )
         else:
             staged_bytes = run_photo_tools(
@@ -518,6 +555,7 @@ async def stage_room(req: StageRoomRequest):
                 repaint_walls=req.repaintWalls,
                 flooring_preset=req.flooringPreset,
                 room_type=req.roomType,
+                model_name=model_name,
             )
     except Exception as e:
         print("[/stage-room] Error in processing:", e)
