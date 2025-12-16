@@ -33,11 +33,13 @@ DEBUG_ROOMPRINTZ_RATIO = os.getenv("DEBUG_ROOMPRINTZ_RATIO", "0") == "1"
 # Optional: cap input size to keep cost + latency down (resize down only; never upscale)
 # Set to "" to disable.
 MAX_INPUT_LONG_EDGE = os.getenv("ROOMPRINTZ_MAX_INPUT_LONG_EDGE", "2048").strip()
-MAX_INPUT_LONG_EDGE_INT = int(MAX_INPUT_LONG_EDGE) if MAX_INPUT_LONG_EDGE.isdigit() else None
+MAX_INPUT_LONG_EDGE_INT = (
+    int(MAX_INPUT_LONG_EDGE) if MAX_INPUT_LONG_EDGE.isdigit() else None
+)
 
-# Gemini 2.5 Flash historically defaults to 1:1. By default, we enforce 1:1 for that model
-# in FRESH upload normalization only.
-ALLOW_FLASH_NON_SQUARE = os.getenv("ROOMPRINTZ_ALLOW_FLASH_NON_SQUARE", "0") == "1"
+# ✅ CHANGE: beta testing wants ALL ratios for Gemini 2.5 Flash.
+# We keep the env var, but default it to "1" so Flash is NOT forced to 1:1.
+ALLOW_FLASH_NON_SQUARE = os.getenv("ROOMPRINTZ_ALLOW_FLASH_NON_SQUARE", "1") == "1"
 
 
 def resolve_model_name(model_version: Optional[str]) -> str:
@@ -171,7 +173,8 @@ def normalize_image_bytes_for_ratio(
     - requested_ratio None/"auto" => choose closest preset from uploaded image ratio.
     - Fill/Crop to that ratio with upward bias.
     - Optionally resize down.
-    - For gemini-2.5-flash-image, optionally enforce 1:1 unless ALLOW_FLASH_NON_SQUARE=1.
+    - For gemini-2.5-flash-image, we no longer force 1:1 (beta wants all ratios),
+      unless ROOMPRINTZ_ALLOW_FLASH_NON_SQUARE is explicitly set to 0.
     """
     img = _safe_open_image(image_bytes)
     w, h = img.size
@@ -190,13 +193,14 @@ def normalize_image_bytes_for_ratio(
         else:
             chosen = normalized
 
+    # Guardrail (opt-out only now):
     if (
         model_name.strip().lower() == "gemini-2.5-flash-image"
         and chosen != "1:1"
         and not ALLOW_FLASH_NON_SQUARE
     ):
         print(
-            "[normalize_image_bytes_for_ratio] Forcing aspect ratio to 1:1 for gemini-2.5-flash-image (reliability)."
+            "[normalize_image_bytes_for_ratio] Forcing aspect ratio to 1:1 for gemini-2.5-flash-image (ROOMPRINTZ_ALLOW_FLASH_NON_SQUARE=0)."
         )
         chosen = "1:1"
 
@@ -656,6 +660,8 @@ async def stage_room(req: StageRoomRequest):
             "requestedAspectRatio": req.aspectRatio,
             "appliedAspectRatio": applied_ratio if applied_ratio else "(passthrough)",
             "sentAspectRatio": aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
+            "allowFlashNonSquare": ALLOW_FLASH_NON_SQUARE,
+            "maxInputLongEdge": MAX_INPUT_LONG_EDGE_INT,
         },
     )
 
