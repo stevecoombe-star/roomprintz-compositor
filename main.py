@@ -27,6 +27,7 @@ DEFAULT_MODEL_NAME = "gemini-3-pro-image-preview"
 # Toggle prompt logging with env var: DEBUG_ROOMPRINTZ_PROMPT=1
 DEBUG_ROOMPRINTZ_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_PROMPT", "1") == "1"
 
+# Toggle ratio debug return
 DEBUG_ROOMPRINTZ_RATIO = os.getenv("DEBUG_ROOMPRINTZ_RATIO", "0") == "1"
 
 # Optional: cap input size to keep cost + latency down (resize down only; never upscale)
@@ -34,8 +35,8 @@ DEBUG_ROOMPRINTZ_RATIO = os.getenv("DEBUG_ROOMPRINTZ_RATIO", "0") == "1"
 MAX_INPUT_LONG_EDGE = os.getenv("ROOMPRINTZ_MAX_INPUT_LONG_EDGE", "2048").strip()
 MAX_INPUT_LONG_EDGE_INT = int(MAX_INPUT_LONG_EDGE) if MAX_INPUT_LONG_EDGE.isdigit() else None
 
-# Gemini 2.5 Flash historically defaults to 1:1. By default, we enforce 1:1 for that model.
-# Set ROOMPRINTZ_ALLOW_FLASH_NON_SQUARE=1 if you want to allow other ratios (not recommended).
+# Gemini 2.5 Flash historically defaults to 1:1. By default, we enforce 1:1 for that model
+# in FRESH upload normalization only.
 ALLOW_FLASH_NON_SQUARE = os.getenv("ROOMPRINTZ_ALLOW_FLASH_NON_SQUARE", "0") == "1"
 
 
@@ -60,7 +61,6 @@ def resolve_model_name(model_version: Optional[str]) -> str:
     if v in ("gemini-2.5", "gemini-2.5-flash-image"):
         return "gemini-2.5-flash-image"
 
-    # Fallback: assume caller passed a valid full model name
     return model_version
 
 
@@ -89,7 +89,7 @@ def _safe_open_image(image_bytes: bytes) -> Image.Image:
 def choose_closest_aspect_ratio(width: int, height: int) -> str:
     """Pick the closest preset ratio to the uploaded image's native ratio."""
     if width <= 0 or height <= 0:
-        return "4:3"  # safe default
+        return "4:3"
     native = width / height
 
     best = "4:3"
@@ -130,26 +130,21 @@ def crop_to_aspect_ratio_fill(img: Image.Image, target_ratio: float) -> Image.Im
 
     current_ratio = w / h
 
-    # Already close enough (tiny floating error tolerance)
     if abs(current_ratio - target_ratio) < 1e-6:
         return img
 
     if current_ratio > target_ratio:
-        # Too wide -> crop width
+        # Too wide -> crop width (center)
         new_w = int(round(h * target_ratio))
         new_w = min(new_w, w)
         left = (w - new_w) // 2
         right = left + new_w
-        top = 0
-        bottom = h
-        return img.crop((left, top, right, bottom))
+        return img.crop((left, 0, right, h))
 
     # Too tall -> crop height (upward bias)
     new_h = int(round(w / target_ratio))
     new_h = min(new_h, h)
 
-    # Upward bias: keep more ceiling by cropping more from the bottom.
-    # bias=0.65 means the crop window starts a bit higher than center.
     bias = 0.65
     max_top = h - new_h
     top = int(round(max_top * (1.0 - bias)))
@@ -172,42 +167,57 @@ def normalize_image_bytes_for_ratio(
     """
     Returns (normalized_png_bytes, applied_ratio_str).
 
-    Behavior:
+    Fresh upload behavior:
     - requested_ratio None/"auto" => choose closest preset from uploaded image ratio.
-    - then Fill/Crop to that ratio with upward bias.
-    - optionally resize down to keep cost reasonable.
+    - Fill/Crop to that ratio with upward bias.
+    - Optionally resize down.
     - For gemini-2.5-flash-image, optionally enforce 1:1 unless ALLOW_FLASH_NON_SQUARE=1.
     """
     img = _safe_open_image(image_bytes)
     w, h = img.size
 
-    # Determine target ratio
     ratio_choice = (requested_ratio or "auto").strip().lower()
 
     if ratio_choice == "auto":
         chosen = choose_closest_aspect_ratio(w, h)
     else:
-        # normalize variants like "16x9"
         normalized = ratio_choice.replace("x", ":")
         if normalized not in RATIO_MAP:
-            print(f"[normalize_image_bytes_for_ratio] Unknown aspectRatio '{requested_ratio}', defaulting to auto.")
+            print(
+                f"[normalize_image_bytes_for_ratio] Unknown aspectRatio '{requested_ratio}', defaulting to auto."
+            )
             chosen = choose_closest_aspect_ratio(w, h)
         else:
             chosen = normalized
 
-    # Guardrails for Gemini 2.5 Flash (optional)
-    if (model_name.strip().lower() == "gemini-2.5-flash-image") and (chosen != "1:1") and (not ALLOW_FLASH_NON_SQUARE):
-        print("[normalize_image_bytes_for_ratio] Forcing aspect ratio to 1:1 for gemini-2.5-flash-image (reliability).")
+    if (
+        model_name.strip().lower() == "gemini-2.5-flash-image"
+        and chosen != "1:1"
+        and not ALLOW_FLASH_NON_SQUARE
+    ):
+        print(
+            "[normalize_image_bytes_for_ratio] Forcing aspect ratio to 1:1 for gemini-2.5-flash-image (reliability)."
+        )
         chosen = "1:1"
 
-    # Fill/Crop
     target_ratio = RATIO_MAP[chosen]
     cropped = crop_to_aspect_ratio_fill(img, target_ratio)
-
-    # Resize down (optional) AFTER crop
     cropped = resize_down_if_needed(cropped, MAX_INPUT_LONG_EDGE_INT)
 
     return image_to_png_bytes(cropped), chosen
+
+
+def prepare_passthrough_png_bytes(image_bytes: bytes) -> bytes:
+    """
+    Continuation mode:
+    - Do NOT normalize aspect ratio
+    - Do NOT crop
+    - Do optionally resize down (uniform) to cap cost/latency
+    - Always send PNG
+    """
+    img = _safe_open_image(image_bytes)
+    img = resize_down_if_needed(img, MAX_INPUT_LONG_EDGE_INT)
+    return image_to_png_bytes(img)
 
 
 # ---------- PROMPT BUILDING (ROOMPRINTZ ENGINE) ----------
@@ -431,54 +441,42 @@ class HealthResponse(BaseModel):
 
 
 class StageRoomRequest(BaseModel):
-    imageBase64: str  # base64-encoded JPEG/PNG
+    imageBase64: str
     styleId: Optional[str] = None
 
-    # Phase 1 tools
     enhancePhoto: bool = False
     cleanupRoom: bool = False
     repairDamage: bool = False
     emptyRoom: bool = False
     renovateRoom: bool = False
 
-    # Phase 2 surfaces
     repaintWalls: bool = False
     flooringPreset: Optional[str] = None
 
-    # Room type
     roomType: Optional[str] = None
-
-    # Model selector
     modelVersion: Optional[str] = None
 
-    # NEW: aspect ratio control (default: "auto")
+    # Used only on fresh uploads
     aspectRatio: Optional[AspectRatio] = "auto"
+
+    # ✅ Continuation mode (Continue from this image)
+    isContinuation: bool = False
 
 
 class StageRoomResponse(BaseModel):
     imageUrl: str
-    appliedAspectRatio: Optional[str] = None  # DEBUG ONLY
-
-
-StyleId = Literal[
-    "modern-luxury",
-    "japandi",
-    "scandinavian",
-    "coastal",
-    "urban-loft",
-    "farmhouse",
-]
+    appliedAspectRatio: Optional[str] = None  # debug only
 
 
 def call_gemini_with_prompt(
     image_png_bytes: bytes,
     prompt: str,
     model_name: str,
-    aspect_ratio: str,
+    aspect_ratio: Optional[str] = None,
 ) -> bytes:
     """
-    Core helper that calls Gemini / Nano Banana with a prompt + a single image.
-    Returns raw bytes of the generated image (PNG).
+    If aspect_ratio is None, we OMIT image_config.aspect_ratio entirely
+    (premium continuation behavior).
     """
     try:
         if DEBUG_ROOMPRINTZ_PROMPT:
@@ -488,8 +486,13 @@ def call_gemini_with_prompt(
                 "| Input PNG bytes:",
                 len(image_png_bytes),
                 "| aspect_ratio:",
-                aspect_ratio,
+                aspect_ratio if aspect_ratio else "(omitted)",
             )
+
+        config_kwargs = {"response_modalities": ["IMAGE"]}
+
+        if aspect_ratio:
+            config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio)
 
         response = client.models.generate_content(
             model=model_name,
@@ -502,12 +505,7 @@ def call_gemini_with_prompt(
                     )
                 ),
             ],
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(
-                    aspect_ratio=aspect_ratio,
-                ),
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
         )
 
         try:
@@ -516,17 +514,15 @@ def call_gemini_with_prompt(
             out_bytes = part.inline_data.data
         except Exception as e:
             print("[call_gemini_with_prompt] Failed to extract image bytes:", e)
-            raise RuntimeError(
-                "Could not extract generated image from Nano Banana / Gemini response"
-            )
+            raise RuntimeError("Could not extract generated image from Gemini response")
 
         if not out_bytes:
-            raise RuntimeError("Nano Banana / Gemini returned empty image bytes")
+            raise RuntimeError("Gemini returned empty image bytes")
 
         return out_bytes
 
     except Exception as e:
-        print("[call_gemini_with_prompt] Error calling Nano Banana / Gemini:", e)
+        print("[call_gemini_with_prompt] Error calling Gemini:", e)
         raise
 
 
@@ -542,7 +538,7 @@ def run_fusion(
     flooring_preset: Optional[str],
     room_type: Optional[str],
     model_name: str,
-    aspect_ratio: str,
+    aspect_ratio: Optional[str],
 ) -> bytes:
     prompt = build_roomprintz_prompt(
         enhance_photo=enhance_photo,
@@ -570,7 +566,7 @@ def run_photo_tools(
     flooring_preset: Optional[str],
     room_type: Optional[str],
     model_name: str,
-    aspect_ratio: str,
+    aspect_ratio: Optional[str],
 ) -> bytes:
     return run_fusion(
         image_png_bytes=image_png_bytes,
@@ -619,60 +615,54 @@ async def stage_room(req: StageRoomRequest):
     wants_staging = bool(req.styleId and req.styleId.strip())
 
     if not wants_photo_tools and not wants_staging:
-        raise HTTPException(
-            status_code=400,
-            detail="No photo tools or styleId provided; nothing to do.",
-        )
+        raise HTTPException(status_code=400, detail="Nothing to do.")
 
-    # Decide model
     model_name = resolve_model_name(req.modelVersion)
 
-    # 1) Decode base64 input
     try:
         raw_bytes = base64.b64decode(req.imageBase64)
     except Exception as e:
         print("[/stage-room] Failed to decode base64:", e)
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
 
-    # 2) Normalize to chosen aspect ratio (Fill/Crop) AND return applied ratio
+    applied_ratio: Optional[str] = None
+    aspect_ratio_to_send: Optional[str] = None
+
     try:
-        normalized_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
-            raw_bytes,
-            requested_ratio=req.aspectRatio,
-            model_name=model_name,
-        )
+        if req.isContinuation:
+            image_png_bytes = prepare_passthrough_png_bytes(raw_bytes)
+            applied_ratio = None
+            aspect_ratio_to_send = None  # OMIT aspect_ratio to avoid drift
+        else:
+            image_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
+                raw_bytes,
+                requested_ratio=req.aspectRatio,
+                model_name=model_name,
+            )
+            aspect_ratio_to_send = applied_ratio
     except Exception as e:
-        print("[/stage-room] Error normalizing image:", e)
-        raise HTTPException(status_code=400, detail="Could not process uploaded image")
+        print("[/stage-room] Error preparing image:", e)
+        raise HTTPException(status_code=400, detail="Could not process image")
 
     print(
         "[/stage-room] Received request:",
         {
             "styleId": req.styleId,
             "raw_bytes_len": len(raw_bytes),
-            "normalized_png_len": len(normalized_png_bytes),
-            "enhancePhoto": req.enhancePhoto,
-            "cleanupRoom": req.cleanupRoom,
-            "repairDamage": req.repairDamage,
-            "emptyRoom": req.emptyRoom,
-            "renovateRoom": req.renovateRoom,
-            "repaintWalls": req.repaintWalls,
-            "flooringPreset": req.flooringPreset,
-            "roomType": req.roomType,
+            "input_png_len": len(image_png_bytes),
+            "isContinuation": req.isContinuation,
             "modelVersion": req.modelVersion,
             "modelName": model_name,
             "requestedAspectRatio": req.aspectRatio,
-            "appliedAspectRatio": applied_ratio,
-            "allowFlashNonSquare": ALLOW_FLASH_NON_SQUARE,
-            "maxInputLongEdge": MAX_INPUT_LONG_EDGE_INT,
+            "appliedAspectRatio": applied_ratio if applied_ratio else "(passthrough)",
+            "sentAspectRatio": aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
         },
     )
 
-    # 3) Run processing
     try:
         if wants_staging:
             out_bytes = run_fusion(
-                image_png_bytes=normalized_png_bytes,
+                image_png_bytes=image_png_bytes,
                 style_id=req.styleId,
                 enhance_photo=req.enhancePhoto,
                 cleanup_room=req.cleanupRoom,
@@ -683,11 +673,11 @@ async def stage_room(req: StageRoomRequest):
                 flooring_preset=req.flooringPreset,
                 room_type=req.roomType,
                 model_name=model_name,
-                aspect_ratio=applied_ratio,
+                aspect_ratio=aspect_ratio_to_send,
             )
         else:
             out_bytes = run_photo_tools(
-                image_png_bytes=normalized_png_bytes,
+                image_png_bytes=image_png_bytes,
                 enhance_photo=req.enhancePhoto,
                 cleanup_room=req.cleanupRoom,
                 repair_damage=req.repairDamage,
@@ -697,7 +687,7 @@ async def stage_room(req: StageRoomRequest):
                 flooring_preset=req.flooringPreset,
                 room_type=req.roomType,
                 model_name=model_name,
-                aspect_ratio=applied_ratio,
+                aspect_ratio=aspect_ratio_to_send,
             )
     except Exception as e:
         print("[/stage-room] Error in processing:", e)
@@ -706,9 +696,10 @@ async def stage_room(req: StageRoomRequest):
     if not out_bytes:
         raise HTTPException(status_code=500, detail="Fusion returned empty image")
 
-    # 4) Return as data URL
     data_url = make_data_url(out_bytes, mime_type="image/png")
-    return StageRoomResponse(
-        imageUrl=data_url,
-        appliedAspectRatio=applied_ratio if DEBUG_ROOMPRINTZ_RATIO else None,
-    )
+
+    debug_ratio: Optional[str] = None
+    if DEBUG_ROOMPRINTZ_RATIO:
+        debug_ratio = "passthrough" if req.isContinuation else (applied_ratio or "auto")
+
+    return StageRoomResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
