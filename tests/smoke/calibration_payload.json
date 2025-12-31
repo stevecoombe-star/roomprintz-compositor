@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "image": {
+    "naturalWidth": 1600,
+    "naturalHeight": 1200
+  },
+  "derived": {
+    "heightInInches": 96,
+    "segmentInInches": 60
+  },
+  "measurements": [
+    {
+      "id": "seg_test_1",
+      "kind": "segment",
+      "p1": { "x": 0.28, "y": 0.62 },
+      "p2": { "x": 0.62, "y": 0.62 },
+      "valueInInches": 60,
+      "label": "Window width",
+      "meta": {
+        "segmentType": "window_width",
+        "segmentOtherText": ""
+      }
+    }
+  ],
+  "meta": {
+    "createdAtIso": "2025-12-29T00:00:00.000Z",
+    "updatedAtIso": "2025-12-29T00:00:00.000Z"
+  }
+}
