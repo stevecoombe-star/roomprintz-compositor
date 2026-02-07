@@ -1,11 +1,17 @@
 import os
 import io
 import base64
-from typing import Literal, Optional, Tuple, Dict
+from typing import Literal, Optional, Tuple, Dict, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from PIL import Image
+try:
+    from PIL import ImageDraw
+    _HAS_IMAGE_DRAW = True
+except Exception:
+    ImageDraw = None
+    _HAS_IMAGE_DRAW = False
 
 from google import genai
 from google.genai import types
@@ -472,6 +478,28 @@ class StageRoomResponse(BaseModel):
     appliedAspectRatio: Optional[str] = None  # debug only
 
 
+class VibodePlacement(BaseModel):
+    nodeId: str
+    skuId: Optional[str] = None
+    skuImageBase64: str
+    cxPx: float
+    cyPx: float
+    rPx: Optional[float] = None
+
+
+class VibodeComposeRequest(BaseModel):
+    roomImageBase64: str
+    placements: List[VibodePlacement]
+    enhancePhoto: bool = True
+    modelVersion: Optional[str] = None
+    aspectRatio: Optional[AspectRatio] = "auto"
+
+
+class VibodeComposeResponse(BaseModel):
+    imageUrl: str
+    appliedAspectRatio: Optional[str] = None
+
+
 def call_gemini_with_prompt(
     image_png_bytes: bytes,
     prompt: str,
@@ -593,6 +621,172 @@ def make_data_url(image_bytes: bytes, mime_type: str = "image/png") -> str:
     return f"data:{mime_type};base64,{b64}"
 
 
+def _decode_base64_image(data: str) -> bytes:
+    try:
+        trimmed = data.strip()
+        if trimmed.startswith("data:") and "," in trimmed:
+            trimmed = trimmed.split(",", 1)[1]
+        return base64.b64decode(trimmed)
+    except Exception as e:
+        print("[_decode_base64_image] Failed to decode base64:", e)
+        raise
+
+
+def _draw_red_marker_pixels(img: Image.Image, cx: int, cy: int, r: int) -> None:
+    pixels = img.load()
+    if pixels is None:
+        return
+    width, height = img.size
+    thickness = 3
+    min_x = max(0, cx - r - thickness)
+    max_x = min(width - 1, cx + r + thickness)
+    min_y = max(0, cy - r - thickness)
+    max_y = min(height - 1, cy + r + thickness)
+    r_inner = max(0, r - thickness)
+    r_outer = r + thickness
+    r_inner_sq = r_inner * r_inner
+    r_outer_sq = r_outer * r_outer
+    for y in range(min_y, max_y + 1):
+        dy = y - cy
+        dy_sq = dy * dy
+        for x in range(min_x, max_x + 1):
+            dx = x - cx
+            dist_sq = dx * dx + dy_sq
+            if r_inner_sq <= dist_sq <= r_outer_sq:
+                pixels[x, y] = (255, 0, 0)
+
+
+def draw_red_markers_overlay(image_png_bytes: bytes, placements: List[VibodePlacement]) -> bytes:
+    img = _safe_open_image(image_png_bytes)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    width, height = img.size
+    max_radius = max(1, min(width, height) // 4)
+    if _HAS_IMAGE_DRAW and ImageDraw is not None:
+        draw = ImageDraw.Draw(img)
+        for placement in placements:
+            radius = int(round(placement.rPx)) if placement.rPx else 60
+            radius = max(20, radius)
+            radius = min(radius, max_radius)
+            cx = int(round(placement.cxPx))
+            cy = int(round(placement.cyPx))
+            cx = max(0, min(cx, width - 1))
+            cy = max(0, min(cy, height - 1))
+            bbox = (cx - radius, cy - radius, cx + radius, cy + radius)
+            draw.ellipse(bbox, outline=(255, 0, 0), width=6)
+    else:
+        for placement in placements:
+            radius = int(round(placement.rPx)) if placement.rPx else 60
+            radius = max(20, radius)
+            radius = min(radius, max_radius)
+            cx = int(round(placement.cxPx))
+            cy = int(round(placement.cyPx))
+            cx = max(0, min(cx, width - 1))
+            cy = max(0, min(cy, height - 1))
+            _draw_red_marker_pixels(img, cx, cy, radius)
+    return image_to_png_bytes(img)
+
+
+def prepare_sku_png_bytes(image_bytes: bytes) -> bytes:
+    img = _safe_open_image(image_bytes)
+    img = resize_down_if_needed(img, MAX_INPUT_LONG_EDGE_INT)
+    return image_to_png_bytes(img)
+
+
+def build_vibode_compose_prompt(
+    placements: List[VibodePlacement],
+    enhance_photo: bool,
+) -> str:
+    lines = [
+        "You are a professional real-estate photo editor.",
+        "",
+        "You are given multiple images in this exact order:",
+        "1) Image 1 is the room photo with one or more red circular marker(s).",
+        "2) Each subsequent image is a single furniture item to insert, in the same order as the placements list.",
+        "The 1st furniture image matches the 1st marker, the 2nd matches the 2nd, and so on.",
+        "",
+        "Strict rules:",
+        "- Place each furniture item at its corresponding red marker location on the floor.",
+        "- Do not move, resize, or rotate the room camera perspective.",
+        "- Do not change existing walls, windows, doors, floors, or lighting.",
+        "- Do not invent extra furniture or decor; only insert the provided items.",
+        "- Add realistic contact shadows so items sit naturally on the floor.",
+        "- Do not add text, logos, or watermarks.",
+    ]
+    if enhance_photo:
+        lines += [
+            "",
+            "Enhance photo quality subtly:",
+            "- Correct white balance and exposure without changing room appearance.",
+            "- Improve clarity and reduce noise while staying photorealistic.",
+        ]
+    if DEBUG_ROOMPRINTZ_PROMPT:
+        print("\n===== VIBODE COMPOSE PROMPT SENT TO GEMINI =====\n")
+        print("\n".join(lines))
+        print("\n=================================================\n")
+    return "\n".join(lines)
+
+
+def call_gemini_multimodal(
+    prompt: str,
+    room_overlay_png_bytes: bytes,
+    sku_png_bytes_list: List[bytes],
+    model_name: str,
+    aspect_ratio: Optional[str] = None,
+) -> bytes:
+    try:
+        if DEBUG_ROOMPRINTZ_PROMPT:
+            print(
+                "[call_gemini_multimodal] Calling model:",
+                model_name,
+                "| Room overlay bytes:",
+                len(room_overlay_png_bytes),
+                "| sku_count:",
+                len(sku_png_bytes_list),
+                "| aspect_ratio:",
+                aspect_ratio if aspect_ratio else "(omitted)",
+            )
+        config_kwargs = {"response_modalities": ["IMAGE"]}
+        if aspect_ratio:
+            config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio)
+        contents = [
+            types.Part(text=prompt),
+            types.Part(
+                inline_data=types.Blob(
+                    data=room_overlay_png_bytes,
+                    mime_type="image/png",
+                )
+            ),
+        ]
+        for sku_bytes in sku_png_bytes_list:
+            contents.append(
+                types.Part(
+                    inline_data=types.Blob(
+                        data=sku_bytes,
+                        mime_type="image/png",
+                    )
+                )
+            )
+        response = client.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+        try:
+            candidate = response.candidates[0]
+            part = candidate.content.parts[0]
+            out_bytes = part.inline_data.data
+        except Exception as e:
+            print("[call_gemini_multimodal] Failed to extract image bytes:", e)
+            raise RuntimeError("Could not extract generated image from Gemini response")
+        if not out_bytes:
+            raise RuntimeError("Gemini returned empty image bytes")
+        return out_bytes
+    except Exception as e:
+        print("[call_gemini_multimodal] Error calling Gemini:", e)
+        raise
+
+
 # ---------- ROUTES ----------
 
 @app.get("/", response_model=HealthResponse)
@@ -709,3 +903,84 @@ async def stage_room(req: StageRoomRequest):
         debug_ratio = "passthrough" if req.isContinuation else (applied_ratio or "auto")
 
     return StageRoomResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
+
+
+@app.post("/vibode/compose", response_model=VibodeComposeResponse)
+async def vibode_compose(req: VibodeComposeRequest):
+    if not req.placements:
+        raise HTTPException(status_code=400, detail="No placements provided.")
+
+    model_name = resolve_model_name(req.modelVersion)
+
+    try:
+        room_raw_bytes = _decode_base64_image(req.roomImageBase64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 room image data")
+
+    applied_ratio: Optional[str] = None
+    aspect_ratio_to_send: Optional[str] = None
+    try:
+        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
+            room_raw_bytes,
+            requested_ratio=req.aspectRatio,
+            model_name=model_name,
+        )
+        aspect_ratio_to_send = applied_ratio
+    except Exception as e:
+        print("[/vibode/compose] Error preparing room image:", e)
+        raise HTTPException(status_code=400, detail="Could not process room image")
+
+    try:
+        room_overlay_png_bytes = draw_red_markers_overlay(room_png_bytes, req.placements)
+    except Exception as e:
+        print("[/vibode/compose] Error drawing markers:", e)
+        raise HTTPException(status_code=500, detail="Failed to draw markers")
+
+    sku_png_bytes_list: List[bytes] = []
+    try:
+        for placement in req.placements:
+            sku_raw_bytes = _decode_base64_image(placement.skuImageBase64)
+            sku_png_bytes_list.append(prepare_sku_png_bytes(sku_raw_bytes))
+    except Exception as e:
+        print("[/vibode/compose] Error preparing SKU images:", e)
+        raise HTTPException(status_code=400, detail="Invalid base64 SKU image data")
+
+    print(
+        "[/vibode/compose] Received request:",
+        {
+            "placements": len(req.placements),
+            "sku_count": len(sku_png_bytes_list),
+            "room_bytes_len": len(room_raw_bytes),
+            "room_png_len": len(room_png_bytes),
+            "modelVersion": req.modelVersion,
+            "modelName": model_name,
+            "requestedAspectRatio": req.aspectRatio,
+            "appliedAspectRatio": applied_ratio,
+            "sentAspectRatio": aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
+            "maxInputLongEdge": MAX_INPUT_LONG_EDGE_INT,
+        },
+    )
+
+    prompt = build_vibode_compose_prompt(req.placements, enhance_photo=req.enhancePhoto)
+    try:
+        out_bytes = call_gemini_multimodal(
+            prompt=prompt,
+            room_overlay_png_bytes=room_overlay_png_bytes,
+            sku_png_bytes_list=sku_png_bytes_list,
+            model_name=model_name,
+            aspect_ratio=aspect_ratio_to_send,
+        )
+    except Exception as e:
+        print("[/vibode/compose] Error in processing:", e)
+        raise HTTPException(status_code=500, detail="Error during compose")
+
+    if not out_bytes:
+        raise HTTPException(status_code=500, detail="Compose returned empty image")
+
+    data_url = make_data_url(out_bytes, mime_type="image/png")
+
+    debug_ratio: Optional[str] = None
+    if DEBUG_ROOMPRINTZ_RATIO:
+        debug_ratio = applied_ratio or "auto"
+
+    return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
