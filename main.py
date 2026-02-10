@@ -1,6 +1,7 @@
 import os
 import io
 import base64
+from datetime import datetime
 from typing import Literal, Optional, Tuple, Dict, List
 
 from fastapi import FastAPI, HTTPException
@@ -687,6 +688,50 @@ def draw_red_markers_overlay(image_png_bytes: bytes, placements: List[VibodePlac
     return image_to_png_bytes(img)
 
 
+def _env_truthy(var_name: str) -> bool:
+    value = os.getenv(var_name)
+    if not value:
+        return False
+    return value.strip().lower() in ("1", "true", "yes")
+
+
+def maybe_dump_annotated_image(
+    image_png_bytes: bytes,
+    scene_hash: Optional[str] = None,
+    output_dir: Optional[str] = None,
+) -> None:
+    if not _env_truthy("VIBODE_DUMP_ANNOTATED_IMAGE"):
+        return
+    try:
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
+        safe_scene_hash = None
+        if scene_hash:
+            cleaned = "".join(ch for ch in scene_hash if ch.isalnum() or ch in ("-", "_"))
+            if cleaned:
+                safe_scene_hash = cleaned
+        filename = f"annotated_{timestamp}"
+        if safe_scene_hash:
+            filename += f"_{safe_scene_hash}"
+        filename += ".png"
+        resolved_dir = output_dir or os.getenv("VIBODE_DEBUG_DIR") or "tmp/vibode_debug"
+        abs_dir = os.path.abspath(resolved_dir)
+        abs_path = os.path.join(abs_dir, filename)
+        print("[maybe_dump_annotated_image] target path:", abs_path)
+
+        def _write() -> None:
+            try:
+                os.makedirs(abs_dir, exist_ok=True)
+                with open(abs_path, "wb") as handle:
+                    handle.write(image_png_bytes)
+                print("[maybe_dump_annotated_image] wrote:", abs_path)
+            except Exception as e:
+                print("[maybe_dump_annotated_image] failed:", e)
+
+        _write()
+    except Exception as e:
+        print("[maybe_dump_annotated_image] failed:", e)
+
+
 def prepare_sku_png_bytes(image_bytes: bytes) -> bytes:
     img = _safe_open_image(image_bytes)
     img = resize_down_if_needed(img, MAX_INPUT_LONG_EDGE_INT)
@@ -935,6 +980,12 @@ async def vibode_compose(req: VibodeComposeRequest):
     except Exception as e:
         print("[/vibode/compose] Error drawing markers:", e)
         raise HTTPException(status_code=500, detail="Failed to draw markers")
+
+    print(
+        "[/vibode/compose] VIBODE_DUMP_ANNOTATED_IMAGE:",
+        os.getenv("VIBODE_DUMP_ANNOTATED_IMAGE"),
+    )
+    maybe_dump_annotated_image(room_overlay_png_bytes)
 
     sku_png_bytes_list: List[bytes] = []
     try:
