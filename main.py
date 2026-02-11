@@ -688,6 +688,64 @@ def draw_red_markers_overlay(image_png_bytes: bytes, placements: List[VibodePlac
     return image_to_png_bytes(img)
 
 
+def scale_placements_for_resized_room_image(
+    placements: List[VibodePlacement],
+    original_size: Tuple[int, int],
+    resized_size: Tuple[int, int],
+) -> List[VibodePlacement]:
+    orig_w, orig_h = original_size
+    new_w, new_h = resized_size
+
+    if orig_w <= 0 or orig_h <= 0 or new_w <= 0 or new_h <= 0:
+        return placements
+
+    if (orig_w, orig_h) == (new_w, new_h):
+        return placements
+
+    scale_x = new_w / float(orig_w)
+    scale_y = new_h / float(orig_h)
+    radius_scale = min(scale_x, scale_y)
+
+    scaled_placements: List[VibodePlacement] = []
+    for placement in placements:
+        scaled_placements.append(
+            placement.model_copy(
+                update={
+                    "cxPx": placement.cxPx * scale_x,
+                    "cyPx": placement.cyPx * scale_y,
+                    "rPx": (placement.rPx * radius_scale) if placement.rPx is not None else None,
+                }
+            )
+        )
+
+    if placements and scaled_placements:
+        first_original = placements[0]
+        first_scaled = scaled_placements[0]
+        print(
+            "[/vibode/compose] Scaling marker coordinates for resized room image:",
+            {
+                "orig_dims": (orig_w, orig_h),
+                "new_dims": (new_w, new_h),
+                "scale_x": scale_x,
+                "scale_y": scale_y,
+                "first_original": {
+                    "nodeId": first_original.nodeId,
+                    "cxPx": first_original.cxPx,
+                    "cyPx": first_original.cyPx,
+                    "rPx": first_original.rPx,
+                },
+                "first_scaled": {
+                    "nodeId": first_scaled.nodeId,
+                    "cxPx": first_scaled.cxPx,
+                    "cyPx": first_scaled.cyPx,
+                    "rPx": first_scaled.rPx,
+                },
+            },
+        )
+
+    return scaled_placements
+
+
 def _env_truthy(var_name: str) -> bool:
     value = os.getenv(var_name)
     if not value:
@@ -962,6 +1020,13 @@ async def vibode_compose(req: VibodeComposeRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 room image data")
 
+    try:
+        room_orig_img = _safe_open_image(room_raw_bytes)
+        orig_w, orig_h = room_orig_img.size
+    except Exception as e:
+        print("[/vibode/compose] Error decoding room image dimensions:", e)
+        raise HTTPException(status_code=400, detail="Could not process room image")
+
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
     try:
@@ -976,7 +1041,20 @@ async def vibode_compose(req: VibodeComposeRequest):
         raise HTTPException(status_code=400, detail="Could not process room image")
 
     try:
-        room_overlay_png_bytes = draw_red_markers_overlay(room_png_bytes, req.placements)
+        room_pre_overlay_img = _safe_open_image(room_png_bytes)
+        new_w, new_h = room_pre_overlay_img.size
+    except Exception as e:
+        print("[/vibode/compose] Error decoding prepared room image dimensions:", e)
+        raise HTTPException(status_code=500, detail="Failed to prepare room overlay image")
+
+    placements_for_overlay = scale_placements_for_resized_room_image(
+        req.placements,
+        original_size=(orig_w, orig_h),
+        resized_size=(new_w, new_h),
+    )
+
+    try:
+        room_overlay_png_bytes = draw_red_markers_overlay(room_png_bytes, placements_for_overlay)
     except Exception as e:
         print("[/vibode/compose] Error drawing markers:", e)
         raise HTTPException(status_code=500, detail="Failed to draw markers")
