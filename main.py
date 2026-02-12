@@ -13,6 +13,10 @@ try:
 except Exception:
     ImageDraw = None
     _HAS_IMAGE_DRAW = False
+try:
+    from PIL import ImageFont
+except Exception:
+    ImageFont = None
 
 from google import genai
 from google.genai import types
@@ -481,6 +485,7 @@ class StageRoomResponse(BaseModel):
 
 class VibodePlacement(BaseModel):
     nodeId: str
+    zIndex: Optional[int] = None
     skuId: Optional[str] = None
     skuImageBase64: str
     cxPx: float
@@ -657,6 +662,75 @@ def _draw_red_marker_pixels(img: Image.Image, cx: int, cy: int, r: int) -> None:
                 pixels[x, y] = (255, 0, 0)
 
 
+def order_vibode_placements(placements: List[VibodePlacement]) -> List[VibodePlacement]:
+    has_z_index = any(placement.zIndex is not None for placement in placements)
+    if has_z_index:
+        return sorted(
+            placements,
+            key=lambda placement: (
+                placement.zIndex if placement.zIndex is not None else float("inf"),
+                placement.nodeId,
+            ),
+        )
+    return sorted(placements, key=lambda placement: placement.nodeId)
+
+
+def _load_marker_label_font(font_size: int):
+    if ImageFont is None:
+        return None
+    for font_name in ("DejaVuSans-Bold.ttf", "Arial.ttf", "LiberationSans-Bold.ttf"):
+        try:
+            return ImageFont.truetype(font_name, size=font_size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def _draw_marker_label(
+    draw: "ImageDraw.ImageDraw",
+    cx: int,
+    cy: int,
+    marker_label: str,
+    radius: int,
+) -> None:
+    font_size = max(14, int(radius * 0.9))
+    font = _load_marker_label_font(font_size)
+    stroke_width = max(1, int(round(radius * 0.12)))
+    try:
+        draw.text(
+            (cx, cy),
+            marker_label,
+            fill=(255, 255, 255),
+            font=font,
+            anchor="mm",
+            stroke_width=stroke_width,
+            stroke_fill=(255, 0, 0),
+        )
+        return
+    except Exception:
+        pass
+
+    try:
+        bbox = draw.textbbox((0, 0), marker_label, font=font, stroke_width=stroke_width)
+        left, top, right, bottom = bbox
+        x = cx - ((right - left) / 2.0)
+        y = cy - ((bottom - top) / 2.0)
+    except Exception:
+        x = cx
+        y = cy
+    draw.text(
+        (x, y),
+        marker_label,
+        fill=(255, 255, 255),
+        font=font,
+        stroke_width=stroke_width,
+        stroke_fill=(0, 0, 0),
+    )
+
+
 def draw_red_markers_overlay(image_png_bytes: bytes, placements: List[VibodePlacement]) -> bytes:
     img = _safe_open_image(image_png_bytes)
     if img.mode != "RGB":
@@ -665,7 +739,7 @@ def draw_red_markers_overlay(image_png_bytes: bytes, placements: List[VibodePlac
     max_radius = max(1, min(width, height) // 4)
     if _HAS_IMAGE_DRAW and ImageDraw is not None:
         draw = ImageDraw.Draw(img)
-        for placement in placements:
+        for idx, placement in enumerate(placements):
             radius = int(round(placement.rPx)) if placement.rPx else 60
             radius = max(20, radius)
             radius = min(radius, max_radius)
@@ -675,6 +749,8 @@ def draw_red_markers_overlay(image_png_bytes: bytes, placements: List[VibodePlac
             cy = max(0, min(cy, height - 1))
             bbox = (cx - radius, cy - radius, cx + radius, cy + radius)
             draw.ellipse(bbox, outline=(255, 0, 0), width=6)
+            marker_label = str(idx + 1)
+            _draw_marker_label(draw, cx, cy, marker_label, radius)
     else:
         for placement in placements:
             radius = int(round(placement.rPx)) if placement.rPx else 60
@@ -753,41 +829,34 @@ def _env_truthy(var_name: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes")
 
 
-def maybe_dump_annotated_image(
-    image_png_bytes: bytes,
-    scene_hash: Optional[str] = None,
+def maybe_dump_prepared_room_images(
+    room_clean_png_bytes: bytes,
+    room_marked_png_bytes: bytes,
     output_dir: Optional[str] = None,
 ) -> None:
     if not _env_truthy("VIBODE_DUMP_ANNOTATED_IMAGE"):
         return
     try:
         timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
-        safe_scene_hash = None
-        if scene_hash:
-            cleaned = "".join(ch for ch in scene_hash if ch.isalnum() or ch in ("-", "_"))
-            if cleaned:
-                safe_scene_hash = cleaned
-        filename = f"annotated_{timestamp}"
-        if safe_scene_hash:
-            filename += f"_{safe_scene_hash}"
-        filename += ".png"
         resolved_dir = output_dir or os.getenv("VIBODE_DEBUG_DIR") or "tmp/vibode_debug"
         abs_dir = os.path.abspath(resolved_dir)
-        abs_path = os.path.join(abs_dir, filename)
-        print("[maybe_dump_annotated_image] target path:", abs_path)
+        os.makedirs(abs_dir, exist_ok=True)
 
-        def _write() -> None:
+        artifacts = (
+            ("prepared_room_clean", room_clean_png_bytes),
+            ("prepared_room_marked", room_marked_png_bytes),
+        )
+        for prefix, image_png_bytes in artifacts:
+            abs_path = os.path.join(abs_dir, f"{prefix}_{timestamp}.png")
+            print("[maybe_dump_prepared_room_images] target path:", abs_path)
             try:
-                os.makedirs(abs_dir, exist_ok=True)
                 with open(abs_path, "wb") as handle:
                     handle.write(image_png_bytes)
-                print("[maybe_dump_annotated_image] wrote:", abs_path)
+                print("[maybe_dump_prepared_room_images] wrote:", abs_path)
             except Exception as e:
-                print("[maybe_dump_annotated_image] failed:", e)
-
-        _write()
+                print("[maybe_dump_prepared_room_images] failed:", e)
     except Exception as e:
-        print("[maybe_dump_annotated_image] failed:", e)
+        print("[maybe_dump_prepared_room_images] failed:", e)
 
 
 def prepare_sku_png_bytes(image_bytes: bytes) -> bytes:
@@ -800,20 +869,27 @@ def build_vibode_compose_prompt(
     placements: List[VibodePlacement],
     enhance_photo: bool,
 ) -> str:
+    placements_count = len(placements)
     lines = [
         "You are a professional real-estate photo editor.",
         "",
         "You are given multiple images in this exact order:",
-        "1) Image 1 is the room photo with one or more red circular marker(s).",
-        "2) Each subsequent image is a single furniture item to insert, in the same order as the placements list.",
-        "The 1st furniture image matches the 1st marker, the 2nd matches the 2nd, and so on.",
+        "1) Image 1 is the clean prepared room photo (background reference).",
+        "   Final output must match Image 1's room exactly.",
+        f"2) Image 2 is the same prepared room with numbered red circle markers (1..{placements_count}) for guidance only.",
+        "   Use Image 2 only to locate targets.",
+        "3) Each subsequent image is a single SKU item to insert, ordered by marker number.",
+        "Place SKU image i at marker i. Do not swap indices. Do not invent additional furniture.",
         "",
         "Strict rules:",
-        "- Place each furniture item at its corresponding red marker location on the floor.",
+        "- Place each SKU item at its corresponding numbered red marker location on the floor.",
+        "- Use Image 1 as the source of truth for room appearance; keep its background unchanged.",
+        "- Use Image 2 only as placement guidance; do not keep any markers in the final result.",
         "- Do not move, resize, or rotate the room camera perspective.",
         "- Do not change existing walls, windows, doors, floors, or lighting.",
-        "- Do not invent extra furniture or decor; only insert the provided items.",
+        "- Do not invent extra furniture or decor; only insert the provided SKU items.",
         "- Add realistic contact shadows so items sit naturally on the floor.",
+        "- Remove all markup in the final image: no circles, numbers, or any text.",
         "- Do not add text, logos, or watermarks.",
     ]
     if enhance_photo:
@@ -832,6 +908,7 @@ def build_vibode_compose_prompt(
 
 def call_gemini_multimodal(
     prompt: str,
+    room_png_bytes: bytes,
     room_overlay_png_bytes: bytes,
     sku_png_bytes_list: List[bytes],
     model_name: str,
@@ -842,6 +919,8 @@ def call_gemini_multimodal(
             print(
                 "[call_gemini_multimodal] Calling model:",
                 model_name,
+                "| Room clean bytes:",
+                len(room_png_bytes),
                 "| Room overlay bytes:",
                 len(room_overlay_png_bytes),
                 "| sku_count:",
@@ -854,6 +933,12 @@ def call_gemini_multimodal(
             config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio)
         contents = [
             types.Part(text=prompt),
+            types.Part(
+                inline_data=types.Blob(
+                    data=room_png_bytes,
+                    mime_type="image/png",
+                )
+            ),
             types.Part(
                 inline_data=types.Blob(
                     data=room_overlay_png_bytes,
@@ -1014,6 +1099,7 @@ async def vibode_compose(req: VibodeComposeRequest):
         raise HTTPException(status_code=400, detail="No placements provided.")
 
     model_name = resolve_model_name(req.modelVersion)
+    placements_ordered = order_vibode_placements(req.placements)
 
     try:
         room_raw_bytes = _decode_base64_image(req.roomImageBase64)
@@ -1048,7 +1134,7 @@ async def vibode_compose(req: VibodeComposeRequest):
         raise HTTPException(status_code=500, detail="Failed to prepare room overlay image")
 
     placements_for_overlay = scale_placements_for_resized_room_image(
-        req.placements,
+        placements_ordered,
         original_size=(orig_w, orig_h),
         resized_size=(new_w, new_h),
     )
@@ -1063,11 +1149,14 @@ async def vibode_compose(req: VibodeComposeRequest):
         "[/vibode/compose] VIBODE_DUMP_ANNOTATED_IMAGE:",
         os.getenv("VIBODE_DUMP_ANNOTATED_IMAGE"),
     )
-    maybe_dump_annotated_image(room_overlay_png_bytes)
+    maybe_dump_prepared_room_images(
+        room_clean_png_bytes=room_png_bytes,
+        room_marked_png_bytes=room_overlay_png_bytes,
+    )
 
     sku_png_bytes_list: List[bytes] = []
     try:
-        for placement in req.placements:
+        for placement in placements_ordered:
             sku_raw_bytes = _decode_base64_image(placement.skuImageBase64)
             sku_png_bytes_list.append(prepare_sku_png_bytes(sku_raw_bytes))
     except Exception as e:
@@ -1078,6 +1167,7 @@ async def vibode_compose(req: VibodeComposeRequest):
         "[/vibode/compose] Received request:",
         {
             "placements": len(req.placements),
+            "placements_ordered": len(placements_ordered),
             "sku_count": len(sku_png_bytes_list),
             "room_bytes_len": len(room_raw_bytes),
             "room_png_len": len(room_png_bytes),
@@ -1090,10 +1180,11 @@ async def vibode_compose(req: VibodeComposeRequest):
         },
     )
 
-    prompt = build_vibode_compose_prompt(req.placements, enhance_photo=req.enhancePhoto)
+    prompt = build_vibode_compose_prompt(placements_ordered, enhance_photo=req.enhancePhoto)
     try:
         out_bytes = call_gemini_multimodal(
             prompt=prompt,
+            room_png_bytes=room_png_bytes,
             room_overlay_png_bytes=room_overlay_png_bytes,
             sku_png_bytes_list=sku_png_bytes_list,
             model_name=model_name,
