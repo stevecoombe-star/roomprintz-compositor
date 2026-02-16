@@ -4,7 +4,7 @@ import base64
 import hashlib
 import math
 from datetime import datetime
-from typing import Literal, Optional, Tuple, Dict, List
+from typing import Any, Literal, Optional, Tuple, Dict, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -548,6 +548,22 @@ class VibodeSwapResponse(BaseModel):
     imageUrl: str
 
 
+class VibodeRotateMark(BaseModel):
+    id: str
+    x: float
+    y: float
+    angleDeg: float
+
+
+class VibodeRotateRequest(BaseModel):
+    freezePayload: Dict[str, Any]
+    baseImageUrl: Optional[str] = None
+    cleanBase64: Optional[str] = None
+    marks: Optional[List[VibodeRotateMark]] = None
+    modelVersion: Optional[str] = None
+    aspectRatio: Optional[AspectRatio] = "auto"
+
+
 def call_gemini_with_prompt(
     image_png_bytes: bytes,
     prompt: str,
@@ -982,6 +998,102 @@ def render_vibode_swap_overlay(image_png_bytes: bytes, marks: List[VibodeSwapMar
     return image_to_png_bytes(img)
 
 
+def _clamp_rotation_degrees(angle_deg: float) -> float:
+    if not math.isfinite(angle_deg):
+        return 0.0
+    return max(-180.0, min(180.0, float(angle_deg)))
+
+
+def _normalized_to_pixel(normalized_value: float, size: int) -> int:
+    if size <= 1:
+        return 0
+    clamped = max(0.0, min(1.0, float(normalized_value)))
+    return max(0, min(int(round(clamped * (size - 1))), size - 1))
+
+
+def _draw_purple_marker_pixels(img: Image.Image, cx: int, cy: int, radius: int) -> None:
+    pixels = img.load()
+    if pixels is None:
+        return
+    width, height = img.size
+    thickness = 3
+    min_x = max(0, cx - radius - thickness)
+    max_x = min(width - 1, cx + radius + thickness)
+    min_y = max(0, cy - radius - thickness)
+    max_y = min(height - 1, cy + radius + thickness)
+    inner_radius = max(0, radius - thickness)
+    outer_radius = radius + thickness
+    inner_radius_sq = inner_radius * inner_radius
+    outer_radius_sq = outer_radius * outer_radius
+    purple = (160, 90, 255)
+    for y in range(min_y, max_y + 1):
+        dy = y - cy
+        dy_sq = dy * dy
+        for x in range(min_x, max_x + 1):
+            dx = x - cx
+            dist_sq = dx * dx + dy_sq
+            if inner_radius_sq <= dist_sq <= outer_radius_sq:
+                pixels[x, y] = purple
+
+
+def render_vibode_rotate_overlay(image_png_bytes: bytes, marks: List[VibodeRotateMark]) -> bytes:
+    img = _safe_open_image(image_png_bytes)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    width, height = img.size
+    min_dim = min(width, height)
+    marker_radius = max(18, int(round(min_dim * 0.038)))
+    marker_radius = min(marker_radius, 64)
+    line_width = max(3, int(round(marker_radius * 0.22)))
+    min_arrow_len = max(marker_radius + 8, int(round(marker_radius * 1.1)))
+    max_arrow_len = max(min_arrow_len + 10, int(round(marker_radius * 2.4)))
+    purple = (160, 90, 255)
+
+    if _HAS_IMAGE_DRAW and ImageDraw is not None:
+        draw = ImageDraw.Draw(img)
+        for idx, mark in enumerate(marks):
+            clamped_angle_deg = _clamp_rotation_degrees(mark.angleDeg)
+            cx = _normalized_to_pixel(mark.x, width)
+            cy = _normalized_to_pixel(mark.y, height)
+
+            marker_bbox = (
+                cx - marker_radius,
+                cy - marker_radius,
+                cx + marker_radius,
+                cy + marker_radius,
+            )
+            draw.ellipse(marker_bbox, outline=purple, width=max(3, int(round(marker_radius * 0.16))))
+            _draw_marker_label(draw=draw, cx=cx, cy=cy, marker_label=str(idx + 1), radius=marker_radius)
+
+            angle_fraction = abs(clamped_angle_deg) / 180.0
+            arrow_len = int(round(min_arrow_len + ((max_arrow_len - min_arrow_len) * angle_fraction)))
+            theta = math.radians(-clamped_angle_deg)
+            end_x = int(round(cx + (math.sin(theta) * arrow_len)))
+            end_y = int(round(cy - (math.cos(theta) * arrow_len)))
+            end_x = max(0, min(end_x, width - 1))
+            end_y = max(0, min(end_y, height - 1))
+
+            draw.line((cx, cy, end_x, end_y), fill=purple, width=line_width)
+
+            head_len = max(8, int(round(marker_radius * 0.45)))
+            direction_theta = math.atan2((end_y - cy), (end_x - cx))
+            left_theta = direction_theta + math.radians(150)
+            right_theta = direction_theta - math.radians(150)
+            left_x = int(round(end_x + (math.cos(left_theta) * head_len)))
+            left_y = int(round(end_y + (math.sin(left_theta) * head_len)))
+            right_x = int(round(end_x + (math.cos(right_theta) * head_len)))
+            right_y = int(round(end_y + (math.sin(right_theta) * head_len)))
+            draw.line((end_x, end_y, left_x, left_y), fill=purple, width=line_width)
+            draw.line((end_x, end_y, right_x, right_y), fill=purple, width=line_width)
+    else:
+        for mark in marks:
+            cx = _normalized_to_pixel(mark.x, width)
+            cy = _normalized_to_pixel(mark.y, height)
+            _draw_purple_marker_pixels(img, cx, cy, marker_radius)
+
+    return image_to_png_bytes(img)
+
+
 def scale_placements_for_resized_room_image(
     placements: List[VibodePlacement],
     original_size: Tuple[int, int],
@@ -1175,6 +1287,27 @@ def _summarize_swap_marks(
     }
 
 
+def _summarize_rotate_marks(
+    marks: List[VibodeRotateMark],
+    limit: int = 5,
+) -> Dict[str, object]:
+    preview: List[Dict[str, object]] = []
+    for idx, mark in enumerate(marks[:limit]):
+        preview.append(
+            {
+                "markerIndex": idx + 1,
+                "markId": mark.id,
+                "xNorm": round(mark.x, 4),
+                "yNorm": round(mark.y, 4),
+                "angleDeg": round(mark.angleDeg, 2),
+            }
+        )
+    return {
+        "count": len(marks),
+        "preview": preview,
+    }
+
+
 def maybe_dump_prepared_room_images(
     room_clean_png_bytes: bytes,
     room_marked_png_bytes: bytes,
@@ -1254,6 +1387,58 @@ def maybe_dump_vibode_swap_images(
         print("[maybe_dump_vibode_swap_images] failed:", e)
 
 
+def maybe_dump_vibode_rotate_images(
+    room_clean_png_bytes: bytes,
+    room_rotate_overlay_png_bytes: bytes,
+    prompt_hash: str,
+    output_dir: Optional[str] = None,
+) -> None:
+    if not _env_truthy("VIBODE_DUMP_ANNOTATED_IMAGE"):
+        return
+
+    try:
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
+        resolved_dir = output_dir or os.getenv("VIBODE_DEBUG_DIR") or "tmp/vibode_debug"
+        abs_dir = os.path.abspath(resolved_dir)
+        prompt_tag = prompt_hash or "nohash"
+        run_dir = os.path.join(abs_dir, f"rotate_{timestamp}_{prompt_tag}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        clean_path = os.path.join(run_dir, "clean_normalized.png")
+        overlay_path = os.path.join(run_dir, "rotate_overlay.png")
+        preview_path = os.path.join(run_dir, "rotate_preview_combined.png")
+
+        with open(clean_path, "wb") as handle:
+            handle.write(room_clean_png_bytes)
+        with open(overlay_path, "wb") as handle:
+            handle.write(room_rotate_overlay_png_bytes)
+
+        try:
+            clean_img = _safe_open_image(room_clean_png_bytes)
+            overlay_img = _safe_open_image(room_rotate_overlay_png_bytes)
+            preview_w = clean_img.width + overlay_img.width
+            preview_h = max(clean_img.height, overlay_img.height)
+            combined = Image.new("RGB", (preview_w, preview_h), color=(30, 30, 30))
+            combined.paste(clean_img, (0, 0))
+            combined.paste(overlay_img, (clean_img.width, 0))
+            with open(preview_path, "wb") as handle:
+                handle.write(image_to_png_bytes(combined))
+        except Exception as e:
+            print("[maybe_dump_vibode_rotate_images] failed to write preview:", e)
+
+        print(
+            "[maybe_dump_vibode_rotate_images] wrote:",
+            {
+                "clean_normalized": clean_path,
+                "rotate_overlay": overlay_path,
+                "rotate_preview_combined": preview_path,
+                "promptHash": prompt_hash,
+            },
+        )
+    except Exception as e:
+        print("[maybe_dump_vibode_rotate_images] failed:", e)
+
+
 def prepare_sku_png_bytes(image_bytes: bytes) -> bytes:
     img = _safe_open_image(image_bytes)
     img = resize_down_if_needed(img, MAX_INPUT_LONG_EDGE_INT)
@@ -1314,6 +1499,122 @@ VIBODE_SWAP_PROMPT = (
     "Match perspective, scale to the removed object footprint, lighting, shadows, and occlusion.\n"
     "Do not change anything outside the swapped objects. Do not restage the room."
 )
+
+
+def build_vibode_rotate_prompt(marks: List[VibodeRotateMark]) -> str:
+    marker_count = len(marks)
+    lines = [
+        "You are a professional real-estate photo editor.",
+        "",
+        "You are given exactly two images in this order:",
+        "1) Image 1 is the clean/base room image and is the source of truth.",
+        f"2) Image 2 is the same room with numbered purple rotate markers (1..{marker_count}) used only for guidance.",
+        "",
+        "Edit strategy:",
+        "- Treat each marker as identifying the object nearest to that marker.",
+        "- Keep every edited object in the same location and at the same scale.",
+        "- Preserve lighting, shadows, and perspective.",
+        "- Use marker order deterministically from #1 to #N.",
+        "- Do not alter any other objects. Do not restage the room.",
+        "- Do not leave any markers, arrows, numbers, text, logos, or watermarks in the final image.",
+        "",
+        "Apply these rotations in order:",
+    ]
+
+    for idx, mark in enumerate(marks):
+        marker_index = idx + 1
+        clamped_angle = _clamp_rotation_degrees(mark.angleDeg)
+        abs_angle = abs(clamped_angle)
+        if clamped_angle > 0:
+            direction = "clockwise"
+        elif clamped_angle < 0:
+            direction = "counter-clockwise"
+        else:
+            direction = "clockwise (no-op)"
+
+        lines.extend(
+            [
+                f"- Marker #{marker_index}: Rotate the object closest to marker #{marker_index} by {abs_angle:g} degrees {direction}.",
+                "  Keep the object in the same location and at the same scale (no shifting or resizing).",
+                "  Preserve lighting, shadows, and perspective.",
+                "  Do not alter any other objects. Do not restage the room.",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def _extract_rotate_marks(
+    freeze_payload: Dict[str, Any],
+    request_marks: Optional[List[VibodeRotateMark]],
+) -> List[VibodeRotateMark]:
+    if request_marks:
+        raw_marks: object = request_marks
+    else:
+        candidate_marks: object = None
+        vibode_intent_block = freeze_payload.get("vibodeIntent")
+        if isinstance(vibode_intent_block, dict):
+            rotate_block = vibode_intent_block.get("rotate")
+            if isinstance(rotate_block, dict):
+                nested_marks = rotate_block.get("marks")
+                if isinstance(nested_marks, list):
+                    candidate_marks = nested_marks
+        if not isinstance(candidate_marks, list):
+            candidate_marks = freeze_payload.get("rotateMarks")
+        if not isinstance(candidate_marks, list):
+            candidate_marks = freeze_payload.get("marks")
+        if not isinstance(candidate_marks, list):
+            rotate_block = freeze_payload.get("rotate")
+            if isinstance(rotate_block, dict):
+                nested_marks = rotate_block.get("marks")
+                if isinstance(nested_marks, list):
+                    candidate_marks = nested_marks
+        raw_marks = candidate_marks
+
+    if not isinstance(raw_marks, list) or not raw_marks:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No rotate marks found. Provide marks[] or freezePayload.rotateMarks[] "
+                "(or freezePayload.marks[])."
+            ),
+        )
+
+    parsed_marks: List[VibodeRotateMark] = []
+    for idx, raw_mark in enumerate(raw_marks):
+        try:
+            if isinstance(raw_mark, VibodeRotateMark):
+                mark = raw_mark
+            elif isinstance(raw_mark, dict):
+                mark = VibodeRotateMark(**raw_mark)
+            else:
+                raise ValueError("Each mark must be an object")
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid rotate mark at index {idx}: {e}",
+            )
+
+        if not math.isfinite(mark.x) or not math.isfinite(mark.y):
+            raise HTTPException(
+                status_code=400,
+                detail=f"marks[{idx}] has invalid coordinates; x and y must be finite numbers.",
+            )
+
+        clamped_x = max(0.0, min(1.0, float(mark.x)))
+        clamped_y = max(0.0, min(1.0, float(mark.y)))
+        clamped_angle = _clamp_rotation_degrees(mark.angleDeg)
+        parsed_marks.append(
+            mark.model_copy(
+                update={
+                    "x": clamped_x,
+                    "y": clamped_y,
+                    "angleDeg": clamped_angle,
+                }
+            )
+        )
+
+    return parsed_marks
 
 
 def call_gemini_multimodal(
@@ -1877,3 +2178,128 @@ async def vibode_swap(req: VibodeSwapRequest):
 
     data_url = make_data_url(out_bytes, mime_type="image/png")
     return VibodeSwapResponse(imageUrl=data_url)
+
+
+@app.post("/vibode/rotate", response_model=VibodeComposeResponse)
+async def vibode_rotate(req: VibodeRotateRequest):
+    marks_ordered = _extract_rotate_marks(
+        freeze_payload=req.freezePayload,
+        request_marks=req.marks,
+    )
+
+    image_source_kind = "cleanBase64"
+    if req.cleanBase64 and req.cleanBase64.strip():
+        try:
+            room_raw_bytes = _decode_base64_image(req.cleanBase64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid base64 room image data")
+    elif req.baseImageUrl and req.baseImageUrl.strip():
+        image_source_kind = "baseImageUrl"
+        try:
+            room_raw_bytes = _fetch_image_bytes_from_url(req.baseImageUrl)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Failed to fetch baseImageUrl image data")
+    else:
+        raise HTTPException(status_code=400, detail="Provide either cleanBase64 or baseImageUrl.")
+
+    model_name = resolve_model_name(req.modelVersion)
+
+    try:
+        room_orig_img = _safe_open_image(room_raw_bytes)
+        orig_w, orig_h = room_orig_img.size
+    except Exception as e:
+        print("[/vibode/rotate] Error decoding room image dimensions:", e)
+        raise HTTPException(status_code=400, detail="Could not process room image")
+
+    applied_ratio: Optional[str] = None
+    aspect_ratio_to_send: Optional[str] = None
+    try:
+        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
+            room_raw_bytes,
+            requested_ratio=req.aspectRatio,
+            model_name=model_name,
+        )
+        aspect_ratio_to_send = applied_ratio
+    except Exception as e:
+        print("[/vibode/rotate] Error preparing room image:", e)
+        raise HTTPException(status_code=400, detail="Could not process room image")
+
+    try:
+        room_pre_overlay_img = _safe_open_image(room_png_bytes)
+        new_w, new_h = room_pre_overlay_img.size
+    except Exception as e:
+        print("[/vibode/rotate] Error decoding prepared room image dimensions:", e)
+        raise HTTPException(status_code=500, detail="Failed to prepare room overlay image")
+
+    try:
+        room_overlay_png_bytes = render_vibode_rotate_overlay(room_png_bytes, marks_ordered)
+    except Exception as e:
+        print("[/vibode/rotate] Error drawing rotate markers:", e)
+        raise HTTPException(status_code=500, detail="Failed to draw rotate markers")
+
+    rotate_prompt = build_vibode_rotate_prompt(marks_ordered)
+    rotate_prompt_hash = _short_prompt_hash(rotate_prompt)
+    rotate_prompt_first_line = _prompt_first_line(rotate_prompt)
+
+    maybe_dump_vibode_rotate_images(
+        room_clean_png_bytes=room_png_bytes,
+        room_rotate_overlay_png_bytes=room_overlay_png_bytes,
+        prompt_hash=rotate_prompt_hash,
+    )
+
+    print(
+        "[/vibode/rotate] Received request:",
+        {
+            "marks": len(marks_ordered),
+            "marks_summary": _summarize_rotate_marks(marks_ordered),
+            "freezePayloadKeys": sorted(req.freezePayload.keys()),
+            "sourceImage": image_source_kind,
+            "baseImageUrlProvided": bool(req.baseImageUrl and req.baseImageUrl.strip()),
+            "room_bytes_len": len(room_raw_bytes),
+            "room_png_len": len(room_png_bytes),
+            "originalDims": (orig_w, orig_h),
+            "preparedDims": (new_w, new_h),
+            "modelVersion": req.modelVersion,
+            "modelName": model_name,
+            "requestedAspectRatio": req.aspectRatio,
+            "appliedAspectRatio": applied_ratio,
+            "sentAspectRatio": aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
+            "maxInputLongEdge": MAX_INPUT_LONG_EDGE_INT,
+        },
+    )
+    print(
+        "[/vibode/rotate] Prompt summary:",
+        {
+            "prompt_hash": rotate_prompt_hash,
+            "prompt_first_line": rotate_prompt_first_line,
+            "marks_summary": _summarize_rotate_marks(marks_ordered),
+        },
+    )
+    if VIBODE_LOG_PROMPTS:
+        print("\n===== VIBODE ROTATE PROMPT SENT TO GEMINI =====\n")
+        print(rotate_prompt)
+        print("\n================================================\n")
+
+    try:
+        out_bytes = call_gemini_multimodal(
+            prompt=rotate_prompt,
+            room_png_bytes=room_png_bytes,
+            room_overlay_png_bytes=room_overlay_png_bytes,
+            sku_png_bytes_list=[],
+            model_name=model_name,
+            aspect_ratio=aspect_ratio_to_send,
+        )
+    except Exception as e:
+        print("[/vibode/rotate] Error in processing:", e)
+        raise HTTPException(status_code=500, detail="Error during rotate")
+
+    if not out_bytes:
+        raise HTTPException(status_code=500, detail="Rotate returned empty image")
+
+    data_url = make_data_url(out_bytes, mime_type="image/png")
+
+    debug_ratio: Optional[str] = None
+    if DEBUG_ROOMPRINTZ_RATIO:
+        debug_ratio = applied_ratio or "auto"
+
+    return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
