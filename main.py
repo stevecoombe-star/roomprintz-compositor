@@ -2,12 +2,14 @@ import os
 import io
 import base64
 import hashlib
+import math
 from datetime import datetime
 from typing import Literal, Optional, Tuple, Dict, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from PIL import Image
+import requests
 try:
     from PIL import ImageDraw
     _HAS_IMAGE_DRAW = True
@@ -522,6 +524,30 @@ class VibodeRemoveRequest(BaseModel):
     aspectRatio: Optional[AspectRatio] = "auto"
 
 
+class VibodeSwapReplacementAsset(BaseModel):
+    kind: str = "sku"
+    skuId: Optional[str] = None
+    imageUrl: str
+
+
+class VibodeSwapMark(BaseModel):
+    id: str
+    x: float
+    y: float
+    replacement: VibodeSwapReplacementAsset
+
+
+class VibodeSwapRequest(BaseModel):
+    cleanBase64: str
+    marks: List[VibodeSwapMark]
+    replacementAssets: List[VibodeSwapReplacementAsset]
+    modelVersion: Optional[str] = None
+
+
+class VibodeSwapResponse(BaseModel):
+    imageUrl: str
+
+
 def call_gemini_with_prompt(
     image_png_bytes: bytes,
     prompt: str,
@@ -652,6 +678,87 @@ def _decode_base64_image(data: str) -> bytes:
     except Exception as e:
         print("[_decode_base64_image] Failed to decode base64:", e)
         raise
+
+
+def _fetch_image_bytes_from_url(image_url: str, timeout_seconds: float = 15.0) -> bytes:
+    try:
+        response = requests.get(image_url, timeout=timeout_seconds)
+        response.raise_for_status()
+        if not response.content:
+            raise RuntimeError("Empty image payload")
+        return response.content
+    except Exception as e:
+        print("[_fetch_image_bytes_from_url] Failed to fetch image URL:", image_url, "| Error:", e)
+        raise
+
+
+def _draw_contrasted_line(
+    draw: "ImageDraw.ImageDraw",
+    points: Tuple[int, int, int, int],
+    line_width: int,
+    inner_color: Tuple[int, int, int] = (255, 255, 255),
+    outer_color: Tuple[int, int, int] = (0, 0, 0),
+) -> None:
+    outer_width = line_width + max(2, int(round(line_width * 0.65)))
+    draw.line(points, fill=outer_color, width=outer_width)
+    draw.line(points, fill=inner_color, width=line_width)
+
+
+def _draw_swap_glyph(
+    draw: "ImageDraw.ImageDraw",
+    cx: int,
+    cy: int,
+    glyph_half_len: int,
+) -> None:
+    track_gap = max(8, int(round(glyph_half_len * 0.6)))
+    top_y = cy - (track_gap // 2)
+    bottom_y = cy + (track_gap // 2)
+    left_x = cx - glyph_half_len
+    right_x = cx + glyph_half_len
+    line_width = max(3, int(round(glyph_half_len * 0.2)))
+    head_len = max(7, int(round(glyph_half_len * 0.35)))
+    head_height = max(6, int(round(glyph_half_len * 0.32)))
+
+    # Top lane points right.
+    _draw_contrasted_line(draw, (left_x, top_y, right_x, top_y), line_width=line_width)
+    _draw_contrasted_line(draw, (right_x, top_y, right_x - head_len, top_y - head_height), line_width=line_width)
+    _draw_contrasted_line(draw, (right_x, top_y, right_x - head_len, top_y + head_height), line_width=line_width)
+
+    # Bottom lane points left.
+    _draw_contrasted_line(draw, (right_x, bottom_y, left_x, bottom_y), line_width=line_width)
+    _draw_contrasted_line(draw, (left_x, bottom_y, left_x + head_len, bottom_y - head_height), line_width=line_width)
+    _draw_contrasted_line(draw, (left_x, bottom_y, left_x + head_len, bottom_y + head_height), line_width=line_width)
+
+
+def _draw_swap_number_badge(
+    draw: "ImageDraw.ImageDraw",
+    cx: int,
+    cy: int,
+    marker_label: str,
+    glyph_half_len: int,
+    width: int,
+    height: int,
+) -> None:
+    badge_radius = max(10, int(round(glyph_half_len * 0.48)))
+    badge_cx = cx + glyph_half_len
+    badge_cy = cy - glyph_half_len
+    badge_cx = max(badge_radius, min(badge_cx, width - 1 - badge_radius))
+    badge_cy = max(badge_radius, min(badge_cy, height - 1 - badge_radius))
+    badge_bbox = (
+        badge_cx - badge_radius,
+        badge_cy - badge_radius,
+        badge_cx + badge_radius,
+        badge_cy + badge_radius,
+    )
+    outline_width = max(2, int(round(badge_radius * 0.18)))
+    draw.ellipse(badge_bbox, fill=(0, 0, 0), outline=(255, 255, 255), width=outline_width)
+    _draw_marker_label(
+        draw=draw,
+        cx=badge_cx,
+        cy=badge_cy,
+        marker_label=marker_label,
+        radius=badge_radius,
+    )
 
 
 def _draw_red_marker_pixels(img: Image.Image, cx: int, cy: int, r: int) -> None:
@@ -835,6 +942,46 @@ def draw_red_x_overlay(image_png_bytes: bytes, marks: List[VibodeRemoveMark]) ->
     return image_to_png_bytes(img)
 
 
+def render_vibode_swap_overlay(image_png_bytes: bytes, marks: List[VibodeSwapMark]) -> bytes:
+    img = _safe_open_image(image_png_bytes)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    width, height = img.size
+    max_glyph_half_len = max(1, min(width, height) // 4)
+    min_dim = min(width, height)
+    base_half_len = int(round(min_dim * 0.045))
+    base_half_len = max(20, min(base_half_len, 72, max_glyph_half_len))
+
+    if _HAS_IMAGE_DRAW and ImageDraw is not None:
+        draw = ImageDraw.Draw(img)
+        for idx, mark in enumerate(marks):
+            cx = int(round(mark.x))
+            cy = int(round(mark.y))
+            cx = max(0, min(cx, width - 1))
+            cy = max(0, min(cy, height - 1))
+            _draw_swap_glyph(draw=draw, cx=cx, cy=cy, glyph_half_len=base_half_len)
+            _draw_swap_number_badge(
+                draw=draw,
+                cx=cx,
+                cy=cy,
+                marker_label=str(idx + 1),
+                glyph_half_len=base_half_len,
+                width=width,
+                height=height,
+            )
+    else:
+        # Keep a deterministic fallback if ImageDraw is unavailable.
+        for mark in marks:
+            radius = max(20, base_half_len)
+            cx = int(round(mark.x))
+            cy = int(round(mark.y))
+            cx = max(0, min(cx, width - 1))
+            cy = max(0, min(cy, height - 1))
+            _draw_red_x_pixels(img, cx, cy, radius)
+
+    return image_to_png_bytes(img)
+
+
 def scale_placements_for_resized_room_image(
     placements: List[VibodePlacement],
     original_size: Tuple[int, int],
@@ -925,6 +1072,36 @@ def scale_marks_for_resized_image(
     return scaled_marks
 
 
+def scale_swap_marks_for_resized_image(
+    marks: List[VibodeSwapMark],
+    original_size: Tuple[int, int],
+    resized_size: Tuple[int, int],
+) -> List[VibodeSwapMark]:
+    orig_w, orig_h = original_size
+    new_w, new_h = resized_size
+
+    if orig_w <= 0 or orig_h <= 0 or new_w <= 0 or new_h <= 0:
+        return marks
+
+    if (orig_w, orig_h) == (new_w, new_h):
+        return marks
+
+    scale_x = new_w / float(orig_w)
+    scale_y = new_h / float(orig_h)
+
+    scaled_marks: List[VibodeSwapMark] = []
+    for mark in marks:
+        scaled_marks.append(
+            mark.model_copy(
+                update={
+                    "x": mark.x * scale_x,
+                    "y": mark.y * scale_y,
+                }
+            )
+        )
+    return scaled_marks
+
+
 def _env_truthy(var_name: str) -> bool:
     value = os.getenv(var_name)
     if not value:
@@ -972,6 +1149,32 @@ def _summarize_remove_marks(
     }
 
 
+def _summarize_swap_marks(
+    marks: List[VibodeSwapMark],
+    replacement_assets: List[VibodeSwapReplacementAsset],
+    limit: int = 5,
+) -> Dict[str, object]:
+    preview: List[Dict[str, object]] = []
+    replacement_count = len(replacement_assets)
+    for idx, mark in enumerate(marks[:limit]):
+        mapped_asset = replacement_assets[idx] if idx < replacement_count else None
+        preview.append(
+            {
+                "markerIndex": idx + 1,
+                "markId": mark.id,
+                "x": round(mark.x, 1),
+                "y": round(mark.y, 1),
+                "markReplacementSkuId": mark.replacement.skuId,
+                "mappedAssetSkuId": mapped_asset.skuId if mapped_asset else None,
+            }
+        )
+    return {
+        "count": len(marks),
+        "replacementAssets": replacement_count,
+        "preview": preview,
+    }
+
+
 def maybe_dump_prepared_room_images(
     room_clean_png_bytes: bytes,
     room_marked_png_bytes: bytes,
@@ -1000,6 +1203,55 @@ def maybe_dump_prepared_room_images(
                 print("[maybe_dump_prepared_room_images] failed:", e)
     except Exception as e:
         print("[maybe_dump_prepared_room_images] failed:", e)
+
+
+def maybe_dump_vibode_swap_images(
+    room_clean_png_bytes: bytes,
+    room_swap_overlay_png_bytes: bytes,
+    output_dir: Optional[str] = None,
+) -> None:
+    if not _env_truthy("VIBODE_DUMP_ANNOTATED_IMAGE"):
+        return
+
+    try:
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
+        resolved_dir = output_dir or os.getenv("VIBODE_DEBUG_DIR") or "tmp/vibode_debug"
+        abs_dir = os.path.abspath(resolved_dir)
+        run_dir = os.path.join(abs_dir, f"swap_{timestamp}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        clean_path = os.path.join(run_dir, "clean_normalized.png")
+        overlay_path = os.path.join(run_dir, "swap_overlay.png")
+        preview_path = os.path.join(run_dir, "swap_preview_combined.png")
+
+        with open(clean_path, "wb") as handle:
+            handle.write(room_clean_png_bytes)
+        with open(overlay_path, "wb") as handle:
+            handle.write(room_swap_overlay_png_bytes)
+
+        try:
+            clean_img = _safe_open_image(room_clean_png_bytes)
+            overlay_img = _safe_open_image(room_swap_overlay_png_bytes)
+            preview_w = clean_img.width + overlay_img.width
+            preview_h = max(clean_img.height, overlay_img.height)
+            combined = Image.new("RGB", (preview_w, preview_h), color=(30, 30, 30))
+            combined.paste(clean_img, (0, 0))
+            combined.paste(overlay_img, (clean_img.width, 0))
+            with open(preview_path, "wb") as handle:
+                handle.write(image_to_png_bytes(combined))
+        except Exception as e:
+            print("[maybe_dump_vibode_swap_images] failed to write preview:", e)
+
+        print(
+            "[maybe_dump_vibode_swap_images] wrote:",
+            {
+                "clean_normalized": clean_path,
+                "swap_overlay": overlay_path,
+                "swap_preview_combined": preview_path,
+            },
+        )
+    except Exception as e:
+        print("[maybe_dump_vibode_swap_images] failed:", e)
 
 
 def prepare_sku_png_bytes(image_bytes: bytes) -> bytes:
@@ -1053,6 +1305,14 @@ VIBODE_REMOVE_PROMPT = (
     "Remove objects under red X markers only. "
     "Do not restyle or add new objects. "
     "Preserve lighting/perspective."
+)
+
+VIBODE_SWAP_PROMPT = (
+    "You will edit Image 1 using guidance from Image 2.\n"
+    "For each numbered swap marker, remove the object at that marker and replace it with the corresponding replacement image.\n"
+    "Marker #1 uses replacement Image #3, marker #2 uses Image #4, etc.\n"
+    "Match perspective, scale to the removed object footprint, lighting, shadows, and occlusion.\n"
+    "Do not change anything outside the swapped objects. Do not restage the room."
 )
 
 
@@ -1466,3 +1726,154 @@ async def vibode_remove(req: VibodeRemoveRequest):
         debug_ratio = applied_ratio or "auto"
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
+
+
+@app.post("/vibode/swap", response_model=VibodeSwapResponse)
+async def vibode_swap(req: VibodeSwapRequest):
+    if not req.cleanBase64 or not req.cleanBase64.strip():
+        raise HTTPException(status_code=400, detail="cleanBase64 is required.")
+    if not req.marks:
+        raise HTTPException(status_code=400, detail="marks must be non-empty.")
+    if not req.replacementAssets:
+        raise HTTPException(status_code=400, detail="replacementAssets must be non-empty.")
+    if len(req.replacementAssets) < len(req.marks):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "replacementAssets length must be >= marks length. "
+                "Marker #1 uses replacementAssets[0], marker #2 uses replacementAssets[1], etc."
+            ),
+        )
+
+    for idx, mark in enumerate(req.marks):
+        if not math.isfinite(mark.x) or not math.isfinite(mark.y):
+            raise HTTPException(
+                status_code=400,
+                detail=f"marks[{idx}] has invalid coordinates; x and y must be finite numbers.",
+            )
+        if not mark.replacement.imageUrl or not mark.replacement.imageUrl.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"marks[{idx}].replacement.imageUrl is required.",
+            )
+
+    for idx, asset in enumerate(req.replacementAssets):
+        if not asset.imageUrl or not asset.imageUrl.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"replacementAssets[{idx}].imageUrl is required.",
+            )
+
+    model_name = resolve_model_name(req.modelVersion)
+    marks_ordered = list(req.marks)  # Preserve request order: marker index -> replacement index.
+    mapped_replacements = req.replacementAssets[: len(marks_ordered)]
+
+    try:
+        room_raw_bytes = _decode_base64_image(req.cleanBase64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 room image data")
+
+    try:
+        room_orig_img = _safe_open_image(room_raw_bytes)
+        orig_w, orig_h = room_orig_img.size
+    except Exception as e:
+        print("[/vibode/swap] Error decoding room image dimensions:", e)
+        raise HTTPException(status_code=400, detail="Could not process room image")
+
+    applied_ratio: Optional[str] = None
+    aspect_ratio_to_send: Optional[str] = None
+    try:
+        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
+            room_raw_bytes,
+            requested_ratio="auto",
+            model_name=model_name,
+        )
+        aspect_ratio_to_send = applied_ratio
+    except Exception as e:
+        print("[/vibode/swap] Error preparing room image:", e)
+        raise HTTPException(status_code=400, detail="Could not process room image")
+
+    try:
+        room_pre_overlay_img = _safe_open_image(room_png_bytes)
+        new_w, new_h = room_pre_overlay_img.size
+    except Exception as e:
+        print("[/vibode/swap] Error decoding prepared room image dimensions:", e)
+        raise HTTPException(status_code=500, detail="Failed to prepare room overlay image")
+
+    marks_for_overlay = scale_swap_marks_for_resized_image(
+        marks_ordered,
+        original_size=(orig_w, orig_h),
+        resized_size=(new_w, new_h),
+    )
+
+    try:
+        room_overlay_png_bytes = render_vibode_swap_overlay(room_png_bytes, marks_for_overlay)
+    except Exception as e:
+        print("[/vibode/swap] Error drawing swap markers:", e)
+        raise HTTPException(status_code=500, detail="Failed to draw swap markers")
+
+    maybe_dump_vibode_swap_images(
+        room_clean_png_bytes=room_png_bytes,
+        room_swap_overlay_png_bytes=room_overlay_png_bytes,
+    )
+
+    replacement_png_bytes_list: List[bytes] = []
+    try:
+        for asset in mapped_replacements:
+            replacement_raw_bytes = _fetch_image_bytes_from_url(asset.imageUrl)
+            replacement_png_bytes_list.append(prepare_sku_png_bytes(replacement_raw_bytes))
+    except Exception as e:
+        print("[/vibode/swap] Error preparing replacement asset images:", e)
+        raise HTTPException(status_code=400, detail="Failed to fetch replacement asset image data")
+
+    print(
+        "[/vibode/swap] Received request:",
+        {
+            "marks": len(req.marks),
+            "replacementAssets": len(req.replacementAssets),
+            "mappedReplacementAssets": len(mapped_replacements),
+            "marks_summary": _summarize_swap_marks(marks_ordered, mapped_replacements),
+            "room_bytes_len": len(room_raw_bytes),
+            "room_png_len": len(room_png_bytes),
+            "modelVersion": req.modelVersion,
+            "modelName": model_name,
+            "requestedAspectRatio": "auto",
+            "appliedAspectRatio": applied_ratio,
+            "sentAspectRatio": aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
+            "maxInputLongEdge": MAX_INPUT_LONG_EDGE_INT,
+        },
+    )
+
+    swap_prompt_hash = _short_prompt_hash(VIBODE_SWAP_PROMPT)
+    swap_prompt_first_line = _prompt_first_line(VIBODE_SWAP_PROMPT)
+    print(
+        "[/vibode/swap] Prompt summary:",
+        {
+            "prompt_hash": swap_prompt_hash,
+            "prompt_first_line": swap_prompt_first_line,
+            "marks_summary": _summarize_swap_marks(marks_ordered, mapped_replacements),
+        },
+    )
+    if VIBODE_LOG_PROMPTS:
+        print("\n===== VIBODE SWAP PROMPT SENT TO GEMINI =====\n")
+        print(VIBODE_SWAP_PROMPT)
+        print("\n==============================================\n")
+
+    try:
+        out_bytes = call_gemini_multimodal(
+            prompt=VIBODE_SWAP_PROMPT,
+            room_png_bytes=room_png_bytes,
+            room_overlay_png_bytes=room_overlay_png_bytes,
+            sku_png_bytes_list=replacement_png_bytes_list,
+            model_name=model_name,
+            aspect_ratio=aspect_ratio_to_send,
+        )
+    except Exception as e:
+        print("[/vibode/swap] Error in processing:", e)
+        raise HTTPException(status_code=500, detail="Error during swap")
+
+    if not out_bytes:
+        raise HTTPException(status_code=500, detail="Swap returned empty image")
+
+    data_url = make_data_url(out_bytes, mime_type="image/png")
+    return VibodeSwapResponse(imageUrl=data_url)
