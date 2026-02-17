@@ -1462,6 +1462,90 @@ def _env_truthy(var_name: str) -> bool:
 
 # Toggle full prompt logging for Vibode routes (off by default to avoid log spam)
 VIBODE_LOG_PROMPTS = _env_truthy("VIBODE_LOG_PROMPTS")
+# Strict validation guardrails for Vibode routes (off by default).
+VIBODE_STRICT = _env_truthy("VIBODE_STRICT")
+
+
+def _append_missing_nonempty_str(
+    missing_fields: List[str],
+    field_path: str,
+    value: Optional[str],
+) -> None:
+    if not value or not value.strip():
+        missing_fields.append(field_path)
+
+
+def _reject_if_vibode_strict_missing(route_tag: str, missing_fields: List[str]) -> None:
+    if not VIBODE_STRICT or not missing_fields:
+        return
+    print(
+        f"[{route_tag}] VIBODE_STRICT reject missing required fields:",
+        ", ".join(missing_fields),
+    )
+    raise HTTPException(
+        status_code=400,
+        detail=f"Missing required fields: {', '.join(missing_fields)}",
+    )
+
+
+def _collect_vibode_compose_missing_fields(req: VibodeComposeRequest) -> List[str]:
+    missing_fields: List[str] = []
+    _append_missing_nonempty_str(missing_fields, "roomImageBase64", req.roomImageBase64)
+    if not req.placements:
+        missing_fields.append("placements")
+        return missing_fields
+
+    for idx, placement in enumerate(req.placements):
+        _append_missing_nonempty_str(missing_fields, f"placements[{idx}].nodeId", placement.nodeId)
+        _append_missing_nonempty_str(
+            missing_fields,
+            f"placements[{idx}].skuImageBase64",
+            placement.skuImageBase64,
+        )
+    return missing_fields
+
+
+def _collect_vibode_remove_missing_fields(req: VibodeRemoveRequest) -> List[str]:
+    missing_fields: List[str] = []
+    _append_missing_nonempty_str(missing_fields, "cleanBase64", req.cleanBase64)
+    if not req.marks:
+        missing_fields.append("marks")
+        return missing_fields
+
+    for idx, mark in enumerate(req.marks):
+        _append_missing_nonempty_str(missing_fields, f"marks[{idx}].id", mark.id)
+    return missing_fields
+
+
+def _collect_vibode_swap_missing_fields(req: VibodeSwapRequest) -> List[str]:
+    missing_fields: List[str] = []
+    _append_missing_nonempty_str(missing_fields, "cleanBase64", req.cleanBase64)
+
+    if not req.marks:
+        missing_fields.append("marks")
+    else:
+        for idx, mark in enumerate(req.marks):
+            _append_missing_nonempty_str(missing_fields, f"marks[{idx}].id", mark.id)
+            if not mark.replacement:
+                missing_fields.append(f"marks[{idx}].replacement")
+            else:
+                _append_missing_nonempty_str(
+                    missing_fields,
+                    f"marks[{idx}].replacement.imageUrl",
+                    mark.replacement.imageUrl,
+                )
+
+    if not req.replacementAssets:
+        missing_fields.append("replacementAssets")
+    else:
+        for idx, asset in enumerate(req.replacementAssets):
+            _append_missing_nonempty_str(
+                missing_fields,
+                f"replacementAssets[{idx}].imageUrl",
+                asset.imageUrl,
+            )
+
+    return missing_fields
 
 
 def _short_prompt_hash(prompt: str, length: int = 12) -> str:
@@ -2213,6 +2297,8 @@ async def stage_room(req: StageRoomRequest):
 
 @app.post("/vibode/compose", response_model=VibodeComposeResponse)
 async def vibode_compose(req: VibodeComposeRequest):
+    _reject_if_vibode_strict_missing("/vibode/compose", _collect_vibode_compose_missing_fields(req))
+
     if not req.placements:
         raise HTTPException(status_code=400, detail="No placements provided.")
 
@@ -2326,6 +2412,8 @@ async def vibode_compose(req: VibodeComposeRequest):
 
 @app.post("/vibode/remove", response_model=VibodeComposeResponse)
 async def vibode_remove(req: VibodeRemoveRequest):
+    _reject_if_vibode_strict_missing("/vibode/remove", _collect_vibode_remove_missing_fields(req))
+
     if not req.marks:
         raise HTTPException(status_code=400, detail="No marks provided.")
 
@@ -2438,6 +2526,8 @@ async def vibode_remove(req: VibodeRemoveRequest):
 
 @app.post("/vibode/swap", response_model=VibodeSwapResponse)
 async def vibode_swap(req: VibodeSwapRequest):
+    _reject_if_vibode_strict_missing("/vibode/swap", _collect_vibode_swap_missing_fields(req))
+
     if not req.cleanBase64 or not req.cleanBase64.strip():
         raise HTTPException(status_code=400, detail="cleanBase64 is required.")
     if not req.marks:
