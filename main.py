@@ -504,6 +504,27 @@ class VibodeComposeRequest(BaseModel):
     aspectRatio: Optional[AspectRatio] = "auto"
 
 
+class VibodeEligibleSku(BaseModel):
+    skuId: str
+    label: Optional[str] = None
+    defaultPxWidth: Optional[int] = None
+    defaultPxHeight: Optional[int] = None
+    realWidthFt: Optional[float] = None
+    realDepthFt: Optional[float] = None
+    variants: Optional[List[Dict[str, Any]]] = None
+
+
+class VibodeVibeRequest(BaseModel):
+    roomImageBase64: str
+    collectionId: Optional[str] = None
+    bundleId: Optional[str] = None
+    eligibleSkus: List[VibodeEligibleSku]
+    targetCount: Optional[int] = None
+    enhancePhoto: bool = True
+    modelVersion: Optional[str] = None
+    aspectRatio: Optional[AspectRatio] = "auto"
+
+
 class VibodeComposeResponse(BaseModel):
     imageUrl: str
     appliedAspectRatio: Optional[str] = None
@@ -1505,6 +1526,18 @@ def _collect_vibode_compose_missing_fields(req: VibodeComposeRequest) -> List[st
     return missing_fields
 
 
+def _collect_vibode_vibe_missing_fields(req: VibodeVibeRequest) -> List[str]:
+    missing_fields: List[str] = []
+    _append_missing_nonempty_str(missing_fields, "roomImageBase64", req.roomImageBase64)
+    if not req.eligibleSkus:
+        missing_fields.append("eligibleSkus")
+        return missing_fields
+
+    for idx, sku in enumerate(req.eligibleSkus):
+        _append_missing_nonempty_str(missing_fields, f"eligibleSkus[{idx}].skuId", sku.skuId)
+    return missing_fields
+
+
 def _collect_vibode_remove_missing_fields(req: VibodeRemoveRequest) -> List[str]:
     missing_fields: List[str] = []
     _append_missing_nonempty_str(missing_fields, "cleanBase64", req.cleanBase64)
@@ -1840,6 +1873,45 @@ def prepare_sku_png_bytes(image_bytes: bytes) -> bytes:
     return image_to_png_bytes(img)
 
 
+def _extract_vibode_vibe_sku_image_ref(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.startswith("http://") or candidate.startswith("https://"):
+            return candidate
+        if candidate.startswith("data:image/"):
+            return candidate
+        return None
+
+    if isinstance(value, list):
+        for item in value:
+            resolved = _extract_vibode_vibe_sku_image_ref(item)
+            if resolved:
+                return resolved
+        return None
+
+    if isinstance(value, dict):
+        preferred_keys = [
+            "imageUrl",
+            "imageURL",
+            "url",
+            "pngUrl",
+            "assetUrl",
+            "src",
+            "image",
+            "asset",
+        ]
+        for key in preferred_keys:
+            if key in value:
+                resolved = _extract_vibode_vibe_sku_image_ref(value.get(key))
+                if resolved:
+                    return resolved
+        for nested_value in value.values():
+            resolved = _extract_vibode_vibe_sku_image_ref(nested_value)
+            if resolved:
+                return resolved
+    return None
+
+
 def build_vibode_compose_prompt(
     placements: List[VibodePlacement],
     enhance_photo: bool,
@@ -1878,6 +1950,52 @@ def build_vibode_compose_prompt(
         print("\n===== VIBODE COMPOSE PROMPT SENT TO GEMINI =====\n")
         print("\n".join(lines))
         print("\n=================================================\n")
+    return "\n".join(lines)
+
+
+def build_vibode_vibe_prompt(
+    eligible_skus: List[VibodeEligibleSku],
+    collection_id: Optional[str],
+    bundle_id: Optional[str],
+    target_count: int,
+    enhance_photo: bool,
+) -> str:
+    lines = [
+        "Stage the room photo with furniture from the provided SKU assets.",
+        "",
+        "Constraints:",
+        f"- Place approximately {target_count} furniture items using only provided SKU assets.",
+        "- Maintain room geometry and lighting consistency.",
+        "- Do not add text, logos, or watermarks.",
+        "- Do not alter architecture (windows, doors, walls) beyond necessary furniture occlusion.",
+        "",
+    ]
+
+    if collection_id and collection_id.strip():
+        lines.append(f"Collection ID: {collection_id.strip()}")
+    if bundle_id and bundle_id.strip():
+        lines.append(f"Bundle ID: {bundle_id.strip()}")
+    if collection_id or bundle_id:
+        lines.append("")
+
+    lines.append("SKU reference list (in order):")
+    for idx, sku in enumerate(eligible_skus, start=1):
+        label = (sku.label or "").strip()
+        if label:
+            lines.append(f"{idx}. {sku.skuId} - {label}")
+        else:
+            lines.append(f"{idx}. {sku.skuId}")
+
+    if enhance_photo:
+        lines += [
+            "",
+            "Subtly enhance photo quality while preserving the original room appearance.",
+        ]
+
+    if DEBUG_ROOMPRINTZ_PROMPT:
+        print("\n===== VIBODE VIBE PROMPT SENT TO GEMINI =====\n")
+        print("\n".join(lines))
+        print("\n==============================================\n")
     return "\n".join(lines)
 
 
@@ -2400,6 +2518,121 @@ async def vibode_compose(req: VibodeComposeRequest):
 
     if not out_bytes:
         raise HTTPException(status_code=500, detail="Compose returned empty image")
+
+    data_url = make_data_url(out_bytes, mime_type="image/png")
+
+    debug_ratio: Optional[str] = None
+    if DEBUG_ROOMPRINTZ_RATIO:
+        debug_ratio = applied_ratio or "auto"
+
+    return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
+
+
+@app.post("/vibode/vibe", response_model=VibodeComposeResponse)
+async def vibode_vibe(req: VibodeVibeRequest):
+    _reject_if_vibode_strict_missing("/vibode/vibe", _collect_vibode_vibe_missing_fields(req))
+
+    model_name = resolve_model_name(req.modelVersion)
+
+    try:
+        room_raw_bytes = _decode_base64_image(req.roomImageBase64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 room image data")
+
+    applied_ratio: Optional[str] = None
+    aspect_ratio_to_send: Optional[str] = None
+    try:
+        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
+            room_raw_bytes,
+            requested_ratio=req.aspectRatio,
+            model_name=model_name,
+        )
+        aspect_ratio_to_send = applied_ratio
+    except Exception as e:
+        print("[/vibode/vibe] Error preparing room image:", e)
+        raise HTTPException(status_code=400, detail="Could not process room image")
+
+    max_target = min(len(req.eligibleSkus), 12)
+    if req.targetCount is not None:
+        target_count = max(1, min(req.targetCount, max_target))
+    else:
+        bundle_id_normalized = (req.bundleId or "").strip().lower()
+        if "small" in bundle_id_normalized:
+            default_target = 6
+        elif "large" in bundle_id_normalized:
+            default_target = 8
+        else:
+            default_target = 7
+        target_count = max(1, min(default_target, max_target))
+
+    selected_skus = req.eligibleSkus[:target_count]
+    print(
+        f"[vibode/vibe] selectedSkus={len(selected_skus)} targetCount={target_count} "
+        f"collection={req.collectionId} bundle={req.bundleId}"
+    )
+
+    sku_png_bytes_list: List[bytes] = []
+    for idx, sku in enumerate(selected_skus):
+        image_ref: Optional[str] = None
+
+        resolver = globals().get("resolveIkeaSkuImageUrl") or globals().get("resolve_ikea_sku_image_url")
+        if callable(resolver):
+            try:
+                image_ref = _extract_vibode_vibe_sku_image_ref(resolver(sku.skuId))
+            except Exception as e:
+                print("[/vibode/vibe] SKU resolver failed:", {"skuId": sku.skuId, "error": str(e)})
+
+        if not image_ref:
+            image_ref = _extract_vibode_vibe_sku_image_ref(sku.variants or [])
+        if not image_ref:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"eligibleSkus[{idx}] skuId={sku.skuId} is missing an image asset input. "
+                    "Provide a variant image URL/data URL or add a skuId image resolver."
+                ),
+            )
+
+        try:
+            if image_ref.startswith("data:image/"):
+                payload_b64 = image_ref.split(",", 1)[1] if "," in image_ref else image_ref
+                sku_raw_bytes = _decode_base64_image(payload_b64)
+            else:
+                sku_raw_bytes = _fetch_image_bytes_from_url(image_ref)
+            sku_png_bytes_list.append(prepare_sku_png_bytes(sku_raw_bytes))
+        except HTTPException:
+            raise
+        except Exception as e:
+            print("[/vibode/vibe] Error preparing SKU image:", {"skuId": sku.skuId, "error": str(e)})
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to fetch/prepare image for eligibleSkus[{idx}] skuId={sku.skuId}",
+            )
+
+    room_overlay_png_bytes = room_png_bytes
+    prompt = build_vibode_vibe_prompt(
+        eligible_skus=selected_skus,
+        collection_id=req.collectionId,
+        bundle_id=req.bundleId,
+        target_count=target_count,
+        enhance_photo=req.enhancePhoto,
+    )
+
+    try:
+        out_bytes = call_gemini_multimodal(
+            prompt=prompt,
+            room_png_bytes=room_png_bytes,
+            room_overlay_png_bytes=room_overlay_png_bytes,
+            sku_png_bytes_list=sku_png_bytes_list,
+            model_name=model_name,
+            aspect_ratio=aspect_ratio_to_send,
+        )
+    except Exception as e:
+        print("[/vibode/vibe] Error in processing:", e)
+        raise HTTPException(status_code=500, detail="Error during vibe")
+
+    if not out_bytes:
+        raise HTTPException(status_code=500, detail="Vibe returned empty image")
 
     data_url = make_data_url(out_bytes, mime_type="image/png")
 
