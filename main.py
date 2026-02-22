@@ -1538,6 +1538,12 @@ def _collect_vibode_vibe_missing_fields(req: VibodeVibeRequest) -> List[str]:
     return missing_fields
 
 
+def _collect_vibode_full_vibe_missing_fields(req: VibodeVibeRequest) -> List[str]:
+    missing_fields: List[str] = []
+    _append_missing_nonempty_str(missing_fields, "roomImageBase64", req.roomImageBase64)
+    return missing_fields
+
+
 def _collect_vibode_remove_missing_fields(req: VibodeRemoveRequest) -> List[str]:
     missing_fields: List[str] = []
     _append_missing_nonempty_str(missing_fields, "cleanBase64", req.cleanBase64)
@@ -1996,6 +2002,60 @@ def build_vibode_vibe_prompt(
         print("\n===== VIBODE VIBE PROMPT SENT TO GEMINI =====\n")
         print("\n".join(lines))
         print("\n==============================================\n")
+    return "\n".join(lines)
+
+
+def build_full_vibe_prompt_sunlit_editorial_v1(
+    collection_id: Optional[str],
+    bundle_id: Optional[str],
+    enhance_photo: bool,
+) -> str:
+    lines = [
+        "You are a professional interior photo editor performing a non-destructive polish pass.",
+        "",
+        "Goal:",
+        "- Apply a subtle full-vibe enhancement pass, not a redesign or restage.",
+        "- Preserve the exact room layout, architecture, and primary furniture positions.",
+        "",
+        "Sunlit editorial lighting direction:",
+        "- Keep lighting natural and believable.",
+        "- Use soft daylight with slight warmth, gentle shadows, and balanced highlights.",
+        "- Improve texture clarity and add only mild natural vibrancy.",
+        "",
+        "Subtle declutter rules:",
+        "- Remove only minor non-essential clutter (for example: visible cords, tiny stray items).",
+        "- Keep meaningful decor, artwork, and all primary furniture.",
+        "",
+        "Minimal accent styling limits:",
+        "- Add less when unsure.",
+        "- At most 1-2 pillows total.",
+        "- Optional small coffee table styling only.",
+        "- Optional small vase or plant, and a simple centerpiece only.",
+        "- No new primary furniture.",
+        "- No new rugs, gallery walls, or shelf redesign.",
+        "",
+        "Hard prohibitions:",
+        "- Do not change layout.",
+        "- Do not shift perspective or camera angle.",
+        "- Do not perform major additions or removals.",
+        "- Do not add text, logos, or watermarks.",
+    ]
+
+    if collection_id and collection_id.strip():
+        lines.append(f"Collection ID (context only): {collection_id.strip()}")
+    if bundle_id and bundle_id.strip():
+        lines.append(f"Bundle ID (context only): {bundle_id.strip()}")
+
+    if enhance_photo:
+        lines += [
+            "",
+            "Apply subtle quality enhancement while preserving realism and original room identity.",
+        ]
+
+    if DEBUG_ROOMPRINTZ_PROMPT:
+        print("\n===== VIBODE FULL VIBE PROMPT SENT TO GEMINI =====\n")
+        print("\n".join(lines))
+        print("\n===================================================\n")
     return "\n".join(lines)
 
 
@@ -2633,6 +2693,67 @@ async def vibode_vibe(req: VibodeVibeRequest):
 
     if not out_bytes:
         raise HTTPException(status_code=500, detail="Vibe returned empty image")
+
+    data_url = make_data_url(out_bytes, mime_type="image/png")
+
+    debug_ratio: Optional[str] = None
+    if DEBUG_ROOMPRINTZ_RATIO:
+        debug_ratio = applied_ratio or "auto"
+
+    return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
+
+
+@app.post("/vibode/full_vibe", response_model=VibodeComposeResponse)
+async def vibode_full_vibe(req: VibodeVibeRequest):
+    _reject_if_vibode_strict_missing(
+        "/vibode/full_vibe",
+        _collect_vibode_full_vibe_missing_fields(req),
+    )
+
+    model_name = resolve_model_name(req.modelVersion)
+
+    try:
+        room_raw_bytes = _decode_base64_image(req.roomImageBase64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 room image data")
+
+    applied_ratio: Optional[str] = None
+    aspect_ratio_to_send: Optional[str] = None
+    try:
+        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
+            room_raw_bytes,
+            requested_ratio=req.aspectRatio,
+            model_name=model_name,
+        )
+        aspect_ratio_to_send = applied_ratio
+    except Exception as e:
+        print("[/vibode/full_vibe] Error preparing room image:", e)
+        raise HTTPException(status_code=400, detail="Could not process room image")
+
+    print(
+        f"[vibode/full_vibe] collection={req.collectionId} bundle={req.bundleId} "
+        f"eligibleSkus={len(req.eligibleSkus or [])}"
+    )
+
+    prompt = build_full_vibe_prompt_sunlit_editorial_v1(
+        collection_id=req.collectionId,
+        bundle_id=req.bundleId,
+        enhance_photo=req.enhancePhoto,
+    )
+
+    try:
+        out_bytes = call_gemini_with_prompt(
+            image_png_bytes=room_png_bytes,
+            prompt=prompt,
+            model_name=model_name,
+            aspect_ratio=aspect_ratio_to_send,
+        )
+    except Exception as e:
+        print("[/vibode/full_vibe] Error in processing:", e)
+        raise HTTPException(status_code=500, detail="Error during full vibe")
+
+    if not out_bytes:
+        raise HTTPException(status_code=500, detail="Full vibe returned empty image")
 
     data_url = make_data_url(out_bytes, mime_type="image/png")
 
