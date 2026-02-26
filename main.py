@@ -504,6 +504,30 @@ class VibodeComposeRequest(BaseModel):
     aspectRatio: Optional[AspectRatio] = "auto"
 
 
+class FreezeBaseImageInput(BaseModel):
+    signedUrl: Optional[str] = None
+    base64: Optional[str] = None
+    widthPx: Optional[int] = None
+    heightPx: Optional[int] = None
+    # Backward compatibility for older clients.
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+class FreezePayloadV2Input(BaseModel):
+    baseImage: FreezeBaseImageInput
+    vibodeIntent: Optional[Dict[str, Any]] = None
+
+
+class VibodeFreezeRequest(BaseModel):
+    freeze: FreezePayloadV2Input
+    collectionId: Optional[str] = None
+    bundleId: Optional[str] = None
+    enhancePhoto: bool = True
+    modelVersion: Optional[str] = None
+    aspectRatio: Optional[AspectRatio] = "auto"
+
+
 class VibodeEligibleSku(BaseModel):
     skuId: str
     label: Optional[str] = None
@@ -1538,9 +1562,17 @@ def _collect_vibode_vibe_missing_fields(req: VibodeVibeRequest) -> List[str]:
     return missing_fields
 
 
-def _collect_vibode_full_vibe_missing_fields(req: VibodeVibeRequest) -> List[str]:
+def _collect_vibode_full_vibe_missing_fields(req: VibodeFreezeRequest) -> List[str]:
     missing_fields: List[str] = []
-    _append_missing_nonempty_str(missing_fields, "roomImageBase64", req.roomImageBase64)
+    base_image = req.freeze.baseImage if req.freeze else None
+    if not base_image:
+        missing_fields.append("freeze.baseImage")
+        return missing_fields
+
+    has_signed_url = bool(base_image.signedUrl and base_image.signedUrl.strip())
+    has_base64 = bool(base_image.base64 and base_image.base64.strip())
+    if not has_signed_url and not has_base64:
+        missing_fields.append("freeze.baseImage.signedUrl")
     return missing_fields
 
 
@@ -2704,7 +2736,7 @@ async def vibode_vibe(req: VibodeVibeRequest):
 
 
 @app.post("/vibode/full_vibe", response_model=VibodeComposeResponse)
-async def vibode_full_vibe(req: VibodeVibeRequest):
+async def vibode_full_vibe(req: VibodeFreezeRequest):
     _reject_if_vibode_strict_missing(
         "/vibode/full_vibe",
         _collect_vibode_full_vibe_missing_fields(req),
@@ -2712,10 +2744,35 @@ async def vibode_full_vibe(req: VibodeVibeRequest):
 
     model_name = resolve_model_name(req.modelVersion)
 
+    base_image = req.freeze.baseImage
     try:
-        room_raw_bytes = _decode_base64_image(req.roomImageBase64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 room image data")
+        if base_image.signedUrl and base_image.signedUrl.strip():
+            room_raw_bytes = _fetch_image_bytes_from_url(base_image.signedUrl.strip())
+        elif base_image.base64 and base_image.base64.strip():
+            room_raw_bytes = _decode_base64_image(base_image.base64)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide freeze.baseImage.signedUrl or freeze.baseImage.base64.",
+            )
+    except Exception as e:
+        print("[/vibode/full_vibe] Failed to resolve base image:", e)
+        raise HTTPException(status_code=400, detail="Failed to resolve freeze base image data")
+
+    collection_id = req.collectionId
+    bundle_id = req.bundleId
+    enhance_photo = req.enhancePhoto
+    vibode_intent_block = req.freeze.vibodeIntent
+    if isinstance(vibode_intent_block, dict):
+        vibode_collection = vibode_intent_block.get("collectionId")
+        vibode_bundle = vibode_intent_block.get("bundleId")
+        vibode_enhance = vibode_intent_block.get("enhancePhoto")
+        if isinstance(vibode_collection, str) and vibode_collection.strip():
+            collection_id = vibode_collection
+        if isinstance(vibode_bundle, str) and vibode_bundle.strip():
+            bundle_id = vibode_bundle
+        if isinstance(vibode_enhance, bool):
+            enhance_photo = vibode_enhance
 
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
@@ -2731,14 +2788,13 @@ async def vibode_full_vibe(req: VibodeVibeRequest):
         raise HTTPException(status_code=400, detail="Could not process room image")
 
     print(
-        f"[vibode/full_vibe] collection={req.collectionId} bundle={req.bundleId} "
-        f"eligibleSkus={len(req.eligibleSkus or [])}"
+        f"[vibode/full_vibe] collection={collection_id} bundle={bundle_id}"
     )
 
     prompt = build_full_vibe_prompt_sunlit_editorial_v1(
-        collection_id=req.collectionId,
-        bundle_id=req.bundleId,
-        enhance_photo=req.enhancePhoto,
+        collection_id=collection_id,
+        bundle_id=bundle_id,
+        enhance_photo=enhance_photo,
     )
 
     try:
