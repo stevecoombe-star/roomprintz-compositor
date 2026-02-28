@@ -524,6 +524,7 @@ class VibodeFreezeRequest(BaseModel):
     collectionId: Optional[str] = None
     bundleId: Optional[str] = None
     enhancePhoto: bool = True
+    heavyDeclutter: bool = False
     modelVersion: Optional[str] = None
     aspectRatio: Optional[AspectRatio] = "auto"
 
@@ -2037,58 +2038,117 @@ def build_vibode_vibe_prompt(
     return "\n".join(lines)
 
 
+# ---- Full Vibe Prompt Anchor ----
+
+FULL_VIBE_PREAMBLE = """
+You are a professional interior photo editor performing a subtle, non-destructive polish pass.
+Your job is to enhance the existing room realistically while preserving its identity, layout, and architecture.
+Do not redesign, restage, or creatively reinterpret the space.
+""".strip()
+
+
+# ---- Optional Enhancement Fragment ----
+
+ENHANCE_FRAGMENT = """
+Step 1 — Enhance photo quality (technical pass only):
+- Correct white balance so the scene looks natural and realistic; do NOT over-neutralize or remove a subtle warm tone.
+- Optimize exposure: recover highlights and gently open shadows.
+- Maintain realistic contrast (do NOT create HDR effects).
+- Improve dynamic range for a bright, inviting interior.
+- Increase sharpness and clarity slightly (avoid oversharpening).
+- Reduce visible noise or grain.
+- Enhancements must support the Step 3 Sunlit Editorial look and must not override its warmth.
+- Preserve original room layout, geometry, and object placement.
+""".strip()
+
+
+# ---- Light Declutter Fragment ----
+
+LIGHT_DECLUTTER_FRAGMENT = """
+Step 2 — Light tidy pass:
+- Remove existing minor non-essential clutter if present (for example: small stray items or visible loose cords).
+- Never introduce new clutter, cables, wires, or additional objects.
+- If unsure, leave surfaces clean and minimal.
+- Keep all primary furniture and meaningful decor.
+""".strip()
+
+
+# ---- Heavy Declutter Fragment ----
+
+HEAVY_DECLUTTER_FRAGMENT = """
+Step 2 — Deep declutter and cleanup:
+- Remove visible clutter and personal items from surfaces and floors.
+- Examples: toys, clothes, laundry baskets, trash, cables, countertop clutter, small busy decor.
+- Keep key furniture pieces that define the room (sofa, bed, table, chairs, TV console).
+- Keep built-in fixtures and major appliances.
+- Do NOT remove walls, windows, doors, radiators, or built-in cabinetry.
+- Never introduce new clutter, cables, or replacement objects.
+- After cleanup, the room should feel tidy, neutral, and ready for real-estate photography.
+""".strip()
+
+
+# ---- Full Vibe Editorial Core ----
+
+FULL_VIBE_CORE = """
+Step 3 — Apply subtle full-vibe editorial polish:
+- Preserve the exact room layout, architecture, and primary furniture positions.
+- Use soft natural daylight with slight warmth.
+- Add gentle, believable shadows and balanced highlights.
+- Improve texture clarity and mild natural vibrancy.
+- Add minimal accent styling only if it enhances realism.
+- At most 1–2 pillows total.
+- Optional small coffee table styling.
+- Optional small vase or plant.
+- Do NOT add new primary furniture.
+- Do NOT add rugs, wall art, drapes, or major decor.
+""".strip()
+
+
+# ---- Hard Prohibitions ----
+
+HARD_RULES = """
+Hard rules:
+- Do not change layout.
+- Do not shift camera angle or perspective.
+- Do not alter architecture.
+- Do not add large decor elements.
+- Do not introduce new clutter.
+- Do not add text, logos, or watermarks.
+""".strip()
+
+
 def build_full_vibe_prompt_sunlit_editorial_v1(
     collection_id: Optional[str],
     bundle_id: Optional[str],
     enhance_photo: bool,
+    heavy_declutter: bool,
 ) -> str:
-    lines = [
-        "You are a professional interior photo editor performing a non-destructive polish pass.",
-        "",
-        "Goal:",
-        "- Apply a subtle full-vibe enhancement pass, not a redesign or restage.",
-        "- Preserve the exact room layout, architecture, and primary furniture positions.",
-        "",
-        "Sunlit editorial lighting direction:",
-        "- Keep lighting natural and believable.",
-        "- Use soft daylight with slight warmth, gentle shadows, and balanced highlights.",
-        "- Improve texture clarity and add only mild natural vibrancy.",
-        "",
-        "Subtle declutter rules:",
-        "- Remove only minor non-essential clutter (for example: visible cords, tiny stray items).",
-        "- Keep meaningful decor, artwork, and all primary furniture.",
-        "",
-        "Minimal accent styling limits:",
-        "- Add less when unsure.",
-        "- At most 1-2 pillows total.",
-        "- Optional small coffee table styling only.",
-        "- Optional small vase or plant, and a simple centerpiece only.",
-        "- No new primary furniture.",
-        "- No new rugs, gallery walls, or shelf redesign.",
-        "",
-        "Hard prohibitions:",
-        "- Do not change layout.",
-        "- Do not shift perspective or camera angle.",
-        "- Do not perform major additions or removals.",
-        "- Do not add text, logos, or watermarks.",
-    ]
+    sections: List[str] = [FULL_VIBE_PREAMBLE]
 
+    context_lines: List[str] = []
     if collection_id and collection_id.strip():
-        lines.append(f"Collection ID (context only): {collection_id.strip()}")
+        context_lines.append(f"Collection ID (context only): {collection_id.strip()}")
     if bundle_id and bundle_id.strip():
-        lines.append(f"Bundle ID (context only): {bundle_id.strip()}")
+        context_lines.append(f"Bundle ID (context only): {bundle_id.strip()}")
+    if context_lines:
+        sections.append("\n".join(context_lines))
 
     if enhance_photo:
-        lines += [
-            "",
-            "Apply subtle quality enhancement while preserving realism and original room identity.",
-        ]
+        sections.append(ENHANCE_FRAGMENT)
+    if heavy_declutter:
+        sections.append(HEAVY_DECLUTTER_FRAGMENT)
+    else:
+        sections.append(LIGHT_DECLUTTER_FRAGMENT)
+    sections.append(FULL_VIBE_CORE)
+    sections.append(HARD_RULES)
+
+    final_prompt = "\n\n".join(sections)
 
     if DEBUG_ROOMPRINTZ_PROMPT:
         print("\n===== VIBODE FULL VIBE PROMPT SENT TO GEMINI =====\n")
-        print("\n".join(lines))
+        print(final_prompt)
         print("\n===================================================\n")
-    return "\n".join(lines)
+    return final_prompt
 
 
 VIBODE_REMOVE_PROMPT = (
@@ -2762,17 +2822,21 @@ async def vibode_full_vibe(req: VibodeFreezeRequest):
     collection_id = req.collectionId
     bundle_id = req.bundleId
     enhance_photo = req.enhancePhoto
+    heavy_declutter = req.heavyDeclutter
     vibode_intent_block = req.freeze.vibodeIntent
     if isinstance(vibode_intent_block, dict):
         vibode_collection = vibode_intent_block.get("collectionId")
         vibode_bundle = vibode_intent_block.get("bundleId")
         vibode_enhance = vibode_intent_block.get("enhancePhoto")
+        vibode_heavy_declutter = vibode_intent_block.get("heavyDeclutter")
         if isinstance(vibode_collection, str) and vibode_collection.strip():
             collection_id = vibode_collection
         if isinstance(vibode_bundle, str) and vibode_bundle.strip():
             bundle_id = vibode_bundle
         if isinstance(vibode_enhance, bool):
             enhance_photo = vibode_enhance
+        if isinstance(vibode_heavy_declutter, bool):
+            heavy_declutter = vibode_heavy_declutter
 
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
@@ -2795,6 +2859,7 @@ async def vibode_full_vibe(req: VibodeFreezeRequest):
         collection_id=collection_id,
         bundle_id=bundle_id,
         enhance_photo=enhance_photo,
+        heavy_declutter=heavy_declutter,
     )
 
     try:
