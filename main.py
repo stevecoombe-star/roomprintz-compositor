@@ -550,6 +550,30 @@ class VibodeVibeRequest(BaseModel):
     aspectRatio: Optional[AspectRatio] = "auto"
 
 
+class VibodeStageRunRequest(BaseModel):
+    stage: Literal[1, 2, 3, 4, 5]
+    baseImageId: Optional[str] = None
+    roomImageBase64: Optional[str] = None
+    baseImageUrl: Optional[str] = None
+    baseImageBase64: Optional[str] = None
+    collectionId: Optional[str] = None
+    bundleId: Optional[str] = None
+    eligibleSkus: Optional[List[VibodeEligibleSku]] = None
+    targetCount: Optional[int] = None
+    enhancePhoto: bool = True
+    cleanupRoom: bool = False
+    repairDamage: bool = False
+    emptyRoom: bool = False
+    stage1Mode: Optional[Literal["enhance_declutter", "empty_room"]] = None
+    heavyDeclutter: bool = False
+    renovateRoom: bool = False
+    repaintWalls: bool = False
+    flooringPreset: Optional[str] = None
+    roomType: Optional[str] = None
+    modelVersion: Optional[str] = None
+    aspectRatio: Optional[AspectRatio] = "auto"
+
+
 class VibodeComposeResponse(BaseModel):
     imageUrl: str
     appliedAspectRatio: Optional[str] = None
@@ -1577,6 +1601,21 @@ def _collect_vibode_full_vibe_missing_fields(req: VibodeFreezeRequest) -> List[s
     return missing_fields
 
 
+def _collect_vibode_stage_run_missing_fields(req: VibodeStageRunRequest) -> List[str]:
+    missing_fields: List[str] = []
+    has_room_b64 = bool(req.roomImageBase64 and req.roomImageBase64.strip())
+    has_base_b64 = bool(req.baseImageBase64 and req.baseImageBase64.strip())
+    has_base_url = bool(req.baseImageUrl and req.baseImageUrl.strip())
+    has_base_id = bool(req.baseImageId and req.baseImageId.strip())
+    if not has_room_b64 and not has_base_b64 and not has_base_url and not has_base_id:
+        missing_fields.append("roomImageBase64|baseImageBase64|baseImageUrl|baseImageId")
+
+    if req.stage in (3, 4) and not req.eligibleSkus:
+        missing_fields.append("eligibleSkus")
+
+    return missing_fields
+
+
 def _collect_vibode_remove_missing_fields(req: VibodeRemoveRequest) -> List[str]:
     missing_fields: List[str] = []
     _append_missing_nonempty_str(missing_fields, "cleanBase64", req.cleanBase64)
@@ -1951,6 +1990,33 @@ def _extract_vibode_vibe_sku_image_ref(value: Any) -> Optional[str]:
     return None
 
 
+def _resolve_vibode_stage_run_room_raw_bytes(req: VibodeStageRunRequest) -> bytes:
+    if req.roomImageBase64 and req.roomImageBase64.strip():
+        return _decode_base64_image(req.roomImageBase64)
+
+    if req.baseImageBase64 and req.baseImageBase64.strip():
+        return _decode_base64_image(req.baseImageBase64)
+
+    if req.baseImageUrl and req.baseImageUrl.strip():
+        return _fetch_image_bytes_from_url(req.baseImageUrl.strip())
+
+    if req.baseImageId and req.baseImageId.strip():
+        base_image_id = req.baseImageId.strip()
+        if base_image_id.startswith("http://") or base_image_id.startswith("https://"):
+            return _fetch_image_bytes_from_url(base_image_id)
+        if base_image_id.startswith("data:image/"):
+            payload_b64 = base_image_id.split(",", 1)[1] if "," in base_image_id else base_image_id
+            return _decode_base64_image(payload_b64)
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Provide roomImageBase64, baseImageBase64, baseImageUrl, "
+            "or a URL/data-URL baseImageId."
+        ),
+    )
+
+
 def build_vibode_compose_prompt(
     placements: List[VibodePlacement],
     enhance_photo: bool,
@@ -2036,6 +2102,165 @@ def build_vibode_vibe_prompt(
         print("\n".join(lines))
         print("\n==============================================\n")
     return "\n".join(lines)
+
+
+def build_stage1_prestage_prompt_v1(
+    enhance_photo: bool,
+    cleanup_room: bool,
+    empty_room_mode: bool,
+    room_type: Optional[str] = None,
+) -> str:
+    if empty_room_mode:
+        return build_roomprintz_prompt(
+            enhance_photo=enhance_photo,
+            cleanup_room=False,
+            repair_damage=False,
+            empty_room=True,
+            renovate_room=False,
+            repaint_walls=False,
+            flooring_preset=None,
+            style_id=None,
+            room_type=room_type,
+        )
+
+    return build_roomprintz_prompt(
+        enhance_photo=enhance_photo,
+        cleanup_room=cleanup_room,
+        repair_damage=False,
+        empty_room=False,
+        renovate_room=False,
+        repaint_walls=False,
+        flooring_preset=None,
+        style_id=None,
+        room_type=room_type,
+    )
+
+
+def build_stage2_surfaces_prompt_v1(
+    repair_damage: bool,
+    heavy_declutter: bool,
+    renovate_room: bool,
+    repaint_walls: bool,
+    flooring_preset: Optional[str],
+    room_type: Optional[str] = None,
+) -> str:
+    fragments = [BASE_ROOMPRINTZ_INSTRUCTIONS.strip()]
+
+    if room_type:
+        key = room_type.strip().lower()
+        hint = ROOM_TYPE_HINTS.get(key) or (
+            "This room has a specific existing function. Preserve that function and "
+            "do not convert it into a different type of room."
+        )
+        fragments.append(
+            f"Room type context:\n- {hint}\n- All edits must keep the room clearly consistent with this function."
+        )
+
+    fragments.append(
+        "You are given a single interior room photo. Edit this photo in-place for a surfaces/finishes pass."
+    )
+
+    if heavy_declutter:
+        fragments.append(HEAVY_DECLUTTER_FRAGMENT.strip())
+    if repair_damage:
+        fragments.append(REPAIR_FRAGMENT.strip())
+    if renovate_room:
+        fragments.append(RENOVATE_ROOM_FRAGMENT.strip())
+    if repaint_walls:
+        fragments.append(REPAINT_WALLS_FRAGMENT.strip())
+
+    if flooring_preset:
+        preset = flooring_preset.lower()
+        if preset == "carpet":
+            fragments.append(FLOORING_CARPET_FRAGMENT.strip())
+        elif preset == "hardwood":
+            fragments.append(FLOORING_HARDWOOD_FRAGMENT.strip())
+        elif preset == "tile":
+            fragments.append(FLOORING_TILE_FRAGMENT.strip())
+
+    fragments.append(
+        """
+Output requirements:
+- Return a single, high-quality edited image.
+- The edit must look like a real photograph, not an illustration or painting.
+- Do not alter the room's basic layout, window views, or camera angle.
+""".strip()
+    )
+
+    return "\n\n".join(fragments)
+
+
+def build_stage3_furniture_prompt_v1(
+    eligible_skus: List[VibodeEligibleSku],
+    collection_id: Optional[str],
+    bundle_id: Optional[str],
+    target_count: int,
+    enhance_photo: bool,
+) -> str:
+    base_prompt = build_vibode_vibe_prompt(
+        eligible_skus=eligible_skus,
+        collection_id=collection_id,
+        bundle_id=bundle_id,
+        target_count=target_count,
+        enhance_photo=enhance_photo,
+    )
+    return (
+        f"{base_prompt}\n\n"
+        "Stage focus:\n"
+        "- This is Stage 3 (furniture pass).\n"
+        "- Prioritize primary furniture placement and realism.\n"
+        "- Keep accessory styling minimal for now."
+    )
+
+
+def build_stage4_accessories_prompt_v1(
+    eligible_skus: List[VibodeEligibleSku],
+    collection_id: Optional[str],
+    bundle_id: Optional[str],
+    target_count: int,
+) -> str:
+    lines = [
+        "Apply an accessories-only styling pass using the provided SKU assets.",
+        "",
+        "Constraints:",
+        f"- Place approximately {target_count} accessory/decor items using only provided SKU assets.",
+        "- Assume primary furniture is already staged; do not replace or add new primary furniture.",
+        "- Keep room geometry, camera perspective, and existing staged furniture unchanged.",
+        "- Do not add text, logos, or watermarks.",
+        "",
+    ]
+
+    if collection_id and collection_id.strip():
+        lines.append(f"Collection ID: {collection_id.strip()}")
+    if bundle_id and bundle_id.strip():
+        lines.append(f"Bundle ID: {bundle_id.strip()}")
+    if collection_id or bundle_id:
+        lines.append("")
+
+    lines.append("SKU reference list (in order):")
+    for idx, sku in enumerate(eligible_skus, start=1):
+        label = (sku.label or "").strip()
+        if label:
+            lines.append(f"{idx}. {sku.skuId} - {label}")
+        else:
+            lines.append(f"{idx}. {sku.skuId}")
+
+    return "\n".join(lines)
+
+
+def build_stage5_final_vibe_prompt_v1(
+    collection_id: Optional[str],
+    bundle_id: Optional[str],
+    enhance_photo: bool,
+    heavy_declutter: bool,
+) -> str:
+    # Keep Full Vibe v1 behavior; this stage is editorial polish only.
+    return build_full_vibe_prompt_sunlit_editorial_v1(
+        collection_id=collection_id,
+        bundle_id=bundle_id,
+        enhance_photo=enhance_photo,
+        heavy_declutter=heavy_declutter,
+    )
 
 
 # ---- Full Vibe Prompt Anchor ----
@@ -2875,6 +3100,177 @@ async def vibode_full_vibe(req: VibodeFreezeRequest):
 
     if not out_bytes:
         raise HTTPException(status_code=500, detail="Full vibe returned empty image")
+
+    data_url = make_data_url(out_bytes, mime_type="image/png")
+
+    debug_ratio: Optional[str] = None
+    if DEBUG_ROOMPRINTZ_RATIO:
+        debug_ratio = applied_ratio or "auto"
+
+    return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
+
+
+@app.post("/api/vibode/stage-run", response_model=VibodeComposeResponse)
+async def vibode_stage_run(req: VibodeStageRunRequest):
+    _reject_if_vibode_strict_missing(
+        "/api/vibode/stage-run",
+        _collect_vibode_stage_run_missing_fields(req),
+    )
+
+    model_name = resolve_model_name(req.modelVersion)
+
+    try:
+        room_raw_bytes = _resolve_vibode_stage_run_room_raw_bytes(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[/api/vibode/stage-run] Failed to resolve base image:", e)
+        raise HTTPException(status_code=400, detail="Failed to resolve stage-run base image data")
+
+    applied_ratio: Optional[str] = None
+    aspect_ratio_to_send: Optional[str] = None
+    try:
+        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
+            room_raw_bytes,
+            requested_ratio=req.aspectRatio,
+            model_name=model_name,
+        )
+        aspect_ratio_to_send = applied_ratio
+    except Exception as e:
+        print("[/api/vibode/stage-run] Error preparing room image:", e)
+        raise HTTPException(status_code=400, detail="Could not process room image")
+
+    prompt: str
+    room_overlay_png_bytes = room_png_bytes
+    sku_png_bytes_list: List[bytes] = []
+
+    if req.stage == 1:
+        stage1_mode = (req.stage1Mode or "").strip().lower()
+        empty_room_mode = stage1_mode == "empty_room" or (not stage1_mode and req.emptyRoom)
+        prompt = build_stage1_prestage_prompt_v1(
+            enhance_photo=req.enhancePhoto,
+            cleanup_room=req.cleanupRoom,
+            empty_room_mode=empty_room_mode,
+            room_type=req.roomType,
+        )
+    elif req.stage == 2:
+        prompt = build_stage2_surfaces_prompt_v1(
+            repair_damage=req.repairDamage,
+            heavy_declutter=req.heavyDeclutter,
+            renovate_room=req.renovateRoom,
+            repaint_walls=req.repaintWalls,
+            flooring_preset=req.flooringPreset,
+            room_type=req.roomType,
+        )
+    elif req.stage in (3, 4):
+        eligible_skus = req.eligibleSkus or []
+        if not eligible_skus:
+            raise HTTPException(status_code=400, detail="eligibleSkus are required for stage 3/4")
+
+        if req.stage == 3:
+            max_target = min(len(eligible_skus), 12)
+            if req.targetCount is not None:
+                target_count = max(1, min(req.targetCount, max_target))
+            else:
+                bundle_id_normalized = (req.bundleId or "").strip().lower()
+                if "small" in bundle_id_normalized:
+                    default_target = 6
+                elif "large" in bundle_id_normalized:
+                    default_target = 8
+                else:
+                    default_target = 7
+                target_count = max(1, min(default_target, max_target))
+        else:
+            max_target = min(len(eligible_skus), 8)
+            if req.targetCount is not None:
+                target_count = max(1, min(req.targetCount, max_target))
+            else:
+                target_count = max(1, min(3, max_target))
+
+        selected_skus = eligible_skus[:target_count]
+        for idx, sku in enumerate(selected_skus):
+            image_ref: Optional[str] = None
+
+            resolver = globals().get("resolveIkeaSkuImageUrl") or globals().get("resolve_ikea_sku_image_url")
+            if callable(resolver):
+                try:
+                    image_ref = _extract_vibode_vibe_sku_image_ref(resolver(sku.skuId))
+                except Exception as e:
+                    print("[/api/vibode/stage-run] SKU resolver failed:", {"skuId": sku.skuId, "error": str(e)})
+
+            if not image_ref:
+                image_ref = _extract_vibode_vibe_sku_image_ref(sku.variants or [])
+            if not image_ref:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"eligibleSkus[{idx}] skuId={sku.skuId} is missing an image asset input. "
+                        "Provide a variant image URL/data URL or add a skuId image resolver."
+                    ),
+                )
+
+            try:
+                if image_ref.startswith("data:image/"):
+                    payload_b64 = image_ref.split(",", 1)[1] if "," in image_ref else image_ref
+                    sku_raw_bytes = _decode_base64_image(payload_b64)
+                else:
+                    sku_raw_bytes = _fetch_image_bytes_from_url(image_ref)
+                sku_png_bytes_list.append(prepare_sku_png_bytes(sku_raw_bytes))
+            except HTTPException:
+                raise
+            except Exception as e:
+                print("[/api/vibode/stage-run] Error preparing SKU image:", {"skuId": sku.skuId, "error": str(e)})
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to fetch/prepare image for eligibleSkus[{idx}] skuId={sku.skuId}",
+                )
+
+        if req.stage == 3:
+            prompt = build_stage3_furniture_prompt_v1(
+                eligible_skus=selected_skus,
+                collection_id=req.collectionId,
+                bundle_id=req.bundleId,
+                target_count=target_count,
+                enhance_photo=req.enhancePhoto,
+            )
+        else:
+            prompt = build_stage4_accessories_prompt_v1(
+                eligible_skus=selected_skus,
+                collection_id=req.collectionId,
+                bundle_id=req.bundleId,
+                target_count=target_count,
+            )
+    else:
+        prompt = build_stage5_final_vibe_prompt_v1(
+            collection_id=req.collectionId,
+            bundle_id=req.bundleId,
+            enhance_photo=req.enhancePhoto,
+            heavy_declutter=req.heavyDeclutter,
+        )
+
+    try:
+        if req.stage in (3, 4):
+            out_bytes = call_gemini_multimodal(
+                prompt=prompt,
+                room_png_bytes=room_png_bytes,
+                room_overlay_png_bytes=room_overlay_png_bytes,
+                sku_png_bytes_list=sku_png_bytes_list,
+                model_name=model_name,
+                aspect_ratio=aspect_ratio_to_send,
+            )
+        else:
+            out_bytes = call_gemini_with_prompt(
+                image_png_bytes=room_png_bytes,
+                prompt=prompt,
+                model_name=model_name,
+                aspect_ratio=aspect_ratio_to_send,
+            )
+    except Exception as e:
+        print("[/api/vibode/stage-run] Error in processing:", e)
+        raise HTTPException(status_code=500, detail="Error during stage run")
+
+    if not out_bytes:
+        raise HTTPException(status_code=500, detail="Stage run returned empty image")
 
     data_url = make_data_url(out_bytes, mime_type="image/png")
 
