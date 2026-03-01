@@ -2213,6 +2213,72 @@ def build_stage3_furniture_prompt_v1(
     )
 
 
+def build_stage3_furniture_prompt_v2(
+    eligible_skus: List[VibodeEligibleSku],
+    collection_id: Optional[str],
+    bundle_id: Optional[str],
+    target_count: int,
+    enhance_photo: bool,
+) -> str:
+    lines = [
+        "Place the provided furniture SKUs into the room photo.",
+        "",
+        "Stage focus:",
+        "- This is Stage 3 (furniture pass) only.",
+        "- Place up to {target_count} furniture items, chosen ONLY from the SKU list.".format(
+            target_count=target_count
+        ),
+        "",
+        "Hard constraints:",
+        "- Use ONLY provided SKU assets; no substitutes.",
+        "- No blending/averaging/hybrids between SKUs.",
+        "- Primary furniture only (sofa/bed/table/storage/seating).",
+        "- Do not rearrange existing furniture unless necessary to place the selected SKUs.",
+        "- If a SKU cannot be placed plausibly (scale/clearance), omit it rather than inventing anything else.",
+        "- Preserve camera angle, perspective, vanishing lines, and room geometry.",
+        "- Preserve architecture and surfaces; Stage 2 handled surfaces.",
+        "- Do not apply cinematic/editorial grading or mood styling (Stage 5 handles final vibe).",
+        "- Do not add text, logos, or watermarks.",
+        "",
+        "Strict exclusions (ban all accessories/decor):",
+        "- Do not add rugs, plants, art, pillows, throws, lamps, vases, books, baskets, candles, mirrors, curtains/drapes, ceiling fixtures, or wall decor.",
+        "",
+        "Placement heuristics:",
+        "- Place anchor pieces first (for example sofa, bed, dining table).",
+        "- Keep clear walk paths and practical circulation.",
+        "- Avoid blocking doors, door swings, and major passage openings.",
+        "",
+    ]
+
+    if collection_id and collection_id.strip():
+        lines.append(f"Collection ID: {collection_id.strip()}")
+    if bundle_id and bundle_id.strip():
+        lines.append(f"Bundle ID: {bundle_id.strip()}")
+    if collection_id or bundle_id:
+        lines.append("")
+
+    lines.append("SKU reference list (only these may be placed):")
+    for idx, sku in enumerate(eligible_skus, start=1):
+        label = (sku.label or "").strip()
+        if label:
+            lines.append(f"{idx}. {sku.skuId} - {label}")
+        else:
+            lines.append(f"{idx}. {sku.skuId}")
+
+    if enhance_photo:
+        lines += [
+            "",
+            "If enhance_photo is true: apply minor technical cleanup only (white balance, exposure, subtle clarity, light noise reduction).",
+            "Do not make mood, style, cinematic, editorial, or creative lighting/color changes.",
+        ]
+
+    if DEBUG_ROOMPRINTZ_PROMPT:
+        print("\n===== STAGE 3 FURNITURE PROMPT V2 SENT TO GEMINI =====\n")
+        print("\n".join(lines))
+        print("\n=======================================================\n")
+    return "\n".join(lines)
+
+
 def build_stage4_accessories_prompt_v1(
     eligible_skus: List[VibodeEligibleSku],
     collection_id: Optional[str],
@@ -3226,7 +3292,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
                 )
 
         if req.stage == 3:
-            prompt = build_stage3_furniture_prompt_v1(
+            prompt = build_stage3_furniture_prompt_v2(
                 eligible_skus=selected_skus,
                 collection_id=req.collectionId,
                 bundle_id=req.bundleId,
