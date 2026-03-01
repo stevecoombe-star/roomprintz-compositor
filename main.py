@@ -3248,6 +3248,29 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
             heavy_declutter=req.heavyDeclutter,
         )
 
+    debug_divider = "=" * 80
+    print(debug_divider)
+    print("[/api/vibode/stage-run] Gemini request debug")
+    print(f"Stage: {req.stage}")
+    print(f"Model: {model_name}")
+    print(f"Aspect ratio sent: {aspect_ratio_to_send if aspect_ratio_to_send else '(omitted)'}")
+    print(
+        "Options:",
+        {
+            "enhancePhoto": req.enhancePhoto,
+            "cleanupRoom": req.cleanupRoom,
+            "heavyDeclutter": req.heavyDeclutter,
+            "repairDamage": req.repairDamage,
+            "renovateRoom": req.renovateRoom,
+            "repaintWalls": req.repaintWalls,
+            "flooringPreset": req.flooringPreset,
+            "emptyRoom": req.emptyRoom,
+        },
+    )
+    print("Prompt:")
+    print(prompt)
+    print(debug_divider)
+
     try:
         if req.stage in (3, 4):
             out_bytes = call_gemini_multimodal(
