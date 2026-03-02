@@ -2329,6 +2329,42 @@ def build_stage5_final_vibe_prompt_v1(
     )
 
 
+STAGE5_PREAMBLE = """
+You are a professional interior photo editor performing a non-destructive polish pass.
+
+Goal:
+- Apply a subtle full-vibe enhancement pass, not a redesign or restage.
+- Preserve the exact room layout, architecture, and primary furniture positions.
+""".strip()
+
+
+STAGE5_SWAGGER_GRADE = """
+Sunlit editorial lighting direction:
+- Keep lighting natural and believable.
+- Use soft daylight with slight warmth, gentle shadows, and balanced highlights.
+- Improve texture clarity and add only mild natural vibrancy.
+""".strip()
+
+
+STAGE5_HARD_RULES = """
+Hard rules (non-negotiable):
+- Do not change layout.
+- Do not shift perspective or camera angle.
+- Do not add, remove, move, rotate, replace, or resize any furniture or objects.
+- Do not add accessories or decor (no pillows, plants, rugs, wall art, drapes, lamps).
+- Do not add text, logos, or watermarks.
+""".strip()
+
+
+def build_stage5_final_vibe_prompt_v3() -> str:
+    final_prompt = "\n\n".join([STAGE5_PREAMBLE, STAGE5_SWAGGER_GRADE, STAGE5_HARD_RULES])
+    if DEBUG_ROOMPRINTZ_PROMPT:
+        print("\n===== STAGE 5 FINAL VIBE PROMPT V3 SENT TO GEMINI =====\n")
+        print(final_prompt)
+        print("\n=========================================================\n")
+    return final_prompt
+
+
 # ---- Full Vibe Prompt Anchor ----
 
 FULL_VIBE_PREAMBLE = """
@@ -3307,12 +3343,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
                 target_count=target_count,
             )
     else:
-        prompt = build_stage5_final_vibe_prompt_v1(
-            collection_id=req.collectionId,
-            bundle_id=req.bundleId,
-            enhance_photo=req.enhancePhoto,
-            heavy_declutter=req.heavyDeclutter,
-        )
+        prompt = build_stage5_final_vibe_prompt_v3()
 
     debug_divider = "=" * 80
     print(debug_divider)
