@@ -4,10 +4,12 @@ import base64
 import hashlib
 import math
 from datetime import datetime
+from uuid import uuid4
+from urllib.parse import quote, urlparse
 from typing import Any, Literal, Optional, Tuple, Dict, List
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from PIL import Image
 import requests
 try:
@@ -54,6 +56,36 @@ MAX_INPUT_LONG_EDGE_INT = (
 # ✅ CHANGE: beta testing wants ALL ratios for Gemini 2.5 Flash.
 # We keep the env var, but default it to "1" so Flash is NOT forced to 1:1.
 ALLOW_FLASH_NON_SQUARE = os.getenv("ROOMPRINTZ_ALLOW_FLASH_NON_SQUARE", "1") == "1"
+
+# User SKU ingest config
+USER_SKU_MAX_INPUT_BYTES = 12 * 1024 * 1024  # 12 MB
+USER_SKU_NORMALIZED_MAX_DIM = 1536
+USER_SKU_NORMALIZED_PADDING_RATIO = 0.03
+USER_SKU_INGEST_TIMEOUT_SECONDS = 10.0
+SUPABASE_SIGNED_URL_TTL_SECONDS = 7 * 24 * 60 * 60
+SUPABASE_STORAGE_UPLOAD_TIMEOUT_SECONDS = 20.0
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").strip()
+SUPABASE_SERVICE_KEY = (os.getenv("SUPABASE_SERVICE_KEY") or "").strip()
+SUPABASE_STORAGE_BUCKET = (
+    os.getenv("SUPABASE_STORAGE_BUCKET")
+    or os.getenv("NEXT_PUBLIC_SUPABASE_STORAGE_BUCKET")
+    or ""
+).strip()
+_SUPABASE_STORAGE_BUCKET_CACHE: Optional[str] = None
+
+USER_SKU_BG_REMOVAL_PROMPT = (
+    "Isolate the product and replace the entire background with a flat, uniform, solid light grey color (#F2F2F2).\n"
+    "The background must be a single solid color.\n"
+    "No gradients.\n"
+    "No shadows.\n"
+    "No floor.\n"
+    "No texture.\n"
+    "No checkerboard pattern.\n"
+    "Do not simulate transparency.\n"
+    "Preserve the product's exact shape, scale, and materials.\n"
+    "Keep clean edges.\n"
+    "Include a small margin around the product."
+)
 
 
 def resolve_model_name(model_version: Optional[str]) -> str:
@@ -650,6 +682,33 @@ class VibodeMoveRequest(BaseModel):
     aspectRatio: Optional[AspectRatio] = "auto"
 
 
+class VibodeUserSkuIngestRequest(BaseModel):
+    imageUrl: Optional[str] = None
+    imageBase64: Optional[str] = None
+    label: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_image_input(self) -> "VibodeUserSkuIngestRequest":
+        has_image_url = bool(self.imageUrl and self.imageUrl.strip())
+        has_image_base64 = bool(self.imageBase64 and self.imageBase64.strip())
+        if has_image_url == has_image_base64:
+            raise ValueError("Exactly one of imageUrl or imageBase64 must be provided.")
+        return self
+
+
+class VibodeUserSku(BaseModel):
+    skuId: str
+    label: str
+    variants: List[str]
+    sourceUrl: Optional[str] = None
+    status: Literal["ready", "failed"]
+    reason: Optional[str] = None
+
+
+class VibodeUserSkuIngestResponse(BaseModel):
+    userSku: VibodeUserSku
+
+
 def call_gemini_with_prompt(
     image_png_bytes: bytes,
     prompt: str,
@@ -792,6 +851,387 @@ def _fetch_image_bytes_from_url(image_url: str, timeout_seconds: float = 15.0) -
     except Exception as e:
         print("[_fetch_image_bytes_from_url] Failed to fetch image URL:", image_url, "| Error:", e)
         raise
+
+
+def _fetch_image_bytes_from_url_limited(
+    image_url: str,
+    timeout_seconds: float = USER_SKU_INGEST_TIMEOUT_SECONDS,
+    max_bytes: int = USER_SKU_MAX_INPUT_BYTES,
+) -> Tuple[bytes, Optional[str]]:
+    try:
+        with requests.get(image_url, timeout=timeout_seconds, stream=True) as response:
+            response.raise_for_status()
+            content_type_header = (response.headers.get("Content-Type") or "").strip()
+            content_type = (
+                content_type_header.split(";", 1)[0].strip().lower()
+                if content_type_header
+                else None
+            )
+
+            content_length_header = (response.headers.get("Content-Length") or "").strip()
+            if content_length_header.isdigit() and int(content_length_header) > max_bytes:
+                raise RuntimeError(
+                    f"Remote image exceeds max size ({content_length_header} > {max_bytes} bytes)."
+                )
+
+            payload = bytearray()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                payload.extend(chunk)
+                if len(payload) > max_bytes:
+                    raise RuntimeError(
+                        f"Remote image exceeds max size while downloading (> {max_bytes} bytes)."
+                    )
+
+            if not payload:
+                raise RuntimeError("Empty image payload.")
+
+            return bytes(payload), content_type
+    except Exception as e:
+        print(
+            "[_fetch_image_bytes_from_url_limited] Failed to fetch image URL:",
+            image_url,
+            "| Error:",
+            e,
+        )
+        raise
+
+
+def _decode_base64_image_with_mime(data: str) -> Tuple[bytes, Optional[str]]:
+    try:
+        trimmed = (data or "").strip()
+        inferred_mime: Optional[str] = None
+        payload = trimmed
+
+        if trimmed.startswith("data:") and "," in trimmed:
+            metadata, payload = trimmed.split(",", 1)
+            media = metadata[5:]
+            if ";" in media:
+                media = media.split(";", 1)[0]
+            inferred_mime = media.strip().lower() or None
+
+        try:
+            decoded = base64.b64decode(payload, validate=True)
+        except Exception:
+            decoded = base64.b64decode(payload)
+
+        if not decoded:
+            raise RuntimeError("Empty base64 payload.")
+        if len(decoded) > USER_SKU_MAX_INPUT_BYTES:
+            raise RuntimeError(
+                f"Base64 image exceeds max size ({len(decoded)} > {USER_SKU_MAX_INPUT_BYTES} bytes)."
+            )
+
+        return decoded, inferred_mime
+    except Exception as e:
+        print("[_decode_base64_image_with_mime] Failed to decode base64 payload:", e)
+        raise
+
+
+def _infer_image_mime_type(image_bytes: bytes, fallback_mime: Optional[str] = None) -> str:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            image_format = (img.format or "").upper()
+        if image_format in Image.MIME:
+            return Image.MIME[image_format]
+    except Exception:
+        pass
+
+    if fallback_mime and fallback_mime.strip():
+        return fallback_mime.strip().lower()
+    return "application/octet-stream"
+
+
+def _convert_image_bytes_to_png(image_bytes: bytes) -> bytes:
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        rgba = img.convert("RGBA")
+        return image_to_png_bytes(rgba)
+
+
+def _has_transparency(png_bytes: bytes) -> bool:
+    with Image.open(io.BytesIO(png_bytes)) as img:
+        rgba = img.convert("RGBA")
+        alpha = rgba.getchannel("A")
+        lo, hi = alpha.getextrema()
+        return not (lo == 255 and hi == 255)
+
+
+def _assert_has_transparency(png_bytes: bytes) -> None:
+    if not _has_transparency(png_bytes):
+        raise RuntimeError(
+            "Background removal output has no transparency (alpha fully opaque)."
+        )
+
+
+def _resolve_supabase_storage_bucket(base_url: str, service_key: str) -> str:
+    global _SUPABASE_STORAGE_BUCKET_CACHE
+
+    if _SUPABASE_STORAGE_BUCKET_CACHE:
+        return _SUPABASE_STORAGE_BUCKET_CACHE
+
+    configured_bucket = (SUPABASE_STORAGE_BUCKET or "").strip()
+    discovered_bucket_ids: List[str] = []
+
+    try:
+        response = requests.get(
+            f"{base_url}/storage/v1/bucket",
+            headers={
+                "Authorization": f"Bearer {service_key}",
+                "apikey": service_key,
+            },
+            timeout=SUPABASE_STORAGE_UPLOAD_TIMEOUT_SECONDS,
+        )
+        if response.status_code < 400:
+            raw_buckets = response.json() if response.content else []
+            if isinstance(raw_buckets, list):
+                for item in raw_buckets:
+                    if not isinstance(item, dict):
+                        continue
+                    bucket_id = str(item.get("id") or item.get("name") or "").strip()
+                    if bucket_id:
+                        discovered_bucket_ids.append(bucket_id)
+        else:
+            print(
+                "[_resolve_supabase_storage_bucket] bucket list failed:",
+                response.status_code,
+                response.text[:200],
+            )
+    except Exception as e:
+        print("[_resolve_supabase_storage_bucket] bucket discovery error:", e)
+
+    chosen_bucket = configured_bucket
+    if discovered_bucket_ids:
+        if not chosen_bucket or chosen_bucket not in discovered_bucket_ids:
+            preferred = (
+                "vibode-user-skus",
+                "user-skus",
+                "assets",
+                "images",
+                "public",
+            )
+            chosen_bucket = next(
+                (bucket for bucket in preferred if bucket in discovered_bucket_ids),
+                discovered_bucket_ids[0],
+            )
+            if configured_bucket and configured_bucket != chosen_bucket:
+                print(
+                    "[_resolve_supabase_storage_bucket] configured bucket not found, using discovered bucket:",
+                    {"configured": configured_bucket, "chosen": chosen_bucket},
+                )
+
+    if not chosen_bucket:
+        raise RuntimeError(
+            "No Supabase storage bucket resolved. Set SUPABASE_STORAGE_BUCKET."
+        )
+
+    _SUPABASE_STORAGE_BUCKET_CACHE = chosen_bucket
+    return chosen_bucket
+
+
+def _require_supabase_storage_config() -> Tuple[str, str, str]:
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL is required.")
+    if not SUPABASE_SERVICE_KEY:
+        raise RuntimeError("SUPABASE_SERVICE_KEY is required.")
+    base_url = SUPABASE_URL.rstrip("/")
+    bucket = _resolve_supabase_storage_bucket(base_url, SUPABASE_SERVICE_KEY)
+    return base_url, SUPABASE_SERVICE_KEY, bucket
+
+
+def _supabase_storage_upload_bytes(object_path: str, payload: bytes, mime_type: str) -> None:
+    base_url, service_key, bucket = _require_supabase_storage_config()
+    normalized_path = object_path.strip().lstrip("/")
+    if not normalized_path:
+        raise RuntimeError("object_path is required for upload.")
+
+    upload_url = f"{base_url}/storage/v1/object/{bucket}/{quote(normalized_path, safe='/')}"
+    headers = {
+        "Authorization": f"Bearer {service_key}",
+        "apikey": service_key,
+        "Content-Type": mime_type,
+        "x-upsert": "true",
+    }
+
+    response = requests.post(
+        upload_url,
+        headers=headers,
+        data=payload,
+        timeout=SUPABASE_STORAGE_UPLOAD_TIMEOUT_SECONDS,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Supabase upload failed ({response.status_code}): {response.text[:300]}"
+        )
+
+
+def _supabase_storage_create_signed_url(
+    object_path: str,
+    expires_in_seconds: int = SUPABASE_SIGNED_URL_TTL_SECONDS,
+) -> str:
+    base_url, service_key, bucket = _require_supabase_storage_config()
+    normalized_path = object_path.strip().lstrip("/")
+    if not normalized_path:
+        raise RuntimeError("object_path is required for signed URL.")
+
+    sign_url = f"{base_url}/storage/v1/object/sign/{bucket}/{quote(normalized_path, safe='/')}"
+    headers = {
+        "Authorization": f"Bearer {service_key}",
+        "apikey": service_key,
+        "Content-Type": "application/json",
+    }
+    response = requests.post(
+        sign_url,
+        headers=headers,
+        json={"expiresIn": int(max(1, expires_in_seconds))},
+        timeout=SUPABASE_STORAGE_UPLOAD_TIMEOUT_SECONDS,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Supabase signed URL failed ({response.status_code}): {response.text[:300]}"
+        )
+
+    payload = response.json() if response.content else {}
+    signed_url_value = (
+        payload.get("signedURL")
+        or payload.get("signedUrl")
+        or payload.get("signed_url")
+        or ""
+    )
+    signed_url_value = str(signed_url_value).strip()
+    if not signed_url_value:
+        raise RuntimeError("Supabase sign response missing signed URL.")
+
+    # Supabase can return signedURL values missing the "/storage/v1" prefix.
+    if signed_url_value.startswith("http://") or signed_url_value.startswith("https://"):
+        parsed = urlparse(signed_url_value)
+        if parsed.path.startswith("/storage/v1/"):
+            normalized_signed_url = signed_url_value
+        elif parsed.path.startswith("/object/"):
+            normalized_signed_url = parsed._replace(path=f"/storage/v1{parsed.path}").geturl()
+        else:
+            print(
+                "[_supabase_storage_create_signed_url] Warning: unexpected absolute signedURL path prefix",
+                {"path": parsed.path},
+            )
+            normalized_signed_url = signed_url_value
+    elif signed_url_value.startswith("/"):
+        normalized_signed_path = signed_url_value
+        if normalized_signed_path.startswith("/object/"):
+            normalized_signed_path = f"/storage/v1{normalized_signed_path}"
+        normalized_signed_url = f"{base_url}{normalized_signed_path}"
+    else:
+        # Supabase can return relative signed paths with different prefixes; normalize safely.
+        if signed_url_value.startswith("storage/v1/"):
+            normalized_signed_url = f"{base_url}/{signed_url_value}"
+        elif signed_url_value.startswith("object/"):
+            normalized_signed_url = f"{base_url}/storage/v1/{signed_url_value}"
+        else:
+            normalized_signed_url = f"{base_url}/storage/v1/{signed_url_value}"
+
+    if DEBUG_ROOMPRINTZ_PROMPT or DEBUG_ROOMPRINTZ_RATIO:
+        print(
+            "[_supabase_storage_create_signed_url] signedURL normalization",
+            {"original": signed_url_value, "normalized": normalized_signed_url},
+        )
+    return normalized_signed_url
+
+
+def _run_user_sku_background_removal(image_png_bytes: bytes, model_name: str) -> bytes:
+    return call_gemini_with_prompt(
+        image_png_bytes=image_png_bytes,
+        prompt=USER_SKU_BG_REMOVAL_PROMPT,
+        model_name=model_name,
+        aspect_ratio=None,
+    )
+
+
+def _normalize_user_sku_transparent_png(
+    image_bytes: bytes,
+    max_dimension: int = USER_SKU_NORMALIZED_MAX_DIM,
+    padding_ratio: float = USER_SKU_NORMALIZED_PADDING_RATIO,
+) -> Tuple[bytes, Tuple[int, int]]:
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        rgba = img.convert("RGBA")
+
+    alpha = rgba.getchannel("A")
+    non_transparent_box = alpha.getbbox()
+    if non_transparent_box:
+        trimmed = rgba.crop(non_transparent_box)
+    else:
+        trimmed = rgba
+
+    width, height = trimmed.size
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Invalid dimensions after background removal.")
+
+    long_edge = max(width, height)
+    if long_edge > max_dimension:
+        scale = max_dimension / float(long_edge)
+        resized = trimmed.resize(
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            resample=Image.LANCZOS,
+        )
+    else:
+        resized = trimmed
+
+    pad = max(2, int(round(max(resized.size) * max(0.0, padding_ratio))))
+    padded = Image.new("RGBA", (resized.width + pad * 2, resized.height + pad * 2), (0, 0, 0, 0))
+    padded.paste(resized, (pad, pad), resized)
+
+    padded_long_edge = max(padded.size)
+    if padded_long_edge > max_dimension:
+        scale = max_dimension / float(padded_long_edge)
+        padded = padded.resize(
+            (
+                max(1, int(round(padded.width * scale))),
+                max(1, int(round(padded.height * scale))),
+            ),
+            resample=Image.LANCZOS,
+        )
+
+    return image_to_png_bytes(padded), padded.size
+
+
+def _normalize_user_sku_solid_bg_png(
+    image_bytes: bytes,
+    max_dimension: int,
+    padding_ratio: float,
+    bg_rgb: Tuple[int, int, int] = (242, 242, 242),
+) -> Tuple[bytes, Tuple[int, int]]:
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        rgb = img.convert("RGB")
+
+    width, height = rgb.size
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Invalid dimensions after background removal.")
+
+    long_edge = max(width, height)
+    if long_edge > max_dimension:
+        scale = max_dimension / float(long_edge)
+        resized = rgb.resize(
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            resample=Image.LANCZOS,
+        )
+    else:
+        resized = rgb
+
+    pad = max(2, int(round(max(resized.size) * max(0.0, padding_ratio))))
+    padded = Image.new("RGB", (resized.width + pad * 2, resized.height + pad * 2), bg_rgb)
+    padded.paste(resized, (pad, pad))
+
+    padded_long_edge = max(padded.size)
+    if padded_long_edge > max_dimension:
+        scale = max_dimension / float(padded_long_edge)
+        padded = padded.resize(
+            (
+                max(1, int(round(padded.width * scale))),
+                max(1, int(round(padded.height * scale))),
+            ),
+            resample=Image.LANCZOS,
+        )
+
+    return image_to_png_bytes(padded), padded.size
 
 
 def _draw_contrasted_line(
@@ -3401,6 +3841,181 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
 
 
+@app.post("/api/vibode/user-skus/ingest", response_model=VibodeUserSkuIngestResponse)
+async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
+    user_sku_id = "user_" + uuid4().hex
+    source_url = request.imageUrl.strip() if request.imageUrl and request.imageUrl.strip() else None
+    resolved_label = (request.label or "").strip() or "User Upload"
+
+    if source_url:
+        normalized_source_url = source_url.lower()
+        if not (
+            normalized_source_url.startswith("http://")
+            or normalized_source_url.startswith("https://")
+        ):
+            raise HTTPException(status_code=400, detail="Invalid imageUrl.")
+        if (
+            "localhost" in normalized_source_url
+            or "127.0.0.1" in normalized_source_url
+            or "0.0.0.0" in normalized_source_url
+        ):
+            raise HTTPException(status_code=400, detail="Invalid imageUrl.")
+
+    print(
+        "[/api/vibode/user-skus/ingest] image acquisition start",
+        {
+            "skuId": user_sku_id,
+            "source": "imageUrl" if source_url else "imageBase64",
+        },
+    )
+
+    try:
+        if source_url:
+            source_bytes, source_hint_mime = _fetch_image_bytes_from_url_limited(
+                source_url,
+                timeout_seconds=USER_SKU_INGEST_TIMEOUT_SECONDS,
+                max_bytes=USER_SKU_MAX_INPUT_BYTES,
+            )
+        else:
+            source_bytes, source_hint_mime = _decode_base64_image_with_mime(request.imageBase64 or "")
+    except Exception as e:
+        print("[/api/vibode/user-skus/ingest] image acquisition failed:", e)
+        raise HTTPException(status_code=400, detail="Failed to acquire image bytes.")
+
+    source_mime = _infer_image_mime_type(source_bytes, fallback_mime=source_hint_mime)
+    print(
+        "[/api/vibode/user-skus/ingest] image acquisition complete",
+        {
+            "skuId": user_sku_id,
+            "bytes": len(source_bytes),
+            "mimeType": source_mime,
+        },
+    )
+
+    try:
+        original_png_bytes = _convert_image_bytes_to_png(source_bytes)
+    except Exception as e:
+        print("[/api/vibode/user-skus/ingest] failed to decode input image:", e)
+        raise HTTPException(status_code=400, detail="Invalid image payload.")
+
+    original_path = f"user-skus/{user_sku_id}/original.png"
+    try:
+        _supabase_storage_upload_bytes(
+            object_path=original_path,
+            payload=original_png_bytes,
+            mime_type="image/png",
+        )
+    except Exception as e:
+        print("[/api/vibode/user-skus/ingest] original upload failed:", e)
+        raise HTTPException(status_code=500, detail="Failed to upload original image.")
+
+    print(
+        "[/api/vibode/user-skus/ingest] original upload complete",
+        {
+            "skuId": user_sku_id,
+            "path": original_path,
+            "bytes": len(original_png_bytes),
+            "mimeType": "image/png",
+        },
+    )
+
+    print("[/api/vibode/user-skus/ingest] background removal start", {"skuId": user_sku_id})
+    try:
+        bg_removed_bytes = _run_user_sku_background_removal(
+            image_png_bytes=original_png_bytes,
+            model_name=DEFAULT_MODEL_NAME,
+        )
+        if not bg_removed_bytes:
+            raise RuntimeError("Background removal returned empty bytes.")
+    except Exception as e:
+        print("[/api/vibode/user-skus/ingest] background removal failed:", e)
+        failed_reason = f"background removal failed: {str(e)[:160]}"
+        failed_user_sku = VibodeUserSku(
+            skuId=user_sku_id,
+            label=resolved_label,
+            variants=[],
+            sourceUrl=source_url,
+            status="failed",
+            reason=failed_reason,
+        )
+        print(
+            "[/api/vibode/user-skus/ingest] final status",
+            {"skuId": user_sku_id, "status": "failed", "reason": failed_reason},
+        )
+        return VibodeUserSkuIngestResponse(userSku=failed_user_sku)
+
+    print(
+        "[/api/vibode/user-skus/ingest] background removal complete",
+        {"skuId": user_sku_id, "bytes": len(bg_removed_bytes)},
+    )
+
+    normalization_mode = "transparent"
+    try:
+        has_alpha = _has_transparency(bg_removed_bytes)
+        if has_alpha:
+            normalized_png_bytes, normalized_dims = _normalize_user_sku_transparent_png(
+                bg_removed_bytes,
+                max_dimension=USER_SKU_NORMALIZED_MAX_DIM,
+                padding_ratio=USER_SKU_NORMALIZED_PADDING_RATIO,
+            )
+            normalization_mode = "transparent"
+        else:
+            normalized_png_bytes, normalized_dims = _normalize_user_sku_solid_bg_png(
+                bg_removed_bytes,
+                max_dimension=USER_SKU_NORMALIZED_MAX_DIM,
+                padding_ratio=USER_SKU_NORMALIZED_PADDING_RATIO,
+            )
+            normalization_mode = "solid_bg"
+    except Exception as e:
+        print("[/api/vibode/user-skus/ingest] normalization failed:", e)
+        raise HTTPException(status_code=500, detail="Failed to normalize user SKU image.")
+
+    print(
+        "[/api/vibode/user-skus/ingest] normalized dimensions",
+        {
+            "skuId": user_sku_id,
+            "width": normalized_dims[0],
+            "height": normalized_dims[1],
+            "bytes": len(normalized_png_bytes),
+        },
+    )
+    print(
+        "[/api/vibode/user-skus/ingest] normalization mode",
+        {"skuId": user_sku_id, "normalizationMode": normalization_mode},
+    )
+
+    normalized_path = f"user-skus/{user_sku_id}/normalized.png"
+    try:
+        _supabase_storage_upload_bytes(
+            object_path=normalized_path,
+            payload=normalized_png_bytes,
+            mime_type="image/png",
+        )
+        normalized_url = _supabase_storage_create_signed_url(normalized_path)
+    except Exception as e:
+        print("[/api/vibode/user-skus/ingest] normalized upload/sign failed:", e)
+        raise HTTPException(status_code=500, detail="Failed to upload normalized user SKU image.")
+
+    print(
+        "[/api/vibode/user-skus/ingest] final status",
+        {
+            "skuId": user_sku_id,
+            "status": "ready",
+            "normalizedPath": normalized_path,
+        },
+    )
+
+    return VibodeUserSkuIngestResponse(
+        userSku=VibodeUserSku(
+            skuId=user_sku_id,
+            label=resolved_label,
+            variants=[normalized_url],
+            sourceUrl=source_url,
+            status="ready",
+        )
+    )
+
+
 @app.post("/vibode/remove", response_model=VibodeComposeResponse)
 async def vibode_remove(req: VibodeRemoveRequest):
     _reject_if_vibode_strict_missing("/vibode/remove", _collect_vibode_remove_missing_fields(req))
@@ -3513,7 +4128,6 @@ async def vibode_remove(req: VibodeRemoveRequest):
         debug_ratio = applied_ratio or "auto"
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
-
 
 @app.post("/vibode/swap", response_model=VibodeSwapResponse)
 async def vibode_swap(req: VibodeSwapRequest):
@@ -3792,7 +4406,6 @@ async def vibode_rotate(req: VibodeRotateRequest):
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
 
-
 @app.post("/vibode/move", response_model=VibodeComposeResponse)
 async def vibode_move(req: VibodeMoveRequest):
     marks_ordered = _parse_and_clamp_move_marks(req.marks)
@@ -3920,3 +4533,7 @@ async def vibode_move(req: VibodeMoveRequest):
         debug_ratio = applied_ratio or "auto"
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
+
+
+# Quick test:
+# curl -sS -X POST "http://localhost:8000/api/vibode/user-skus/ingest" -H "Content-Type: application/json" -d '{"label":"Demo SKU","imageUrl":"https://example.com/product.png"}'
