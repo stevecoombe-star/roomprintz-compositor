@@ -3685,6 +3685,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
     prompt: str
     room_overlay_png_bytes = room_png_bytes
     sku_png_bytes_list: List[bytes] = []
+    attached_sku_assets: List[Dict[str, str]] = []
 
     if req.stage == 1:
         stage1_mode = (req.stage1Mode or "").strip().lower()
@@ -3729,7 +3730,18 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
             else:
                 target_count = max(1, min(3, max_target))
 
-        selected_skus = eligible_skus[:target_count]
+        def _is_user_sku(sku: VibodeEligibleSku) -> bool:
+            if isinstance(sku.skuId, str) and sku.skuId.startswith("user_"):
+                return True
+            source = getattr(sku, "source", None)
+            return isinstance(source, str) and source.strip().lower() == "user"
+
+        if req.stage == 3:
+            user_skus = [sku for sku in eligible_skus if _is_user_sku(sku)]
+            catalog_skus = [sku for sku in eligible_skus if not _is_user_sku(sku)]
+            selected_skus = (user_skus + catalog_skus)[:target_count]
+        else:
+            selected_skus = eligible_skus[:target_count]
         for idx, sku in enumerate(selected_skus):
             image_ref: Optional[str] = None
 
@@ -3758,6 +3770,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
                 else:
                     sku_raw_bytes = _fetch_image_bytes_from_url(image_ref)
                 sku_png_bytes_list.append(prepare_sku_png_bytes(sku_raw_bytes))
+                attached_sku_assets.append({"skuId": sku.skuId, "imageRef": image_ref})
             except HTTPException:
                 raise
             except Exception as e:
@@ -3807,6 +3820,68 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
     print("Prompt:")
     print(prompt)
     print(debug_divider)
+
+    if req.stage == 3:
+        eligible_skus = req.eligibleSkus or []
+        eligible_sku_ids = [sku.skuId for sku in eligible_skus]
+        user_sku_ids = [sku_id for sku_id in eligible_sku_ids if isinstance(sku_id, str) and sku_id.startswith("user_")]
+
+        def _truncate_preview(value: Optional[str], max_len: int = 80) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            return value[:max_len]
+
+        def _log_variant_shape(prefix: str, sku: VibodeEligibleSku) -> None:
+            variants = sku.variants or []
+            first_variant = variants[0] if variants else None
+            first_variant_type = type(first_variant).__name__ if first_variant is not None else None
+            payload: Dict[str, Any] = {
+                "skuId": sku.skuId,
+                "variants.length": len(variants),
+                "typeof variants[0]": first_variant_type,
+            }
+            if isinstance(first_variant, dict):
+                payload["variants[0].imageUrl"] = _truncate_preview(first_variant.get("imageUrl"))
+            elif isinstance(first_variant, str):
+                payload["variants[0]"] = _truncate_preview(first_variant)
+            print(prefix, payload)
+
+        print("[/api/vibode/stage-run][stage3-debug] summary", {
+            "stage": req.stage,
+            "targetCount": target_count,
+            "eligibleSkus.length": len(eligible_skus),
+            "eligibleSkuIds": eligible_sku_ids,
+            "userSkuCount": len(user_sku_ids),
+            "selectedSkuIds": [sku.skuId for sku in selected_skus],
+            "selectedUserSkuCount": sum(1 for sku in selected_skus if _is_user_sku(sku)),
+        })
+
+        for idx, sku in enumerate(eligible_skus[:3], start=1):
+            _log_variant_shape(f"[/api/vibode/stage-run][stage3-debug] parsed variants first3[{idx}]", sku)
+
+        first_user_sku = next(
+            (sku for sku in eligible_skus if isinstance(sku.skuId, str) and sku.skuId.startswith("user_")),
+            None,
+        )
+        if first_user_sku is not None:
+            _log_variant_shape("[/api/vibode/stage-run][stage3-debug] parsed variants first user sku", first_user_sku)
+        else:
+            print("[/api/vibode/stage-run][stage3-debug] parsed variants first user sku", {"found": False})
+
+        attached_sku_ids = [asset["skuId"] for asset in attached_sku_assets]
+        print("[/api/vibode/stage-run][stage3-debug] attached SKU assets", {
+            "attachedSkuImageCount": len(attached_sku_assets),
+            "attachedSkuIds": attached_sku_ids,
+        })
+        for idx, asset in enumerate(attached_sku_assets, start=1):
+            print(
+                f"[/api/vibode/stage-run][stage3-debug] attached SKU asset [{idx}]",
+                {"skuId": asset["skuId"], "resolvedImageUrl": _truncate_preview(asset["imageRef"])},
+            )
+
+        print("[/api/vibode/stage-run][stage3-debug] full Stage 3 prompt text (exact) BEGIN")
+        print(prompt)
+        print("[/api/vibode/stage-run][stage3-debug] full Stage 3 prompt text (exact) END")
 
     try:
         if req.stage in (3, 4):
