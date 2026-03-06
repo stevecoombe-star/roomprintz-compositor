@@ -3,12 +3,14 @@ import io
 import base64
 import hashlib
 import math
+import inspect
 from datetime import datetime
 from uuid import uuid4
 from urllib.parse import quote, urlparse
 from typing import Any, Literal, Optional, Tuple, Dict, List
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 from PIL import Image
 import requests
@@ -604,6 +606,57 @@ class VibodeStageRunRequest(BaseModel):
     roomType: Optional[str] = None
     modelVersion: Optional[str] = None
     aspectRatio: Optional[AspectRatio] = "auto"
+
+
+class ScenePlacementBbox(BaseModel):
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+class ScenePlacement(BaseModel):
+    placementId: str
+    skuId: str
+    label: Optional[str] = None
+    source: Optional[str] = None
+    bbox: Optional[ScenePlacementBbox] = None
+    rotationDeg: Optional[float] = None
+    stageAdded: Optional[int] = None
+    locked: Optional[bool] = None
+
+
+class EligibleSkuVariant(BaseModel):
+    imageUrl: str
+
+
+class EligibleSku(BaseModel):
+    skuId: str
+    label: str
+    source: Optional[str] = None
+    variants: List[EligibleSkuVariant]
+
+
+class VibodeEditRunTarget(BaseModel):
+    placementId: Optional[str] = None
+    skuId: Optional[str] = None
+
+
+class VibodeEditRunRequest(BaseModel):
+    baseImageUrl: Optional[str] = None
+    action: Literal["add", "remove", "swap", "rotate", "move"]
+    placements: List[ScenePlacement]
+    target: Optional[VibodeEditRunTarget] = None
+    params: Optional[Dict[str, Any]] = None
+    eligibleSkus: Optional[List[EligibleSku]] = None
+    sceneId: Optional[str] = None
+    modelVersion: Optional[str] = None
+    aspectRatio: Optional[AspectRatio] = "auto"
+
+
+class VibodeEditRunResponse(BaseModel):
+    imageUrl: str
+    placements: List[ScenePlacement]
 
 
 class VibodeComposeResponse(BaseModel):
@@ -3145,6 +3198,178 @@ def _extract_rotate_marks(
     return parsed_marks
 
 
+def _vibode_edit_run_error(status_code: int, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"error": message})
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _sanitize_storage_segment(raw_value: Optional[str], fallback: str) -> str:
+    source = (raw_value or "").strip()
+    if not source:
+        return fallback
+    allowed = []
+    for ch in source:
+        if ch.isalnum() or ch in ("-", "_"):
+            allowed.append(ch)
+        elif ch in ("/", "\\", " "):
+            allowed.append("_")
+    normalized = "".join(allowed).strip("_")
+    return normalized or fallback
+
+
+def _find_scene_placement_index(placements: List[ScenePlacement], placement_id: str) -> int:
+    for idx, placement in enumerate(placements):
+        if placement.placementId == placement_id:
+            return idx
+    return -1
+
+
+def _find_eligible_sku(eligible_skus: Optional[List[EligibleSku]], sku_id: str) -> Optional[EligibleSku]:
+    if not eligible_skus:
+        return None
+    for sku in eligible_skus:
+        if sku.skuId == sku_id:
+            return sku
+    return None
+
+
+def _looks_like_png_image_ref(image_ref: str) -> bool:
+    value = image_ref.strip().lower()
+    if value.startswith("data:image/png"):
+        return True
+    parsed = urlparse(value)
+    return parsed.path.endswith(".png")
+
+
+def _select_eligible_sku_image_ref(sku: EligibleSku) -> Optional[str]:
+    variants = sku.variants or []
+    if not variants:
+        return None
+    refs: List[str] = []
+    for variant in variants:
+        candidate = (variant.imageUrl or "").strip()
+        if candidate:
+            refs.append(candidate)
+    if not refs:
+        return None
+    png_ref = next((ref for ref in refs if _looks_like_png_image_ref(ref)), None)
+    return png_ref or refs[0]
+
+
+def _load_image_ref_bytes(image_ref: str) -> bytes:
+    if image_ref.startswith("data:image/"):
+        payload_b64 = (image_ref.split(",", 1)[1] if "," in image_ref else image_ref).strip()
+        return _decode_base64_image(payload_b64)
+    return _fetch_image_bytes_from_url(image_ref)
+
+
+def _normalized_bbox_for_storage(bbox: ScenePlacementBbox) -> ScenePlacementBbox:
+    w = min(1.0, max(0.01, float(bbox.w)))
+    h = min(1.0, max(0.01, float(bbox.h)))
+    x = min(1.0 - w, max(0.0, float(bbox.x)))
+    y = min(1.0 - h, max(0.0, float(bbox.y)))
+    return ScenePlacementBbox(x=x, y=y, w=w, h=h)
+
+
+def _bbox_prompt_snippet(bbox: Optional[ScenePlacementBbox]) -> str:
+    if not bbox:
+        return "Target location is approximate; use context from existing object geometry."
+    return (
+        "The object to edit is located in bounding box normalized "
+        f"({bbox.x:.4f}, {bbox.y:.4f}, {bbox.w:.4f}, {bbox.h:.4f})."
+    )
+
+
+def build_vibode_edit_run_prompt(
+    action: Literal["add", "remove", "swap", "rotate", "move"],
+    target_placement: Optional[ScenePlacement],
+    params: Optional[Dict[str, Any]],
+    sku_label: Optional[str] = None,
+) -> str:
+    params = params or {}
+    bbox = target_placement.bbox if target_placement else None
+    lines = [
+        "You are a professional real-estate photo editor.",
+        "",
+        "Hard constraints:",
+        "- Preserve camera position, room geometry, and architecture exactly.",
+        "- Preserve perspective, lighting direction, white balance, and material realism.",
+        "- Do not alter non-target objects.",
+        "- Keep output photorealistic with clean natural edges and contact shadows.",
+        "- Do not add text, logos, watermarks, or visible markup.",
+        "",
+        _bbox_prompt_snippet(bbox),
+        "",
+    ]
+
+    if action == "add":
+        lines.extend(
+            [
+                "Task: Add exactly one object using the provided SKU asset image.",
+                (
+                    f"Insert SKU '{sku_label}' near that bounding box with realistic scale, "
+                    "ground contact, and occlusion."
+                    if sku_label
+                    else "Insert the provided SKU near that bounding box with realistic scale, "
+                    "ground contact, and occlusion."
+                ),
+                "Do not move or modify existing furniture.",
+            ]
+        )
+    elif action == "remove":
+        lines.extend(
+            [
+                "Task: Remove only the target object.",
+                "Remove the highlighted object and fill background naturally.",
+                "Do not restyle or re-stage the scene.",
+            ]
+        )
+    elif action == "swap":
+        lines.extend(
+            [
+                "Task: Replace only the target object with the provided SKU asset image.",
+                (
+                    f"Use SKU '{sku_label}' for the replacement, matching footprint and perspective."
+                    if sku_label
+                    else "Match footprint and perspective to the original target object."
+                ),
+                "Do not change any other object.",
+            ]
+        )
+    elif action == "rotate":
+        rotation_deg = params.get("rotationDeg")
+        lines.extend(
+            [
+                "Task: Rotate only the target object in place.",
+                (
+                    f"Apply a {rotation_deg} degree rotation while keeping the same position and scale."
+                    if rotation_deg is not None
+                    else "Keep the same position and scale."
+                ),
+                "Do not move any other object.",
+            ]
+        )
+    else:
+        dx = params.get("dx")
+        dy = params.get("dy")
+        lines.extend(
+            [
+                "Task: Move only the target object to the updated location.",
+                (
+                    f"Translation vector normalized is (dx={dx}, dy={dy}); keep original scale and rotation."
+                    if dx is not None and dy is not None
+                    else "Keep original scale and rotation."
+                ),
+                "Do not alter any other object.",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
 def call_gemini_multimodal(
     prompt: str,
     room_png_bytes: bytes,
@@ -3914,6 +4139,269 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
         debug_ratio = applied_ratio or "auto"
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
+
+
+@app.post("/api/vibode/edit-run", response_model=VibodeEditRunResponse)
+async def vibode_edit_run(req: VibodeEditRunRequest):
+    # v1 targeting is text-only using normalized bbox coordinates; this can be upgraded to mask/overlay targeting later.
+    action = req.action
+    params = req.params or {}
+    target = req.target or VibodeEditRunTarget()
+
+    if not req.baseImageUrl or not req.baseImageUrl.strip():
+        return _vibode_edit_run_error(400, "baseImageUrl is required.")
+
+    try:
+        room_raw_bytes = _fetch_image_bytes_from_url(req.baseImageUrl.strip())
+    except Exception:
+        return _vibode_edit_run_error(400, "Failed to fetch baseImageUrl image data.")
+
+    model_name = resolve_model_name(req.modelVersion)
+    try:
+        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
+            room_raw_bytes,
+            requested_ratio=req.aspectRatio,
+            model_name=model_name,
+        )
+        aspect_ratio_to_send = applied_ratio
+    except Exception as e:
+        print("[/api/vibode/edit-run] Error preparing room image:", e)
+        return _vibode_edit_run_error(400, "Could not process base image.")
+
+    updated_placements = [placement.model_copy(deep=True) for placement in req.placements]
+    prompt: str
+    out_bytes: Optional[bytes] = None
+    sku_png_bytes_list: List[bytes] = []
+
+    if action == "add":
+        target_sku_id = (target.skuId or "").strip()
+        if not target_sku_id:
+            return _vibode_edit_run_error(400, "target.skuId is required for add.")
+
+        raw_x = params.get("x")
+        raw_y = params.get("y")
+        raw_scale = params.get("scale")
+        if raw_x is None or raw_y is None or raw_scale is None:
+            return _vibode_edit_run_error(400, "params.x, params.y, and params.scale are required for add.")
+
+        try:
+            x = float(raw_x)
+            y = float(raw_y)
+            scale = float(raw_scale)
+        except Exception:
+            return _vibode_edit_run_error(400, "params.x, params.y, and params.scale must be numbers.")
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(scale)):
+            return _vibode_edit_run_error(400, "params.x, params.y, and params.scale must be finite numbers.")
+
+        sku = _find_eligible_sku(req.eligibleSkus, target_sku_id)
+        if sku is None:
+            return _vibode_edit_run_error(400, f"Could not find eligibleSkus entry for skuId={target_sku_id}.")
+        sku_image_ref = _select_eligible_sku_image_ref(sku)
+        if not sku_image_ref:
+            return _vibode_edit_run_error(400, f"eligibleSkus skuId={target_sku_id} is missing variants[].imageUrl.")
+
+        try:
+            sku_raw_bytes = _load_image_ref_bytes(sku_image_ref)
+            sku_png_bytes_list = [_convert_image_bytes_to_png(sku_raw_bytes)]
+        except Exception:
+            return _vibode_edit_run_error(400, f"Failed to fetch/prepare SKU image for skuId={target_sku_id}.")
+
+        box_size = min(0.9, max(0.05, scale))
+        cx = _clamp01(x)
+        cy = _clamp01(y)
+        new_bbox = _normalized_bbox_for_storage(
+            ScenePlacementBbox(
+                x=cx - (box_size / 2.0),
+                y=cy - (box_size / 2.0),
+                w=box_size,
+                h=box_size,
+            )
+        )
+        new_placement = ScenePlacement(
+            placementId="pl_" + uuid4().hex,
+            skuId=target_sku_id,
+            label=sku.label,
+            source=sku.source,
+            bbox=new_bbox,
+            rotationDeg=0.0,
+            stageAdded=3,
+            locked=False,
+        )
+        updated_placements.append(new_placement)
+        prompt = build_vibode_edit_run_prompt(
+            action="add",
+            target_placement=new_placement,
+            params=params,
+            sku_label=sku.label,
+        )
+    elif action == "remove":
+        target_placement_id = (target.placementId or "").strip()
+        if not target_placement_id:
+            return _vibode_edit_run_error(400, "target.placementId is required for remove.")
+        target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
+        if target_idx < 0:
+            return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+        placement_to_remove = updated_placements[target_idx]
+        prompt = build_vibode_edit_run_prompt(
+            action="remove",
+            target_placement=placement_to_remove,
+            params=params,
+        )
+        updated_placements.pop(target_idx)
+    elif action == "swap":
+        target_placement_id = (target.placementId or "").strip()
+        if not target_placement_id:
+            return _vibode_edit_run_error(400, "target.placementId is required for swap.")
+        new_sku_id = str(params.get("newSkuId") or "").strip()
+        if not new_sku_id:
+            return _vibode_edit_run_error(400, "params.newSkuId is required for swap.")
+        target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
+        if target_idx < 0:
+            return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+
+        sku = _find_eligible_sku(req.eligibleSkus, new_sku_id)
+        if sku is None:
+            return _vibode_edit_run_error(400, f"Could not find eligibleSkus entry for skuId={new_sku_id}.")
+        sku_image_ref = _select_eligible_sku_image_ref(sku)
+        if not sku_image_ref:
+            return _vibode_edit_run_error(400, f"eligibleSkus skuId={new_sku_id} is missing variants[].imageUrl.")
+
+        try:
+            sku_raw_bytes = _load_image_ref_bytes(sku_image_ref)
+            sku_png_bytes_list = [_convert_image_bytes_to_png(sku_raw_bytes)]
+        except Exception:
+            return _vibode_edit_run_error(400, f"Failed to fetch/prepare SKU image for skuId={new_sku_id}.")
+
+        placement_before = updated_placements[target_idx]
+        updated_placement = placement_before.model_copy(
+            update={
+                "skuId": new_sku_id,
+                "label": sku.label,
+                "source": sku.source if sku.source is not None else placement_before.source,
+            }
+        )
+        updated_placements[target_idx] = updated_placement
+        prompt = build_vibode_edit_run_prompt(
+            action="swap",
+            target_placement=updated_placement,
+            params=params,
+            sku_label=sku.label,
+        )
+    elif action == "rotate":
+        target_placement_id = (target.placementId or "").strip()
+        if not target_placement_id:
+            return _vibode_edit_run_error(400, "target.placementId is required for rotate.")
+        raw_rotation = params.get("rotationDeg")
+        if raw_rotation is None:
+            return _vibode_edit_run_error(400, "params.rotationDeg is required for rotate.")
+        try:
+            rotation_deg = float(raw_rotation)
+        except Exception:
+            return _vibode_edit_run_error(400, "params.rotationDeg must be a number.")
+        if not math.isfinite(rotation_deg):
+            return _vibode_edit_run_error(400, "params.rotationDeg must be a finite number.")
+
+        target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
+        if target_idx < 0:
+            return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+
+        updated_placement = updated_placements[target_idx].model_copy(update={"rotationDeg": rotation_deg})
+        updated_placements[target_idx] = updated_placement
+        prompt = build_vibode_edit_run_prompt(
+            action="rotate",
+            target_placement=updated_placement,
+            params={"rotationDeg": rotation_deg},
+        )
+    else:
+        target_placement_id = (target.placementId or "").strip()
+        if not target_placement_id:
+            return _vibode_edit_run_error(400, "target.placementId is required for move.")
+        raw_dx = params.get("dx")
+        raw_dy = params.get("dy")
+        if raw_dx is None or raw_dy is None:
+            return _vibode_edit_run_error(400, "params.dx and params.dy are required for move.")
+        try:
+            dx = float(raw_dx)
+            dy = float(raw_dy)
+        except Exception:
+            return _vibode_edit_run_error(400, "params.dx and params.dy must be numbers.")
+        if not (math.isfinite(dx) and math.isfinite(dy)):
+            return _vibode_edit_run_error(400, "params.dx and params.dy must be finite numbers.")
+
+        target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
+        if target_idx < 0:
+            return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+        target_placement = updated_placements[target_idx]
+        if not target_placement.bbox:
+            return _vibode_edit_run_error(400, f"placementId={target_placement_id} is missing bbox for move.")
+
+        normalized_bbox = _normalized_bbox_for_storage(target_placement.bbox)
+        moved_bbox = _normalized_bbox_for_storage(
+            ScenePlacementBbox(
+                x=normalized_bbox.x + dx,
+                y=normalized_bbox.y + dy,
+                w=normalized_bbox.w,
+                h=normalized_bbox.h,
+            )
+        )
+        updated_placement = target_placement.model_copy(update={"bbox": moved_bbox})
+        updated_placements[target_idx] = updated_placement
+        prompt = build_vibode_edit_run_prompt(
+            action="move",
+            target_placement=updated_placement,
+            params={"dx": dx, "dy": dy},
+        )
+
+    room_overlay_png_bytes = room_png_bytes
+    try:
+        if action in ("add", "swap"):
+            gemini_multimodal_sig = inspect.signature(call_gemini_multimodal)
+            gemini_multimodal_kwargs: Dict[str, Any] = {
+                "prompt": prompt,
+                "room_png_bytes": room_png_bytes,
+                "sku_png_bytes_list": sku_png_bytes_list,
+                "model_name": model_name,
+            }
+            if "room_overlay_png_bytes" in gemini_multimodal_sig.parameters:
+                gemini_multimodal_kwargs["room_overlay_png_bytes"] = room_overlay_png_bytes
+            if "aspect_ratio" in gemini_multimodal_sig.parameters:
+                gemini_multimodal_kwargs["aspect_ratio"] = aspect_ratio_to_send
+            out_bytes = call_gemini_multimodal(**gemini_multimodal_kwargs)
+        else:
+            out_bytes = call_gemini_with_prompt(
+                image_png_bytes=room_png_bytes,
+                prompt=prompt,
+                model_name=model_name,
+                aspect_ratio=aspect_ratio_to_send,
+            )
+    except Exception as e:
+        print("[/api/vibode/edit-run] Error in processing:", e)
+        return _vibode_edit_run_error(500, "Error during edit run.")
+
+    if not out_bytes:
+        return _vibode_edit_run_error(500, "Edit run returned empty image.")
+    try:
+        if _infer_image_mime_type(out_bytes) != "image/png":
+            out_bytes = _convert_image_bytes_to_png(out_bytes)
+    except Exception as e:
+        print("[/api/vibode/edit-run] Failed to normalize output PNG bytes:", e)
+        return _vibode_edit_run_error(500, "Edit run returned invalid image bytes.")
+
+    scene_folder = _sanitize_storage_segment(req.sceneId, uuid4().hex)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    output_path = f"vibode-edits/{scene_folder}/{timestamp}_{action}.png"
+    try:
+        _supabase_storage_upload_bytes(
+            object_path=output_path,
+            payload=out_bytes,
+            mime_type="image/png",
+        )
+        signed_url = _supabase_storage_create_signed_url(output_path)
+    except Exception as e:
+        print("[/api/vibode/edit-run] Upload/sign failed:", e)
+        return _vibode_edit_run_error(500, "Failed to upload edited image.")
+
+    return VibodeEditRunResponse(imageUrl=signed_url, placements=updated_placements)
 
 
 @app.post("/api/vibode/user-skus/ingest", response_model=VibodeUserSkuIngestResponse)
