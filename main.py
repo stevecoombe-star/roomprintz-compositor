@@ -3370,6 +3370,48 @@ def build_vibode_edit_run_prompt(
     return "\n".join(lines)
 
 
+def _debug_log_vibode_edit_run(
+    action: str,
+    model_name: str,
+    aspect_ratio_to_send: Optional[str],
+    base_image_url_kind: str,
+    target_placement_id: Optional[str],
+    target_sku_id: Optional[str],
+    params: Dict[str, Any],
+    placements_count: int,
+    eligible_skus_count: int,
+    target_bbox: Optional[ScenePlacementBbox],
+    prompt: str,
+    sku_images_count: Optional[int] = None,
+) -> None:
+    print("[/api/vibode/edit-run] request")
+    print(f"  action={action}")
+    print(f"  model={model_name}")
+    print(f"  aspect_ratio={aspect_ratio_to_send if aspect_ratio_to_send else '(omitted)'}")
+    print(f"  baseImageUrl kind={base_image_url_kind}")
+    print(f"  placements={placements_count}")
+    print(f"  eligible_skus={eligible_skus_count}")
+    print(f"  target_placement_id={target_placement_id if target_placement_id else '(none)'}")
+    print(f"  target_sku_id={target_sku_id if target_sku_id else '(none)'}")
+    print(f"  params={params}")
+    if target_bbox:
+        print(
+            "  bbox="
+            + str(
+                {
+                    "x": target_bbox.x,
+                    "y": target_bbox.y,
+                    "w": target_bbox.w,
+                    "h": target_bbox.h,
+                }
+            )
+        )
+    if sku_images_count is not None:
+        print(f"  sku_images={sku_images_count}")
+    print("  prompt:")
+    print(prompt)
+
+
 def call_gemini_multimodal(
     prompt: str,
     room_png_bytes: bytes,
@@ -4151,8 +4193,10 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
     if not req.baseImageUrl or not req.baseImageUrl.strip():
         return _vibode_edit_run_error(400, "baseImageUrl is required.")
 
+    base_image_url_kind = "data-url" if req.baseImageUrl.strip().startswith("data:image/") else "remote-url"
     try:
-        room_raw_bytes = _fetch_image_bytes_from_url(req.baseImageUrl.strip())
+        print("[/api/vibode/edit-run] baseImageUrl kind:", base_image_url_kind)
+        room_raw_bytes = _load_image_ref_bytes(req.baseImageUrl.strip())
     except Exception:
         return _vibode_edit_run_error(400, "Failed to fetch baseImageUrl image data.")
 
@@ -4172,6 +4216,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
     prompt: str
     out_bytes: Optional[bytes] = None
     sku_png_bytes_list: List[bytes] = []
+    target_placement_id: Optional[str] = None
+    target_sku_id: Optional[str] = None
+    target_bbox: Optional[ScenePlacementBbox] = None
 
     if action == "add":
         target_sku_id = (target.skuId or "").strip()
@@ -4228,6 +4275,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
             locked=False,
         )
         updated_placements.append(new_placement)
+        target_bbox = new_placement.bbox
         prompt = build_vibode_edit_run_prompt(
             action="add",
             target_placement=new_placement,
@@ -4247,6 +4295,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
             target_placement=placement_to_remove,
             params=params,
         )
+        target_bbox = placement_to_remove.bbox
         updated_placements.pop(target_idx)
     elif action == "swap":
         target_placement_id = (target.placementId or "").strip()
@@ -4281,6 +4330,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
             }
         )
         updated_placements[target_idx] = updated_placement
+        target_bbox = updated_placement.bbox
         prompt = build_vibode_edit_run_prompt(
             action="swap",
             target_placement=updated_placement,
@@ -4307,6 +4357,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
 
         updated_placement = updated_placements[target_idx].model_copy(update={"rotationDeg": rotation_deg})
         updated_placements[target_idx] = updated_placement
+        target_bbox = updated_placement.bbox
         prompt = build_vibode_edit_run_prompt(
             action="rotate",
             target_placement=updated_placement,
@@ -4346,6 +4397,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         )
         updated_placement = target_placement.model_copy(update={"bbox": moved_bbox})
         updated_placements[target_idx] = updated_placement
+        target_bbox = updated_placement.bbox
         prompt = build_vibode_edit_run_prompt(
             action="move",
             target_placement=updated_placement,
@@ -4353,6 +4405,20 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         )
 
     room_overlay_png_bytes = room_png_bytes
+    _debug_log_vibode_edit_run(
+        action=action,
+        model_name=model_name,
+        aspect_ratio_to_send=aspect_ratio_to_send,
+        base_image_url_kind=base_image_url_kind,
+        target_placement_id=target_placement_id,
+        target_sku_id=target_sku_id,
+        params=params,
+        placements_count=len(req.placements),
+        eligible_skus_count=len(req.eligibleSkus or []),
+        target_bbox=target_bbox,
+        prompt=prompt,
+        sku_images_count=len(sku_png_bytes_list) if action in ("add", "swap") else None,
+    )
     try:
         if action in ("add", "swap"):
             gemini_multimodal_sig = inspect.signature(call_gemini_multimodal)
@@ -4378,6 +4444,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         print("[/api/vibode/edit-run] Error in processing:", e)
         return _vibode_edit_run_error(500, "Error during edit run.")
 
+    print(f"[/api/vibode/edit-run] output bytes={len(out_bytes) if out_bytes else 0}")
     if not out_bytes:
         return _vibode_edit_run_error(500, "Edit run returned empty image.")
     try:
@@ -4401,6 +4468,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         print("[/api/vibode/edit-run] Upload/sign failed:", e)
         return _vibode_edit_run_error(500, "Failed to upload edited image.")
 
+    print(f"[/api/vibode/edit-run] uploaded path={output_path}")
     return VibodeEditRunResponse(imageUrl=signed_url, placements=updated_placements)
 
 
