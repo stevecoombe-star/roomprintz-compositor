@@ -3291,15 +3291,29 @@ def _target_area_prompt_snippet(bbox: Optional[ScenePlacementBbox]) -> str:
     return f"The target edit should occur roughly near normalized location ({center_x:.4f}, {center_y:.4f})."
 
 
+def _target_area_list_prompt_snippet(targets: List[ScenePlacementBbox]) -> str:
+    if not targets:
+        return "The target edits should occur roughly in the intended target areas."
+    centers = ", ".join(
+        f"({target.x + (target.w / 2.0):.4f}, {target.y + (target.h / 2.0):.4f})" for target in targets
+    )
+    return f"The target edits should occur roughly near normalized locations: {centers}."
+
+
 def build_vibode_edit_run_prompt(
     action: Literal["add", "remove", "swap", "rotate", "move"],
     target_placement: Optional[ScenePlacement],
     params: Optional[Dict[str, Any]],
     sku_label: Optional[str] = None,
+    remove_target_bboxes: Optional[List[ScenePlacementBbox]] = None,
 ) -> str:
     params = params or {}
     bbox = target_placement.bbox if target_placement else None
-    target_guidance = _target_area_prompt_snippet(bbox)
+    remove_target_bboxes = remove_target_bboxes or []
+    if action == "remove" and remove_target_bboxes:
+        target_guidance = _target_area_list_prompt_snippet(remove_target_bboxes)
+    else:
+        target_guidance = _target_area_prompt_snippet(bbox)
     lines = [
         "You are a professional real-estate photo editor.",
         "",
@@ -3330,13 +3344,23 @@ def build_vibode_edit_run_prompt(
             ]
         )
     elif action == "remove":
-        lines.extend(
-            [
-                "Task: Remove only the target object in the intended target area.",
-                "Fill background naturally.",
-                "Do not remove surrounding room content.",
-            ]
-        )
+        if remove_target_bboxes:
+            lines.extend(
+                [
+                    "Task: Remove only the target objects in the intended target areas.",
+                    "Fill background naturally.",
+                    "Do not remove surrounding room content.",
+                    "Do not alter other objects.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "Task: Remove only the target object in the intended target area.",
+                    "Fill background naturally.",
+                    "Do not remove surrounding room content.",
+                ]
+            )
     elif action == "swap":
         lines.extend(
             [
@@ -3409,6 +3433,10 @@ def _debug_log_vibode_edit_run(
     print(f"  target_placement_id={target_placement_id if target_placement_id else '(none)'}")
     print(f"  target_sku_id={target_sku_id if target_sku_id else '(none)'}")
     print(f"  params={params}")
+    if "removeTargets" in params:
+        remove_targets = params.get("removeTargets")
+        remove_targets_count = len(remove_targets) if isinstance(remove_targets, list) else 0
+        print(f"  remove_targets={remove_targets_count}")
     if target_bbox:
         print(
             "  bbox="
@@ -4296,20 +4324,63 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
             sku_label=sku.label,
         )
     elif action == "remove":
-        target_placement_id = (target.placementId or "").strip()
-        if not target_placement_id:
-            return _vibode_edit_run_error(400, "target.placementId is required for remove.")
-        target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
-        if target_idx < 0:
-            return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
-        placement_to_remove = updated_placements[target_idx]
-        prompt = build_vibode_edit_run_prompt(
-            action="remove",
-            target_placement=placement_to_remove,
-            params=params,
-        )
-        target_bbox = placement_to_remove.bbox
-        updated_placements.pop(target_idx)
+        remove_targets = params.get("removeTargets")
+        if isinstance(remove_targets, list) and remove_targets:
+            remove_target_bboxes: List[ScenePlacementBbox] = []
+            remove_target_placement_ids: set[str] = set()
+            target_placement_id = (target.placementId or "").strip() or None
+
+            for remove_target in remove_targets:
+                if not isinstance(remove_target, dict):
+                    continue
+                remove_target_placement_id = str(remove_target.get("placementId") or "").strip()
+                if remove_target_placement_id:
+                    remove_target_placement_ids.add(remove_target_placement_id)
+                remove_target_bbox_raw = remove_target.get("bbox")
+                if isinstance(remove_target_bbox_raw, dict):
+                    try:
+                        remove_target_bbox = ScenePlacementBbox.model_validate(remove_target_bbox_raw)
+                    except Exception:
+                        remove_target_bbox = None
+                    if remove_target_bbox:
+                        remove_target_bboxes.append(_normalized_bbox_for_storage(remove_target_bbox))
+
+            if not remove_target_bboxes and remove_target_placement_ids:
+                for placement in updated_placements:
+                    if placement.placementId in remove_target_placement_ids and placement.bbox:
+                        remove_target_bboxes.append(_normalized_bbox_for_storage(placement.bbox))
+
+            if not remove_target_bboxes:
+                return _vibode_edit_run_error(400, "removeTargets did not include any valid target areas.")
+
+            prompt = build_vibode_edit_run_prompt(
+                action="remove",
+                target_placement=None,
+                params=params,
+                remove_target_bboxes=remove_target_bboxes,
+            )
+            target_bbox = remove_target_bboxes[0] if remove_target_bboxes else None
+            if remove_target_placement_ids:
+                updated_placements = [
+                    placement
+                    for placement in updated_placements
+                    if placement.placementId not in remove_target_placement_ids
+                ]
+        else:
+            target_placement_id = (target.placementId or "").strip()
+            if not target_placement_id:
+                return _vibode_edit_run_error(400, "target.placementId is required for remove.")
+            target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
+            if target_idx < 0:
+                return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+            placement_to_remove = updated_placements[target_idx]
+            prompt = build_vibode_edit_run_prompt(
+                action="remove",
+                target_placement=placement_to_remove,
+                params=params,
+            )
+            target_bbox = placement_to_remove.bbox
+            updated_placements.pop(target_idx)
     elif action == "swap":
         target_placement_id = (target.placementId or "").strip()
         if not target_placement_id:
