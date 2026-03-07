@@ -3283,6 +3283,14 @@ def _bbox_prompt_snippet(bbox: Optional[ScenePlacementBbox]) -> str:
     )
 
 
+def _target_area_prompt_snippet(bbox: Optional[ScenePlacementBbox]) -> str:
+    if not bbox:
+        return "The target edit should occur roughly in the intended target area."
+    center_x = bbox.x + (bbox.w / 2.0)
+    center_y = bbox.y + (bbox.h / 2.0)
+    return f"The target edit should occur roughly near normalized location ({center_x:.4f}, {center_y:.4f})."
+
+
 def build_vibode_edit_run_prompt(
     action: Literal["add", "remove", "swap", "rotate", "move"],
     target_placement: Optional[ScenePlacement],
@@ -3291,6 +3299,7 @@ def build_vibode_edit_run_prompt(
 ) -> str:
     params = params or {}
     bbox = target_placement.bbox if target_placement else None
+    target_guidance = _target_area_prompt_snippet(bbox)
     lines = [
         "You are a professional real-estate photo editor.",
         "",
@@ -3301,7 +3310,7 @@ def build_vibode_edit_run_prompt(
         "- Keep output photorealistic with clean natural edges and contact shadows.",
         "- Do not add text, logos, watermarks, or visible markup.",
         "",
-        _bbox_prompt_snippet(bbox),
+        target_guidance,
         "",
     ]
 
@@ -3310,32 +3319,36 @@ def build_vibode_edit_run_prompt(
             [
                 "Task: Add exactly one object using the provided SKU asset image.",
                 (
-                    f"Insert SKU '{sku_label}' near that bounding box with realistic scale, "
-                    "ground contact, and occlusion."
+                    f"Place SKU '{sku_label}' roughly in the intended target area."
                     if sku_label
-                    else "Insert the provided SKU near that bounding box with realistic scale, "
-                    "ground contact, and occlusion."
+                    else "Place the provided SKU roughly in the intended target area."
                 ),
+                "Determine believable real-world scale automatically from room context, perspective, and nearby furniture.",
+                "Prioritize realistic proportion over placeholder target area.",
+                "Maintain realistic ground contact and occlusion.",
                 "Do not move or modify existing furniture.",
             ]
         )
     elif action == "remove":
         lines.extend(
             [
-                "Task: Remove only the target object.",
-                "Remove the highlighted object and fill background naturally.",
-                "Do not restyle or re-stage the scene.",
+                "Task: Remove only the target object in the intended target area.",
+                "Fill background naturally.",
+                "Do not remove surrounding room content.",
             ]
         )
     elif action == "swap":
         lines.extend(
             [
-                "Task: Replace only the target object with the provided SKU asset image.",
+                "Task: Replace the target object in the intended target area using the provided SKU asset image.",
                 (
-                    f"Use SKU '{sku_label}' for the replacement, matching footprint and perspective."
+                    f"Use SKU '{sku_label}' for the replacement."
                     if sku_label
-                    else "Match footprint and perspective to the original target object."
+                    else "Use the provided SKU for the replacement."
                 ),
+                "Determine believable scale automatically from room context and perspective.",
+                "Prioritize realistic proportion over placeholder target area.",
+                "Preserve placement intent without treating the target area as an exact size box.",
                 "Do not change any other object.",
             ]
         )
@@ -3343,12 +3356,13 @@ def build_vibode_edit_run_prompt(
         rotation_deg = params.get("rotationDeg")
         lines.extend(
             [
-                "Task: Rotate only the target object in place.",
+                "Task: Rotate the target object in place in the intended target area.",
                 (
-                    f"Apply a {rotation_deg} degree rotation while keeping the same position and scale."
+                    f"Apply a {rotation_deg} degree rotation."
                     if rotation_deg is not None
-                    else "Keep the same position and scale."
+                    else "Rotate to the requested orientation."
                 ),
+                "Preserve believable real-world scale and perspective.",
                 "Do not move any other object.",
             ]
         )
@@ -3357,12 +3371,13 @@ def build_vibode_edit_run_prompt(
         dy = params.get("dy")
         lines.extend(
             [
-                "Task: Move only the target object to the updated location.",
+                "Task: Move the target object to the updated intended target area.",
                 (
-                    f"Translation vector normalized is (dx={dx}, dy={dy}); keep original scale and rotation."
+                    f"Translation vector normalized is (dx={dx}, dy={dy})."
                     if dx is not None and dy is not None
-                    else "Keep original scale and rotation."
+                    else "Move to the requested updated target area."
                 ),
+                "Preserve believable real-world scale and perspective.",
                 "Do not alter any other object.",
             ]
         )
@@ -4227,18 +4242,16 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
 
         raw_x = params.get("x")
         raw_y = params.get("y")
-        raw_scale = params.get("scale")
-        if raw_x is None or raw_y is None or raw_scale is None:
-            return _vibode_edit_run_error(400, "params.x, params.y, and params.scale are required for add.")
+        if raw_x is None or raw_y is None:
+            return _vibode_edit_run_error(400, "params.x and params.y are required for add.")
 
         try:
             x = float(raw_x)
             y = float(raw_y)
-            scale = float(raw_scale)
         except Exception:
-            return _vibode_edit_run_error(400, "params.x, params.y, and params.scale must be numbers.")
-        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(scale)):
-            return _vibode_edit_run_error(400, "params.x, params.y, and params.scale must be finite numbers.")
+            return _vibode_edit_run_error(400, "params.x and params.y must be numbers.")
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return _vibode_edit_run_error(400, "params.x and params.y must be finite numbers.")
 
         sku = _find_eligible_sku(req.eligibleSkus, target_sku_id)
         if sku is None:
@@ -4253,7 +4266,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         except Exception:
             return _vibode_edit_run_error(400, f"Failed to fetch/prepare SKU image for skuId={target_sku_id}.")
 
-        box_size = min(0.9, max(0.05, scale))
+        box_size = 0.18
         cx = _clamp01(x)
         cy = _clamp01(y)
         new_bbox = _normalized_bbox_for_storage(
