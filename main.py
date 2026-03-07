@@ -117,6 +117,14 @@ def resolve_model_name(model_version: Optional[str]) -> str:
 # ---------- ASPECT RATIO NORMALIZATION ----------
 
 AspectRatio = Literal["auto", "4:3", "3:2", "16:9", "1:1"]
+Stage4StyleMode = Literal[
+    "style_room",
+    "accessories",
+    "wall_art",
+    "shelves",
+    "curtains",
+    "ceiling_light",
+]
 
 RATIO_MAP: Dict[str, float] = {
     "4:3": 4 / 3,
@@ -604,6 +612,7 @@ class VibodeStageRunRequest(BaseModel):
     repaintWalls: bool = False
     flooringPreset: Optional[str] = None
     roomType: Optional[str] = None
+    stage4Mode: Optional[Stage4StyleMode] = None
     modelVersion: Optional[str] = None
     aspectRatio: Optional[AspectRatio] = "auto"
 
@@ -2103,7 +2112,7 @@ def _collect_vibode_stage_run_missing_fields(req: VibodeStageRunRequest) -> List
     if not has_room_b64 and not has_base_b64 and not has_base_url and not has_base_id:
         missing_fields.append("roomImageBase64|baseImageBase64|baseImageUrl|baseImageId")
 
-    if req.stage in (3, 4) and not req.eligibleSkus:
+    if req.stage == 3 and not req.eligibleSkus:
         missing_fields.append("eligibleSkus")
 
     return missing_fields
@@ -2772,39 +2781,119 @@ def build_stage3_furniture_prompt_v2(
     return "\n".join(lines)
 
 
-def build_stage4_accessories_prompt_v1(
-    eligible_skus: List[VibodeEligibleSku],
-    collection_id: Optional[str],
-    bundle_id: Optional[str],
-    target_count: int,
-) -> str:
-    lines = [
-        "Apply an accessories-only styling pass using the provided SKU assets.",
-        "",
-        "Constraints:",
-        f"- Place approximately {target_count} accessory/decor items using only provided SKU assets.",
-        "- Assume primary furniture is already staged; do not replace or add new primary furniture.",
-        "- Keep room geometry, camera perspective, and existing staged furniture unchanged.",
-        "- Do not add text, logos, or watermarks.",
-        "",
-    ]
+STAGE4_PREAMBLE = """
+You are a professional interior photo editor performing Stage 4 styling.
+This is a non-destructive styling pass on an already-staged room image.
+""".strip()
 
-    if collection_id and collection_id.strip():
-        lines.append(f"Collection ID: {collection_id.strip()}")
-    if bundle_id and bundle_id.strip():
-        lines.append(f"Bundle ID: {bundle_id.strip()}")
-    if collection_id or bundle_id:
-        lines.append("")
 
-    lines.append("SKU reference list (in order):")
-    for idx, sku in enumerate(eligible_skus, start=1):
-        label = (sku.label or "").strip()
-        if label:
-            lines.append(f"{idx}. {sku.skuId} - {label}")
-        else:
-            lines.append(f"{idx}. {sku.skuId}")
+STAGE4_GLOBAL_RULES = """
+Global hard constraints:
+- Preserve room geometry and camera.
+- Do NOT move, resize, replace, or remove existing furniture.
+- Keep edits subtle, photorealistic, and editorial.
+- Ensure all added items appear physically supported (no floating).
+- Do not add text, logos, or watermarks.
+""".strip()
 
-    return "\n".join(lines)
+
+STAGE4_STYLE_ROOM_FRAGMENT = """
+Stage 4 — Editorial Accessories
+
+Add a small number of tasteful editorial accessories to subtly style the room.
+
+Allowed items:
+books, small plant, decorative tray, vase, cushion, throw blanket, or small tabletop decor.
+
+Styling guidance:
+- Place accessories naturally on appropriate surfaces such as coffee tables, side tables, consoles, shelves, or sofas.
+- Create one primary styling vignette (for example a coffee table or sofa composition) and a few smaller supporting accents.
+- Favor restraint and leave some surfaces intentionally uncluttered so the room feels open and balanced.
+- Choose accessories whose materials or tones harmonize with materials already present in the room.
+- Arrange objects so they are visually readable from the camera perspective and subtly suggest a lived-in atmosphere.
+
+Constraints:
+- Preserve room geometry and camera.
+- Do NOT move, resize, replace, or remove existing furniture.
+- Add only small accessories.
+- Maximum 5-8 items.
+- Avoid blocking walkways or functional surfaces like dining tables or desks.
+- Accessories must appear supported by surfaces and not float.
+""".strip()
+
+
+STAGE4_ACCESSORIES_FRAGMENT = """
+Stage 4 — Accessories (Advanced)
+
+Apply a concise editorial accessories pass only.
+- Add only small accessories (for example: books, small plant, tray, vase, cushion, throw, small tabletop decor).
+- Keep the styling restrained and natural, with one main vignette and a few subtle supporting accents.
+- Do not add wall-mounted or architectural elements.
+- Do NOT move, resize, replace, or remove existing furniture.
+""".strip()
+
+
+STAGE4_WALL_ART_FRAGMENT = """
+Stage 4 — Wall Art (Advanced)
+
+Add tasteful minimal framed wall art only.
+- Keep pieces proportionate to wall size.
+- Do not add oversized gallery walls.
+- Do NOT move, resize, replace, or remove existing furniture.
+""".strip()
+
+
+STAGE4_SHELVES_FRAGMENT = """
+Stage 4 — Shelves (Advanced)
+
+Add minimal small floating wall shelves only.
+- Maximum 1-2 shelves.
+- Apply light styling only.
+- Do NOT move, resize, replace, or remove existing furniture.
+""".strip()
+
+
+STAGE4_CURTAINS_FRAGMENT = """
+Stage 4 — Curtains (Advanced)
+
+Add tasteful neutral window dressing only.
+- Use a soft editorial drape.
+- Do not block light excessively.
+- Preserve window geometry.
+- Do NOT move, resize, replace, or remove existing furniture.
+""".strip()
+
+
+STAGE4_CEILING_LIGHT_FRAGMENT = """
+Stage 4 — Ceiling Light (Advanced)
+
+Add a tasteful ceiling light only if the room naturally supports one.
+- Keep it proportionate.
+- Do not introduce dramatic oversized fixtures.
+- Preserve room geometry.
+- Do NOT move, resize, replace, or remove existing furniture.
+""".strip()
+
+
+def build_stage4_styling_prompt_v1(stage4_mode: Stage4StyleMode) -> str:
+    mode_fragments: Dict[str, str] = {
+        "style_room": STAGE4_STYLE_ROOM_FRAGMENT,
+        "accessories": STAGE4_ACCESSORIES_FRAGMENT,
+        "wall_art": STAGE4_WALL_ART_FRAGMENT,
+        "shelves": STAGE4_SHELVES_FRAGMENT,
+        "curtains": STAGE4_CURTAINS_FRAGMENT,
+        "ceiling_light": STAGE4_CEILING_LIGHT_FRAGMENT,
+    }
+    mode_key = (stage4_mode or "style_room").strip().lower()
+    mode_fragment = mode_fragments.get(mode_key, STAGE4_STYLE_ROOM_FRAGMENT)
+    final_prompt = "\n\n".join([STAGE4_PREAMBLE, mode_fragment, STAGE4_GLOBAL_RULES])
+
+    if DEBUG_ROOMPRINTZ_PROMPT:
+        print("\n===== STAGE 4 STYLING PROMPT V1 SENT TO GEMINI =====\n")
+        print(final_prompt)
+        print("\n=====================================================\n")
+
+    return final_prompt
 
 
 def build_stage5_final_vibe_prompt_v1(
@@ -4015,30 +4104,23 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
             flooring_preset=req.flooringPreset,
             room_type=req.roomType,
         )
-    elif req.stage in (3, 4):
+    elif req.stage == 3:
         eligible_skus = req.eligibleSkus or []
         if not eligible_skus:
-            raise HTTPException(status_code=400, detail="eligibleSkus are required for stage 3/4")
+            raise HTTPException(status_code=400, detail="eligibleSkus are required for stage 3")
 
-        if req.stage == 3:
-            max_target = min(len(eligible_skus), 12)
-            if req.targetCount is not None:
-                target_count = max(1, min(req.targetCount, max_target))
-            else:
-                bundle_id_normalized = (req.bundleId or "").strip().lower()
-                if "small" in bundle_id_normalized:
-                    default_target = 6
-                elif "large" in bundle_id_normalized:
-                    default_target = 8
-                else:
-                    default_target = 7
-                target_count = max(1, min(default_target, max_target))
+        max_target = min(len(eligible_skus), 12)
+        if req.targetCount is not None:
+            target_count = max(1, min(req.targetCount, max_target))
         else:
-            max_target = min(len(eligible_skus), 8)
-            if req.targetCount is not None:
-                target_count = max(1, min(req.targetCount, max_target))
+            bundle_id_normalized = (req.bundleId or "").strip().lower()
+            if "small" in bundle_id_normalized:
+                default_target = 6
+            elif "large" in bundle_id_normalized:
+                default_target = 8
             else:
-                target_count = max(1, min(3, max_target))
+                default_target = 7
+            target_count = max(1, min(default_target, max_target))
 
         def _is_user_sku(sku: VibodeEligibleSku) -> bool:
             if isinstance(sku.skuId, str) and sku.skuId.startswith("user_"):
@@ -4046,12 +4128,9 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
             source = getattr(sku, "source", None)
             return isinstance(source, str) and source.strip().lower() == "user"
 
-        if req.stage == 3:
-            user_skus = [sku for sku in eligible_skus if _is_user_sku(sku)]
-            catalog_skus = [sku for sku in eligible_skus if not _is_user_sku(sku)]
-            selected_skus = (user_skus + catalog_skus)[:target_count]
-        else:
-            selected_skus = eligible_skus[:target_count]
+        user_skus = [sku for sku in eligible_skus if _is_user_sku(sku)]
+        catalog_skus = [sku for sku in eligible_skus if not _is_user_sku(sku)]
+        selected_skus = (user_skus + catalog_skus)[:target_count]
         for idx, sku in enumerate(selected_skus):
             image_ref: Optional[str] = None
 
@@ -4090,21 +4169,16 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
                     detail=f"Failed to fetch/prepare image for eligibleSkus[{idx}] skuId={sku.skuId}",
                 )
 
-        if req.stage == 3:
-            prompt = build_stage3_furniture_prompt_v2(
-                eligible_skus=selected_skus,
-                collection_id=req.collectionId,
-                bundle_id=req.bundleId,
-                target_count=target_count,
-                enhance_photo=req.enhancePhoto,
-            )
-        else:
-            prompt = build_stage4_accessories_prompt_v1(
-                eligible_skus=selected_skus,
-                collection_id=req.collectionId,
-                bundle_id=req.bundleId,
-                target_count=target_count,
-            )
+        prompt = build_stage3_furniture_prompt_v2(
+            eligible_skus=selected_skus,
+            collection_id=req.collectionId,
+            bundle_id=req.bundleId,
+            target_count=target_count,
+            enhance_photo=req.enhancePhoto,
+        )
+    elif req.stage == 4:
+        stage4_mode: Stage4StyleMode = req.stage4Mode or "style_room"
+        prompt = build_stage4_styling_prompt_v1(stage4_mode=stage4_mode)
     else:
         prompt = build_stage5_final_vibe_prompt_v3()
 
@@ -4125,6 +4199,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
             "repaintWalls": req.repaintWalls,
             "flooringPreset": req.flooringPreset,
             "emptyRoom": req.emptyRoom,
+            "stage4Mode": req.stage4Mode or "style_room",
         },
     )
     print("Prompt:")
@@ -4194,7 +4269,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
         print("[/api/vibode/stage-run][stage3-debug] full Stage 3 prompt text (exact) END")
 
     try:
-        if req.stage in (3, 4):
+        if req.stage == 3:
             out_bytes = call_gemini_multimodal(
                 prompt=prompt,
                 room_png_bytes=room_png_bytes,
