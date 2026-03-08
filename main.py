@@ -122,7 +122,19 @@ def resolve_model_name(model_version: Optional[str]) -> str:
 
 # ---------- ASPECT RATIO NORMALIZATION ----------
 
-AspectRatio = Literal["auto", "4:3", "3:2", "16:9", "1:1"]
+AspectRatio = Literal[
+    "auto",
+    "1:1",
+    "3:2",
+    "2:3",
+    "3:4",
+    "4:3",
+    "4:5",
+    "5:4",
+    "9:16",
+    "16:9",
+    "21:9",
+]
 Stage4StyleMode = Literal[
     "style_room",
     "accessories",
@@ -133,13 +145,19 @@ Stage4StyleMode = Literal[
 ]
 
 RATIO_MAP: Dict[str, float] = {
-    "4:3": 4 / 3,
-    "3:2": 3 / 2,
-    "16:9": 16 / 9,
     "1:1": 1.0,
+    "3:2": 3 / 2,
+    "2:3": 2 / 3,
+    "3:4": 3 / 4,
+    "4:3": 4 / 3,
+    "4:5": 4 / 5,
+    "5:4": 5 / 4,
+    "9:16": 9 / 16,
+    "16:9": 16 / 9,
+    "21:9": 21 / 9,
 }
 
-SUPPORTED_RATIOS_ORDERED = ["4:3", "3:2", "16:9", "1:1"]
+SUPPORTED_RATIOS_ORDERED = ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
 
 _REQUEST_ID_CTX: ContextVar[str] = ContextVar("roomprintz_request_id", default="-")
 
@@ -299,6 +317,15 @@ def normalize_image_bytes_for_ratio(
         )
         chosen = "1:1"
 
+    log_event(
+        "aspect_ratio_policy",
+        continuation=False,
+        source_canvas_width=w,
+        source_canvas_height=h,
+        mapped_aspect_ratio=chosen,
+        aspect_ratio_applied=True,
+    )
+
     target_ratio = RATIO_MAP[chosen]
     cropped = crop_to_aspect_ratio_fill(img, target_ratio)
     cropped = resize_down_if_needed(cropped, MAX_INPUT_LONG_EDGE_INT)
@@ -317,6 +344,16 @@ def prepare_passthrough_png_bytes(image_bytes: bytes) -> bytes:
     img = _safe_open_image(image_bytes)
     img = resize_down_if_needed(img, MAX_INPUT_LONG_EDGE_INT)
     return image_to_png_bytes(img)
+
+
+def log_continuation_aspect_ratio_omitted(route: str, **fields: Any) -> None:
+    log_event(
+        "aspect_ratio_policy",
+        route=route,
+        continuation=True,
+        aspect_ratio_applied=False,
+        **fields,
+    )
 
 
 # ---------- PROMPT BUILDING (ROOMPRINTZ ENGINE) ----------
@@ -3767,6 +3804,7 @@ async def stage_room(req: StageRoomRequest):
 
     try:
         if req.isContinuation:
+            log_continuation_aspect_ratio_omitted("/stage-room")
             image_png_bytes = prepare_passthrough_png_bytes(raw_bytes)
             applied_ratio = None
             aspect_ratio_to_send = None  # OMIT aspect_ratio to avoid drift
@@ -4183,13 +4221,20 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
 
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
+    is_continuation = req.stage > 1
     try:
-        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
-            room_raw_bytes,
-            requested_ratio=req.aspectRatio,
-            model_name=model_name,
-        )
-        aspect_ratio_to_send = applied_ratio
+        if is_continuation:
+            log_continuation_aspect_ratio_omitted("/api/vibode/stage-run", stage=req.stage)
+            room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
+            applied_ratio = None
+            aspect_ratio_to_send = None
+        else:
+            room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
+                room_raw_bytes,
+                requested_ratio=req.aspectRatio,
+                model_name=model_name,
+            )
+            aspect_ratio_to_send = applied_ratio
     except Exception as e:
         log_event("vibode_stage_run_room_prepare_failed", error=str(e))
         raise HTTPException(status_code=400, detail="Could not process room image")
@@ -4414,7 +4459,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
 
     debug_ratio: Optional[str] = None
     if DEBUG_ROOMPRINTZ_RATIO:
-        debug_ratio = applied_ratio or "auto"
+        debug_ratio = "passthrough" if is_continuation else (applied_ratio or "auto")
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
 
@@ -4438,12 +4483,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
 
     model_name = resolve_model_name(req.modelVersion)
     try:
-        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
-            room_raw_bytes,
-            requested_ratio=req.aspectRatio,
-            model_name=model_name,
-        )
-        aspect_ratio_to_send = applied_ratio
+        log_continuation_aspect_ratio_omitted("/api/vibode/edit-run", action=action)
+        room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
+        aspect_ratio_to_send = None
     except Exception as e:
         print("[/api/vibode/edit-run] Error preparing room image:", e)
         return _vibode_edit_run_error(400, "Could not process base image.")
@@ -4948,12 +4990,10 @@ async def vibode_remove(req: VibodeRemoveRequest):
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
     try:
-        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
-            room_raw_bytes,
-            requested_ratio=req.aspectRatio,
-            model_name=model_name,
-        )
-        aspect_ratio_to_send = applied_ratio
+        log_continuation_aspect_ratio_omitted("/vibode/remove")
+        room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
+        applied_ratio = None
+        aspect_ratio_to_send = None
     except Exception as e:
         print("[/vibode/remove] Error preparing room image:", e)
         raise HTTPException(status_code=400, detail="Could not process room image")
@@ -5033,7 +5073,7 @@ async def vibode_remove(req: VibodeRemoveRequest):
 
     debug_ratio: Optional[str] = None
     if DEBUG_ROOMPRINTZ_RATIO:
-        debug_ratio = applied_ratio or "auto"
+        debug_ratio = "passthrough"
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
 
@@ -5094,12 +5134,10 @@ async def vibode_swap(req: VibodeSwapRequest):
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
     try:
-        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
-            room_raw_bytes,
-            requested_ratio="auto",
-            model_name=model_name,
-        )
-        aspect_ratio_to_send = applied_ratio
+        log_continuation_aspect_ratio_omitted("/vibode/swap")
+        room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
+        applied_ratio = None
+        aspect_ratio_to_send = None
     except Exception as e:
         print("[/vibode/swap] Error preparing room image:", e)
         raise HTTPException(status_code=400, detail="Could not process room image")
@@ -5224,12 +5262,10 @@ async def vibode_rotate(req: VibodeRotateRequest):
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
     try:
-        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
-            room_raw_bytes,
-            requested_ratio=req.aspectRatio,
-            model_name=model_name,
-        )
-        aspect_ratio_to_send = applied_ratio
+        log_continuation_aspect_ratio_omitted("/vibode/rotate")
+        room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
+        applied_ratio = None
+        aspect_ratio_to_send = None
     except Exception as e:
         print("[/vibode/rotate] Error preparing room image:", e)
         raise HTTPException(status_code=400, detail="Could not process room image")
@@ -5310,7 +5346,7 @@ async def vibode_rotate(req: VibodeRotateRequest):
 
     debug_ratio: Optional[str] = None
     if DEBUG_ROOMPRINTZ_RATIO:
-        debug_ratio = applied_ratio or "auto"
+        debug_ratio = "passthrough"
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
 
@@ -5345,12 +5381,10 @@ async def vibode_move(req: VibodeMoveRequest):
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
     try:
-        room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
-            room_raw_bytes,
-            requested_ratio=req.aspectRatio,
-            model_name=model_name,
-        )
-        aspect_ratio_to_send = applied_ratio
+        log_continuation_aspect_ratio_omitted("/vibode/move")
+        room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
+        applied_ratio = None
+        aspect_ratio_to_send = None
     except Exception as e:
         print("[/vibode/move] Error preparing room image:", e)
         raise HTTPException(status_code=400, detail="Could not process room image")
@@ -5438,7 +5472,7 @@ async def vibode_move(req: VibodeMoveRequest):
 
     debug_ratio: Optional[str] = None
     if DEBUG_ROOMPRINTZ_RATIO:
-        debug_ratio = applied_ratio or "auto"
+        debug_ratio = "passthrough"
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
 
