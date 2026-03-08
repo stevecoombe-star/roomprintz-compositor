@@ -25,4 +25,19 @@ if [[ -f ".env.local" ]]; then
   set +a
 fi
 
+# Sensible defaults for local dev if not explicitly set in env files.
+export DEBUG_ROOMPRINTZ_PROMPT="${DEBUG_ROOMPRINTZ_PROMPT:-1}"
+export DEBUG_ROOMPRINTZ_STAGE3_PROMPT="${DEBUG_ROOMPRINTZ_STAGE3_PROMPT:-0}"
+export VIBODE_LOG_PROMPTS="${VIBODE_LOG_PROMPTS:-0}"
+
+echo "-------------------------------------------------------"
+echo "Vibode Compositor Dev Server"
+echo "DEBUG_ROOMPRINTZ_PROMPT=${DEBUG_ROOMPRINTZ_PROMPT}"
+echo "DEBUG_ROOMPRINTZ_STAGE3_PROMPT=${DEBUG_ROOMPRINTZ_STAGE3_PROMPT}"
+echo "VIBODE_LOG_PROMPTS=${VIBODE_LOG_PROMPTS}"
+echo "VIBODE_DUMP_ANNOTATED_IMAGE=${VIBODE_DUMP_ANNOTATED_IMAGE:-0}"
+echo "VIBODE_DEBUG_DIR=${VIBODE_DEBUG_DIR:-}"
+echo "VIBODE_STRICT=${VIBODE_STRICT:-0}"
+echo "-------------------------------------------------------"
+
 exec uvicorn main:app --reload --port 8000

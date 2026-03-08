@@ -3610,8 +3610,11 @@ def _debug_log_vibode_edit_run(
         )
     if sku_images_count is not None:
         print(f"  sku_images={sku_images_count}")
-    print("  prompt:")
-    print(prompt)
+    if DEBUG_ROOMPRINTZ_PROMPT:
+        request_id = get_request_id()
+        print(f"[roomprintz][prompt] BEGIN request_id={request_id} action={action}")
+        print(prompt)
+        print(f"[roomprintz][prompt] END request_id={request_id} action={action}")
 
 
 def call_gemini_multimodal(
