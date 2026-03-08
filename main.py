@@ -2,14 +2,17 @@ import os
 import io
 import base64
 import hashlib
+import json
 import math
 import inspect
+import time
+from contextvars import ContextVar
 from datetime import datetime
 from uuid import uuid4
 from urllib.parse import quote, urlparse
 from typing import Any, Literal, Optional, Tuple, Dict, List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 from PIL import Image
@@ -43,7 +46,10 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 DEFAULT_MODEL_NAME = "gemini-3-pro-image-preview"
 
 # Toggle prompt logging with env var: DEBUG_ROOMPRINTZ_PROMPT=1
-DEBUG_ROOMPRINTZ_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_PROMPT", "1") == "1"
+DEBUG_ROOMPRINTZ_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_PROMPT", "0") == "1"
+
+# Strict Stage 3 prompt dump flag (route-level, exact prompt text).
+DEBUG_ROOMPRINTZ_STAGE3_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_STAGE3_PROMPT", "0") == "1"
 
 # Toggle ratio debug return
 DEBUG_ROOMPRINTZ_RATIO = os.getenv("DEBUG_ROOMPRINTZ_RATIO", "0") == "1"
@@ -134,6 +140,39 @@ RATIO_MAP: Dict[str, float] = {
 }
 
 SUPPORTED_RATIOS_ORDERED = ["4:3", "3:2", "16:9", "1:1"]
+
+_REQUEST_ID_CTX: ContextVar[str] = ContextVar("roomprintz_request_id", default="-")
+
+
+def get_request_id() -> str:
+    return _REQUEST_ID_CTX.get()
+
+
+def _log_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.replace("\n", "\\n")
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=True, default=str)
+    return str(value)
+
+
+def log_event(event: str, **fields: Any) -> None:
+    parts = [f"event={event}", f"request_id={get_request_id()}"]
+    for key in sorted(fields.keys()):
+        parts.append(f"{key}={_log_value(fields[key])}")
+    print("[roomprintz]", " ".join(parts))
+
+
+def summarize_prompt(prompt: str) -> Dict[str, Any]:
+    prompt_text = prompt or ""
+    first_line = next((line.strip() for line in prompt_text.splitlines() if line.strip()), "")
+    if len(first_line) > 120:
+        first_line = f"{first_line[:117]}..."
+    return {
+        "prompt_len": len(prompt_text),
+        "prompt_hash": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:12],
+        "prompt_first_line": first_line,
+    }
 
 
 def _safe_open_image(image_bytes: bytes) -> Image.Image:
@@ -481,17 +520,24 @@ Output requirements:
 
     final_prompt = "\n\n".join(fragments)
 
-    if DEBUG_ROOMPRINTZ_PROMPT:
-        print("\n===== ROOMPRINTZ PROMPT SENT TO NANO BANANA =====\n")
-        print(final_prompt)
-        print("\n=================================================\n")
-
     return final_prompt
 
 
 # ---------- FASTAPI APP ----------
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def add_request_id_middleware(request: Request, call_next):
+    request_id = uuid4().hex[:12]
+    token = _REQUEST_ID_CTX.set(request_id)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = request_id
+        return response
+    finally:
+        _REQUEST_ID_CTX.reset(token)
 
 
 # ---------- MODELS ----------
@@ -781,17 +827,18 @@ def call_gemini_with_prompt(
     If aspect_ratio is None, we OMIT image_config.aspect_ratio entirely
     (premium continuation behavior).
     """
+    started_at = time.perf_counter()
+    logged_terminal_failure = False
+    log_event(
+        "model_call_start",
+        function="call_gemini_with_prompt",
+        model_name=model_name,
+        modality="image+text",
+        aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+        image_count=1,
+        input_png_bytes=len(image_png_bytes),
+    )
     try:
-        if DEBUG_ROOMPRINTZ_PROMPT:
-            print(
-                "[call_gemini_with_prompt] Calling model:",
-                model_name,
-                "| Input PNG bytes:",
-                len(image_png_bytes),
-                "| aspect_ratio:",
-                aspect_ratio if aspect_ratio else "(omitted)",
-            )
-
         config_kwargs = {"response_modalities": ["IMAGE"]}
 
         if aspect_ratio:
@@ -816,16 +863,52 @@ def call_gemini_with_prompt(
             part = candidate.content.parts[0]
             out_bytes = part.inline_data.data
         except Exception as e:
-            print("[call_gemini_with_prompt] Failed to extract image bytes:", e)
+            log_event(
+                "model_call_extract_failed",
+                function="call_gemini_with_prompt",
+                model_name=model_name,
+                modality="image+text",
+                aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+                error=str(e),
+            )
+            logged_terminal_failure = True
             raise RuntimeError("Could not extract generated image from Gemini response")
 
         if not out_bytes:
+            logged_terminal_failure = True
+            log_event(
+                "model_call_failed",
+                function="call_gemini_with_prompt",
+                model_name=model_name,
+                modality="image+text",
+                aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+                error="Gemini returned empty image bytes",
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
             raise RuntimeError("Gemini returned empty image bytes")
 
+        log_event(
+            "model_call_success",
+            function="call_gemini_with_prompt",
+            model_name=model_name,
+            modality="image+text",
+            aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+            output_png_bytes=len(out_bytes),
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+        )
         return out_bytes
 
     except Exception as e:
-        print("[call_gemini_with_prompt] Error calling Gemini:", e)
+        if not logged_terminal_failure:
+            log_event(
+                "model_call_failed",
+                function="call_gemini_with_prompt",
+                model_name=model_name,
+                modality="image+text",
+                aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+                error=str(e),
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
         raise
 
 
@@ -2774,10 +2857,6 @@ def build_stage3_furniture_prompt_v2(
             "Do not make mood, style, cinematic, editorial, or creative lighting/color changes.",
         ]
 
-    if DEBUG_ROOMPRINTZ_PROMPT:
-        print("\n===== STAGE 3 FURNITURE PROMPT V2 SENT TO GEMINI =====\n")
-        print("\n".join(lines))
-        print("\n=======================================================\n")
     return "\n".join(lines)
 
 
@@ -2888,11 +2967,6 @@ def build_stage4_styling_prompt_v1(stage4_mode: Stage4StyleMode) -> str:
     mode_fragment = mode_fragments.get(mode_key, STAGE4_STYLE_ROOM_FRAGMENT)
     final_prompt = "\n\n".join([STAGE4_PREAMBLE, mode_fragment, STAGE4_GLOBAL_RULES])
 
-    if DEBUG_ROOMPRINTZ_PROMPT:
-        print("\n===== STAGE 4 STYLING PROMPT V1 SENT TO GEMINI =====\n")
-        print(final_prompt)
-        print("\n=====================================================\n")
-
     return final_prompt
 
 
@@ -2940,10 +3014,6 @@ Hard rules (non-negotiable):
 
 def build_stage5_final_vibe_prompt_v3() -> str:
     final_prompt = "\n\n".join([STAGE5_PREAMBLE, STAGE5_SWAGGER_GRADE, STAGE5_HARD_RULES])
-    if DEBUG_ROOMPRINTZ_PROMPT:
-        print("\n===== STAGE 5 FINAL VIBE PROMPT V3 SENT TO GEMINI =====\n")
-        print(final_prompt)
-        print("\n=========================================================\n")
     return final_prompt
 
 
@@ -3552,20 +3622,20 @@ def call_gemini_multimodal(
     model_name: str,
     aspect_ratio: Optional[str] = None,
 ) -> bytes:
+    started_at = time.perf_counter()
+    logged_terminal_failure = False
+    log_event(
+        "model_call_start",
+        function="call_gemini_multimodal",
+        model_name=model_name,
+        modality="multimodal",
+        aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+        image_count=2 + len(sku_png_bytes_list),
+        room_png_bytes=len(room_png_bytes),
+        room_overlay_png_bytes=len(room_overlay_png_bytes),
+        sku_count=len(sku_png_bytes_list),
+    )
     try:
-        if DEBUG_ROOMPRINTZ_PROMPT:
-            print(
-                "[call_gemini_multimodal] Calling model:",
-                model_name,
-                "| Room clean bytes:",
-                len(room_png_bytes),
-                "| Room overlay bytes:",
-                len(room_overlay_png_bytes),
-                "| sku_count:",
-                len(sku_png_bytes_list),
-                "| aspect_ratio:",
-                aspect_ratio if aspect_ratio else "(omitted)",
-            )
         config_kwargs = {"response_modalities": ["IMAGE"]}
         if aspect_ratio:
             config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio)
@@ -3603,13 +3673,53 @@ def call_gemini_multimodal(
             part = candidate.content.parts[0]
             out_bytes = part.inline_data.data
         except Exception as e:
-            print("[call_gemini_multimodal] Failed to extract image bytes:", e)
+            log_event(
+                "model_call_extract_failed",
+                function="call_gemini_multimodal",
+                model_name=model_name,
+                modality="multimodal",
+                aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+                sku_count=len(sku_png_bytes_list),
+                error=str(e),
+            )
+            logged_terminal_failure = True
             raise RuntimeError("Could not extract generated image from Gemini response")
         if not out_bytes:
+            logged_terminal_failure = True
+            log_event(
+                "model_call_failed",
+                function="call_gemini_multimodal",
+                model_name=model_name,
+                modality="multimodal",
+                aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+                sku_count=len(sku_png_bytes_list),
+                error="Gemini returned empty image bytes",
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
             raise RuntimeError("Gemini returned empty image bytes")
+        log_event(
+            "model_call_success",
+            function="call_gemini_multimodal",
+            model_name=model_name,
+            modality="multimodal",
+            aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+            sku_count=len(sku_png_bytes_list),
+            output_png_bytes=len(out_bytes),
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+        )
         return out_bytes
     except Exception as e:
-        print("[call_gemini_multimodal] Error calling Gemini:", e)
+        if not logged_terminal_failure:
+            log_event(
+                "model_call_failed",
+                function="call_gemini_multimodal",
+                model_name=model_name,
+                modality="multimodal",
+                aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
+                sku_count=len(sku_png_bytes_list),
+                error=str(e),
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
         raise
 
 
@@ -3716,7 +3826,7 @@ async def stage_room(req: StageRoomRequest):
                 aspect_ratio=aspect_ratio_to_send,
             )
     except Exception as e:
-        print("[/stage-room] Error in processing:", e)
+        log_event("stage_room_processing_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Error during fusion")
 
     if not out_bytes:
@@ -3831,7 +3941,7 @@ async def vibode_compose(req: VibodeComposeRequest):
             aspect_ratio=aspect_ratio_to_send,
         )
     except Exception as e:
-        print("[/vibode/compose] Error in processing:", e)
+        log_event("vibode_compose_processing_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Error during compose")
 
     if not out_bytes:
@@ -3946,7 +4056,7 @@ async def vibode_vibe(req: VibodeVibeRequest):
             aspect_ratio=aspect_ratio_to_send,
         )
     except Exception as e:
-        print("[/vibode/vibe] Error in processing:", e)
+        log_event("vibode_vibe_processing_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Error during vibe")
 
     if not out_bytes:
@@ -4036,7 +4146,7 @@ async def vibode_full_vibe(req: VibodeFreezeRequest):
             aspect_ratio=aspect_ratio_to_send,
         )
     except Exception as e:
-        print("[/vibode/full_vibe] Error in processing:", e)
+        log_event("vibode_full_vibe_processing_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Error during full vibe")
 
     if not out_bytes:
@@ -4065,7 +4175,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print("[/api/vibode/stage-run] Failed to resolve base image:", e)
+        log_event("vibode_stage_run_base_image_resolve_failed", error=str(e))
         raise HTTPException(status_code=400, detail="Failed to resolve stage-run base image data")
 
     applied_ratio: Optional[str] = None
@@ -4078,7 +4188,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
         )
         aspect_ratio_to_send = applied_ratio
     except Exception as e:
-        print("[/api/vibode/stage-run] Error preparing room image:", e)
+        log_event("vibode_stage_run_room_prepare_failed", error=str(e))
         raise HTTPException(status_code=400, detail="Could not process room image")
 
     prompt: str
@@ -4139,7 +4249,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
                 try:
                     image_ref = _extract_vibode_vibe_sku_image_ref(resolver(sku.skuId))
                 except Exception as e:
-                    print("[/api/vibode/stage-run] SKU resolver failed:", {"skuId": sku.skuId, "error": str(e)})
+                    log_event("vibode_stage_run_sku_resolver_failed", sku_id=sku.skuId, error=str(e))
 
             if not image_ref:
                 image_ref = _extract_vibode_vibe_sku_image_ref(sku.variants or [])
@@ -4163,7 +4273,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
             except HTTPException:
                 raise
             except Exception as e:
-                print("[/api/vibode/stage-run] Error preparing SKU image:", {"skuId": sku.skuId, "error": str(e)})
+                log_event("vibode_stage_run_sku_prepare_failed", sku_id=sku.skuId, error=str(e))
                 raise HTTPException(
                     status_code=400,
                     detail=f"Failed to fetch/prepare image for eligibleSkus[{idx}] skuId={sku.skuId}",
@@ -4182,15 +4292,14 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
     else:
         prompt = build_stage5_final_vibe_prompt_v3()
 
-    debug_divider = "=" * 80
-    print(debug_divider)
-    print("[/api/vibode/stage-run] Gemini request debug")
-    print(f"Stage: {req.stage}")
-    print(f"Model: {model_name}")
-    print(f"Aspect ratio sent: {aspect_ratio_to_send if aspect_ratio_to_send else '(omitted)'}")
-    print(
-        "Options:",
-        {
+    prompt_summary = summarize_prompt(prompt)
+    log_event(
+        "vibode_stage_run_ready",
+        stage=req.stage,
+        model_name=model_name,
+        aspect_ratio=aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
+        sku_count=len(sku_png_bytes_list),
+        options={
             "enhancePhoto": req.enhancePhoto,
             "cleanupRoom": req.cleanupRoom,
             "heavyDeclutter": req.heavyDeclutter,
@@ -4201,10 +4310,15 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
             "emptyRoom": req.emptyRoom,
             "stage4Mode": req.stage4Mode or "style_room",
         },
+        **prompt_summary,
     )
-    print("Prompt:")
-    print(prompt)
-    print(debug_divider)
+    if DEBUG_ROOMPRINTZ_PROMPT:
+        request_id = get_request_id()
+        print(
+            f"[roomprintz][prompt] BEGIN request_id={request_id} stage={req.stage} model_name={model_name}"
+        )
+        print(prompt)
+        print(f"[roomprintz][prompt] END request_id={request_id} stage={req.stage}")
 
     if req.stage == 3:
         eligible_skus = req.eligibleSkus or []
@@ -4264,9 +4378,10 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
                 {"skuId": asset["skuId"], "resolvedImageUrl": _truncate_preview(asset["imageRef"])},
             )
 
-        print("[/api/vibode/stage-run][stage3-debug] full Stage 3 prompt text (exact) BEGIN")
-        print(prompt)
-        print("[/api/vibode/stage-run][stage3-debug] full Stage 3 prompt text (exact) END")
+        if DEBUG_ROOMPRINTZ_STAGE3_PROMPT and not DEBUG_ROOMPRINTZ_PROMPT:
+            print("[/api/vibode/stage-run][stage3-debug] full Stage 3 prompt text (exact) BEGIN")
+            print(prompt)
+            print("[/api/vibode/stage-run][stage3-debug] full Stage 3 prompt text (exact) END")
 
     try:
         if req.stage == 3:
@@ -4286,7 +4401,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
                 aspect_ratio=aspect_ratio_to_send,
             )
     except Exception as e:
-        print("[/api/vibode/stage-run] Error in processing:", e)
+        log_event("vibode_stage_run_processing_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Error during stage run")
 
     if not out_bytes:
@@ -4600,7 +4715,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
                 aspect_ratio=aspect_ratio_to_send,
             )
     except Exception as e:
-        print("[/api/vibode/edit-run] Error in processing:", e)
+        log_event("vibode_edit_run_processing_failed", error=str(e))
         return _vibode_edit_run_error(500, "Error during edit run.")
 
     print(f"[/api/vibode/edit-run] output bytes={len(out_bytes) if out_bytes else 0}")
@@ -4624,7 +4739,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         )
         signed_url = _supabase_storage_create_signed_url(output_path)
     except Exception as e:
-        print("[/api/vibode/edit-run] Upload/sign failed:", e)
+        log_event("vibode_edit_run_upload_sign_failed", error=str(e))
         return _vibode_edit_run_error(500, "Failed to upload edited image.")
 
     print(f"[/api/vibode/edit-run] uploaded path={output_path}")
@@ -4905,7 +5020,7 @@ async def vibode_remove(req: VibodeRemoveRequest):
             aspect_ratio=aspect_ratio_to_send,
         )
     except Exception as e:
-        print("[/vibode/remove] Error in processing:", e)
+        log_event("vibode_remove_processing_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Error during remove")
 
     if not out_bytes:
@@ -5062,7 +5177,7 @@ async def vibode_swap(req: VibodeSwapRequest):
             aspect_ratio=aspect_ratio_to_send,
         )
     except Exception as e:
-        print("[/vibode/swap] Error in processing:", e)
+        log_event("vibode_swap_processing_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Error during swap")
 
     if not out_bytes:
@@ -5182,7 +5297,7 @@ async def vibode_rotate(req: VibodeRotateRequest):
             aspect_ratio=aspect_ratio_to_send,
         )
     except Exception as e:
-        print("[/vibode/rotate] Error in processing:", e)
+        log_event("vibode_rotate_processing_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Error during rotate")
 
     if not out_bytes:
@@ -5297,7 +5412,7 @@ async def vibode_move(req: VibodeMoveRequest):
             aspect_ratio=aspect_ratio_to_send,
         )
     except Exception as e:
-        print("[/vibode/move] Error in processing:", e)
+        log_event("vibode_move_processing_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Error during move")
 
     if not out_bytes:
