@@ -677,6 +677,7 @@ class VibodeVibeRequest(BaseModel):
 
 class VibodeStageRunRequest(BaseModel):
     stage: Literal[1, 2, 3, 4, 5]
+    isContinuation: Optional[bool] = None
     baseImageId: Optional[str] = None
     roomImageBase64: Optional[str] = None
     baseImageUrl: Optional[str] = None
@@ -4221,7 +4222,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
 
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
-    is_continuation = req.stage > 1
+    is_continuation = bool(req.isContinuation) or req.stage > 1
     try:
         if is_continuation:
             log_continuation_aspect_ratio_omitted("/api/vibode/stage-run", stage=req.stage)
