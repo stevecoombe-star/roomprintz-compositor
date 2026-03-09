@@ -3802,6 +3802,15 @@ async def stage_room(req: StageRoomRequest):
 
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
+    continuation_field_set = getattr(req, "model_fields_set", None)
+    if continuation_field_set is None:
+        continuation_field_set = getattr(req, "__fields_set__", set())
+    if "isContinuation" not in continuation_field_set:
+        log_event(
+            "stage_room_continuation_flag_defaulted",
+            route="/stage-room",
+            isContinuation=req.isContinuation,
+        )
 
     try:
         if req.isContinuation:
