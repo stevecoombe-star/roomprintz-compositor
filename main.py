@@ -4244,13 +4244,17 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
 
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
-    is_continuation = bool(req.isContinuation) or req.stage > 1
+    is_continuation = bool(req.isContinuation)
     try:
         if is_continuation:
-            log_continuation_aspect_ratio_omitted("/api/vibode/stage-run", stage=req.stage)
             room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
             applied_ratio = None
-            aspect_ratio_to_send = None
+            requested_ratio = (req.aspectRatio or "").strip().lower().replace("x", ":")
+            if requested_ratio and requested_ratio != "auto":
+                aspect_ratio_to_send = requested_ratio
+            else:
+                source_w, source_h = _safe_open_image(room_raw_bytes).size
+                aspect_ratio_to_send = choose_closest_aspect_ratio(source_w, source_h)
         else:
             room_png_bytes, applied_ratio = normalize_image_bytes_for_ratio(
                 room_raw_bytes,
@@ -4366,7 +4370,12 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
     prompt_summary = summarize_prompt(prompt)
     log_event(
         "vibode_stage_run_ready",
+        route="/api/vibode/stage-run",
         stage=req.stage,
+        continuation=is_continuation,
+        requested_aspect_ratio=req.aspectRatio,
+        applied_ratio=applied_ratio if applied_ratio else "(none)",
+        aspect_ratio_to_send=aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
         model_name=model_name,
         aspect_ratio=aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
         sku_count=len(sku_png_bytes_list),
