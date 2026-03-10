@@ -4254,6 +4254,15 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
 
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
+    # IMPORTANT:
+    # Gemini image generation defaults to 1:1 when `image_config.aspect_ratio`
+    # is omitted from the request. For Vibode continuation flows we preserve
+    # passthrough image bytes (no crop/normalize), but we MUST still compute
+    # and send an explicit `aspect_ratio_to_send` based on either the requested
+    # aspectRatio or the source image dimensions.
+    #
+    # Do NOT omit aspect_ratio for continuation or edit flows, otherwise
+    # Gemini will return square (1:1) outputs.
     is_continuation = bool(req.isContinuation)
     try:
         if is_continuation:
@@ -4524,6 +4533,15 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         return _vibode_edit_run_error(400, "Failed to fetch baseImageUrl image data.")
 
     model_name = resolve_model_name_for_route("/api/vibode/edit-run", req.modelVersion)
+    # IMPORTANT:
+    # Gemini image generation defaults to 1:1 when `image_config.aspect_ratio`
+    # is omitted from the request. For Vibode continuation flows we preserve
+    # passthrough image bytes (no crop/normalize), but we MUST still compute
+    # and send an explicit `aspect_ratio_to_send` based on either the requested
+    # aspectRatio or the source image dimensions.
+    #
+    # Do NOT omit aspect_ratio for continuation or edit flows, otherwise
+    # Gemini will return square (1:1) outputs.
     try:
         room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
         source_w, source_h = _safe_open_image(room_raw_bytes).size
