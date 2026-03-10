@@ -44,6 +44,19 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Default model: Nano Banana Pro
 DEFAULT_MODEL_NAME = "gemini-3-pro-image-preview"
+MODEL_VERSION_ALIASES: Dict[str, str] = {
+    # Preferred Vibode shorthand contract.
+    "nbp": "gemini-3-pro-image-preview",
+    "nb2": "gemini-3.1-flash-image-preview",
+    # Backward-compatible raw model IDs.
+    "gemini-3-pro-image-preview": "gemini-3-pro-image-preview",
+    "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image-preview",
+    # Legacy aliases kept for compatibility.
+    "gemini-3": "gemini-3-pro-image-preview",
+    "gemini-3-pro": "gemini-3-pro-image-preview",
+    "gemini-2.5": "gemini-2.5-flash-image",
+    "gemini-2.5-flash-image": "gemini-2.5-flash-image",
+}
 
 # Toggle prompt logging with env var: DEBUG_ROOMPRINTZ_PROMPT=1
 DEBUG_ROOMPRINTZ_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_PROMPT", "0") == "1"
@@ -98,26 +111,15 @@ USER_SKU_BG_REMOVAL_PROMPT = (
 
 def resolve_model_name(model_version: Optional[str]) -> str:
     """
-    Map a simple modelVersion string from the frontend into a concrete Gemini model ID.
+    Map modelVersion aliases from the frontend into a concrete Gemini model ID.
 
-    Expected values from the frontend:
-    - "gemini-3"   -> "gemini-3-pro-image-preview" (Nano Banana Pro, default)
-    - "gemini-2.5" -> "gemini-2.5-flash-image"    (OG Nano Banana)
-
-    If a full model ID is passed, we just use it as-is.
+    Default/fallback remains Nano Banana Pro.
     """
     if not model_version or model_version.strip() == "":
         return DEFAULT_MODEL_NAME
 
     v = model_version.strip().lower()
-
-    if v in ("gemini-3", "gemini-3-pro", "gemini-3-pro-image-preview"):
-        return "gemini-3-pro-image-preview"
-
-    if v in ("gemini-2.5", "gemini-2.5-flash-image"):
-        return "gemini-2.5-flash-image"
-
-    return model_version
+    return MODEL_VERSION_ALIASES.get(v, model_version)
 
 
 # ---------- ASPECT RATIO NORMALIZATION ----------
@@ -179,6 +181,17 @@ def log_event(event: str, **fields: Any) -> None:
     for key in sorted(fields.keys()):
         parts.append(f"{key}={_log_value(fields[key])}")
     print("[roomprintz]", " ".join(parts))
+
+
+def resolve_model_name_for_route(route: str, model_version: Optional[str]) -> str:
+    model_name = resolve_model_name(model_version)
+    log_event(
+        "model_version_resolved",
+        route=route,
+        model_version=model_version,
+        model_name=model_name,
+    )
+    return model_name
 
 
 def summarize_prompt(prompt: str) -> Dict[str, Any]:
@@ -3792,7 +3805,7 @@ async def stage_room(req: StageRoomRequest):
     if not wants_photo_tools and not wants_staging:
         raise HTTPException(status_code=400, detail="Nothing to do.")
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/stage-room", req.modelVersion)
 
     try:
         raw_bytes = base64.b64decode(req.imageBase64)
@@ -3899,7 +3912,7 @@ async def vibode_compose(req: VibodeComposeRequest):
     if not req.placements:
         raise HTTPException(status_code=400, detail="No placements provided.")
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/vibode/compose", req.modelVersion)
     placements_ordered = order_vibode_placements(req.placements)
 
     try:
@@ -4011,7 +4024,7 @@ async def vibode_compose(req: VibodeComposeRequest):
 async def vibode_vibe(req: VibodeVibeRequest):
     _reject_if_vibode_strict_missing("/vibode/vibe", _collect_vibode_vibe_missing_fields(req))
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/vibode/vibe", req.modelVersion)
 
     try:
         room_raw_bytes = _decode_base64_image(req.roomImageBase64)
@@ -4129,7 +4142,7 @@ async def vibode_full_vibe(req: VibodeFreezeRequest):
         _collect_vibode_full_vibe_missing_fields(req),
     )
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/vibode/full_vibe", req.modelVersion)
 
     base_image = req.freeze.baseImage
     try:
@@ -4219,7 +4232,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
         _collect_vibode_stage_run_missing_fields(req),
     )
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/api/vibode/stage-run", req.modelVersion)
 
     try:
         room_raw_bytes = _resolve_vibode_stage_run_room_raw_bytes(req)
@@ -4491,7 +4504,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
     except Exception:
         return _vibode_edit_run_error(400, "Failed to fetch baseImageUrl image data.")
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/api/vibode/edit-run", req.modelVersion)
     try:
         log_continuation_aspect_ratio_omitted("/api/vibode/edit-run", action=action)
         room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
@@ -4983,7 +4996,7 @@ async def vibode_remove(req: VibodeRemoveRequest):
     if not req.marks:
         raise HTTPException(status_code=400, detail="No marks provided.")
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/vibode/remove", req.modelVersion)
 
     try:
         room_raw_bytes = _decode_base64_image(req.cleanBase64)
@@ -5125,7 +5138,7 @@ async def vibode_swap(req: VibodeSwapRequest):
                 detail=f"replacementAssets[{idx}].imageUrl is required.",
             )
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/vibode/swap", req.modelVersion)
     marks_ordered = list(req.marks)  # Preserve request order: marker index -> replacement index.
     mapped_replacements = req.replacementAssets[: len(marks_ordered)]
 
@@ -5260,7 +5273,7 @@ async def vibode_rotate(req: VibodeRotateRequest):
     else:
         raise HTTPException(status_code=400, detail="Provide either cleanBase64 or baseImageUrl.")
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/vibode/rotate", req.modelVersion)
 
     try:
         room_orig_img = _safe_open_image(room_raw_bytes)
@@ -5379,7 +5392,7 @@ async def vibode_move(req: VibodeMoveRequest):
     else:
         raise HTTPException(status_code=400, detail="Provide either imageBase64 or imageUrl.")
 
-    model_name = resolve_model_name(req.modelVersion)
+    model_name = resolve_model_name_for_route("/vibode/move", req.modelVersion)
 
     try:
         room_orig_img = _safe_open_image(room_raw_bytes)
