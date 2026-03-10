@@ -3622,6 +3622,7 @@ def build_vibode_edit_run_prompt(
 def _debug_log_vibode_edit_run(
     action: str,
     model_name: str,
+    requested_aspect_ratio: Optional[str],
     aspect_ratio_to_send: Optional[str],
     base_image_url_kind: str,
     target_placement_id: Optional[str],
@@ -3633,9 +3634,18 @@ def _debug_log_vibode_edit_run(
     prompt: str,
     sku_images_count: Optional[int] = None,
 ) -> None:
+    log_event(
+        "vibode_edit_run_ready",
+        route="/api/vibode/edit-run",
+        action=action,
+        requested_aspect_ratio=requested_aspect_ratio if requested_aspect_ratio else "(none)",
+        aspect_ratio_to_send=aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
+        model_name=model_name,
+    )
     print("[/api/vibode/edit-run] request")
     print(f"  action={action}")
     print(f"  model={model_name}")
+    print(f"  requested_aspect_ratio={requested_aspect_ratio if requested_aspect_ratio else '(none)'}")
     print(f"  aspect_ratio={aspect_ratio_to_send if aspect_ratio_to_send else '(omitted)'}")
     print(f"  baseImageUrl kind={base_image_url_kind}")
     print(f"  placements={placements_count}")
@@ -4515,9 +4525,23 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
 
     model_name = resolve_model_name_for_route("/api/vibode/edit-run", req.modelVersion)
     try:
-        log_continuation_aspect_ratio_omitted("/api/vibode/edit-run", action=action)
         room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
-        aspect_ratio_to_send = None
+        source_w, source_h = _safe_open_image(room_raw_bytes).size
+        requested_ratio = (req.aspectRatio or "").strip().lower().replace("x", ":")
+        if requested_ratio and requested_ratio != "auto" and requested_ratio in RATIO_MAP:
+            aspect_ratio_to_send = requested_ratio
+        else:
+            aspect_ratio_to_send = choose_closest_aspect_ratio(source_w, source_h)
+        log_event(
+            "aspect_ratio_policy",
+            route="/api/vibode/edit-run",
+            continuation=True,
+            requested_aspect_ratio=req.aspectRatio,
+            source_canvas_width=source_w,
+            source_canvas_height=source_h,
+            mapped_aspect_ratio=aspect_ratio_to_send,
+            aspect_ratio_applied=False,
+        )
     except Exception as e:
         print("[/api/vibode/edit-run] Error preparing room image:", e)
         return _vibode_edit_run_error(400, "Could not process base image.")
@@ -4759,6 +4783,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
     _debug_log_vibode_edit_run(
         action=action,
         model_name=model_name,
+        requested_aspect_ratio=req.aspectRatio,
         aspect_ratio_to_send=aspect_ratio_to_send,
         base_image_url_kind=base_image_url_kind,
         target_placement_id=target_placement_id,
