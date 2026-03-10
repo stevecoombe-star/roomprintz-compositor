@@ -2869,7 +2869,7 @@ def build_stage3_furniture_prompt_v2(
         "- Use ONLY provided SKU assets; no substitutes.",
         "- No blending/averaging/hybrids between SKUs.",
         "- Primary furniture only (sofa/bed/table/storage/seating).",
-        "- Do not rearrange existing furniture unless necessary to place the selected SKUs.",
+        "- Do not rearrange existing furniture unless absolutely necessary to place the selected SKUs.",
         "- If a SKU cannot be placed plausibly (scale/clearance), omit it rather than inventing anything else.",
         "- Preserve camera angle, perspective, vanishing lines, and room geometry.",
         "- Preserve architecture and surfaces; Stage 2 handled surfaces.",
@@ -2883,6 +2883,12 @@ def build_stage3_furniture_prompt_v2(
         "- Place anchor pieces first (for example sofa, bed, dining table).",
         "- Keep clear walk paths and practical circulation.",
         "- Avoid blocking doors, door swings, and major passage openings.",
+        "",
+        "Layout stability:",
+        "- If furniture already appears to be placed in a plausible layout, preserve its position.",
+        "- Avoid shifting existing items unless absolutely necessary to place a new SKU.",
+        "- Do not slightly move, rotate, or resize furniture that already fits naturally in the scene.",
+        "- Treat the current layout as intentional staging, not a layout to be redesigned.",
         "",
     ]
 
