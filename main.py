@@ -15,7 +15,7 @@ from typing import Any, Literal, Optional, Tuple, Dict, List
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter
 import requests
 try:
     from PIL import ImageDraw
@@ -96,6 +96,8 @@ _SUPABASE_STORAGE_BUCKET_CACHE: Optional[str] = None
 
 USER_SKU_BG_REMOVAL_PROMPT = (
     "Isolate the product and replace the entire background with a flat, uniform, solid light grey color (#F2F2F2).\n"
+    "Treat screenshot/clipboard/card captures as source only and isolate only the real product object.\n"
+    "Remove and ignore any border, frame, card, clipboard shape, source UI, or screenshot container shadow.\n"
     "The background must be a single solid color.\n"
     "No gradients.\n"
     "No shadows.\n"
@@ -107,6 +109,20 @@ USER_SKU_BG_REMOVAL_PROMPT = (
     "Keep clean edges.\n"
     "Include a small margin around the product."
 )
+USER_SKU_CLIPBOARD_ISOLATION_PROMPT = (
+    "Extract only the real furniture/product object from this image.\n"
+    "The source may be a screenshot, card, clipboard, or UI capture.\n"
+    "Do not keep or recreate any outer rectangle, border, frame, card, clipboard, UI, source shadow, or filler background.\n"
+    "Return only the product and preserve its true silhouette.\n"
+    "Prefer transparent background; if not possible, use flat #F2F2F2 background."
+)
+USER_SKU_FOREGROUND_COLOR_DISTANCE_THRESHOLD = 24
+USER_SKU_MIN_FOREGROUND_AREA_RATIO = 0.008
+USER_SKU_MAX_FOREGROUND_AREA_RATIO = 0.96
+USER_SKU_RECT_FRAME_BBOX_COVER_RATIO = 0.88
+USER_SKU_RECT_FRAME_FILL_RATIO = 0.84
+USER_SKU_BORDER_HEAVY_EDGE_RATIO = 0.20
+USER_SKU_UNIFORM_BG_DOMINANCE_RATIO = 0.48
 
 
 def resolve_model_name(model_version: Optional[str]) -> str:
@@ -1160,6 +1176,198 @@ def _assert_has_transparency(png_bytes: bytes) -> None:
         )
 
 
+def _estimate_corner_background_rgb(img_rgb: Image.Image) -> Tuple[int, int, int]:
+    width, height = img_rgb.size
+    patch = max(2, int(round(min(width, height) * 0.04)))
+    corners = [
+        (0, 0, patch, patch),
+        (max(0, width - patch), 0, width, patch),
+        (0, max(0, height - patch), patch, height),
+        (max(0, width - patch), max(0, height - patch), width, height),
+    ]
+    samples: List[Tuple[int, int, int]] = []
+    for box in corners:
+        samples.extend(list(img_rgb.crop(box).getdata()))
+    if not samples:
+        return (242, 242, 242)
+    total = len(samples)
+    return (
+        int(round(sum(px[0] for px in samples) / total)),
+        int(round(sum(px[1] for px in samples) / total)),
+        int(round(sum(px[2] for px in samples) / total)),
+    )
+
+
+def _count_mask_pixels(mask: Image.Image) -> int:
+    return sum(1 for px in mask.getdata() if px >= 128)
+
+
+def _build_user_sku_foreground_mask(img_rgba: Image.Image) -> Image.Image:
+    rgba = img_rgba.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    alpha_lo, _ = alpha.getextrema()
+    if alpha_lo < 255:
+        base_mask = alpha.point(lambda a: 255 if a >= 12 else 0, mode="L")
+    else:
+        rgb = rgba.convert("RGB")
+        bg_r, bg_g, bg_b = _estimate_corner_background_rgb(rgb)
+        bg = Image.new("RGB", rgb.size, (bg_r, bg_g, bg_b))
+        diff = ImageChops.difference(rgb, bg).convert("L")
+        base_mask = diff.point(
+            lambda v: 255 if v >= USER_SKU_FOREGROUND_COLOR_DISTANCE_THRESHOLD else 0,
+            mode="L",
+        )
+
+    # Keep shape tight while removing tiny noise + holes.
+    base_mask = base_mask.filter(ImageFilter.MaxFilter(size=3))
+    base_mask = base_mask.filter(ImageFilter.MinFilter(size=3))
+    return base_mask
+
+
+def _compute_user_sku_mask_stats(mask: Image.Image) -> Dict[str, Any]:
+    binary_mask = mask.convert("L").point(lambda v: 255 if v >= 128 else 0, mode="L")
+    width, height = binary_mask.size
+    total_pixels = max(1, width * height)
+    fg_pixels = _count_mask_pixels(binary_mask)
+    bbox = binary_mask.getbbox()
+    if not bbox or fg_pixels <= 0:
+        return {
+            "has_foreground": False,
+            "fg_pixels": 0,
+            "area_ratio": 0.0,
+            "bbox_cover_w": 0.0,
+            "bbox_cover_h": 0.0,
+            "fill_ratio": 0.0,
+            "edge_touch_ratio": 0.0,
+            "edge_touch_sides": 0,
+        }
+
+    bbox_w = max(1, bbox[2] - bbox[0])
+    bbox_h = max(1, bbox[3] - bbox[1])
+    bbox_pixels = max(1, bbox_w * bbox_h)
+    edge_band = max(1, int(round(min(width, height) * 0.02)))
+
+    top = binary_mask.crop((0, 0, width, edge_band))
+    bottom = binary_mask.crop((0, max(0, height - edge_band), width, height))
+    left = binary_mask.crop((0, 0, edge_band, height))
+    right = binary_mask.crop((max(0, width - edge_band), 0, width, height))
+    edge_pixels = _count_mask_pixels(top) + _count_mask_pixels(bottom) + _count_mask_pixels(left) + _count_mask_pixels(right)
+    touched_sides = sum(1 for region in (top, bottom, left, right) if region.getbbox() is not None)
+
+    return {
+        "has_foreground": True,
+        "fg_pixels": fg_pixels,
+        "area_ratio": fg_pixels / float(total_pixels),
+        "bbox_cover_w": bbox_w / float(max(1, width)),
+        "bbox_cover_h": bbox_h / float(max(1, height)),
+        "fill_ratio": fg_pixels / float(bbox_pixels),
+        "edge_touch_ratio": min(1.0, edge_pixels / float(max(1, fg_pixels))),
+        "edge_touch_sides": touched_sides,
+    }
+
+
+def _dominant_quantized_color_ratio(img_rgb: Image.Image) -> float:
+    width, height = img_rgb.size
+    long_edge = max(width, height)
+    sample = img_rgb
+    if long_edge > 512:
+        scale = 512.0 / float(long_edge)
+        sample = img_rgb.resize(
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            resample=Image.BILINEAR,
+        )
+
+    counts: Dict[Tuple[int, int, int], int] = {}
+    total = 0
+    for r, g, b in sample.getdata():
+        key = (r // 32, g // 32, b // 32)
+        counts[key] = counts.get(key, 0) + 1
+        total += 1
+    if total <= 0 or not counts:
+        return 0.0
+    return max(counts.values()) / float(total)
+
+
+def _analyze_user_sku_candidate(
+    original_png_bytes: bytes,
+    candidate_png_bytes: bytes,
+) -> Dict[str, Any]:
+    with Image.open(io.BytesIO(original_png_bytes)) as src_img:
+        src_rgb = src_img.convert("RGB")
+    with Image.open(io.BytesIO(candidate_png_bytes)) as candidate_img:
+        candidate_rgba = candidate_img.convert("RGBA")
+
+    mask = _build_user_sku_foreground_mask(candidate_rgba)
+    mask_stats = _compute_user_sku_mask_stats(mask)
+    uniform_bg_dominance_ratio = _dominant_quantized_color_ratio(src_rgb)
+
+    rectangular_outer_frame_likelihood = (
+        mask_stats["has_foreground"]
+        and mask_stats["bbox_cover_w"] >= USER_SKU_RECT_FRAME_BBOX_COVER_RATIO
+        and mask_stats["bbox_cover_h"] >= USER_SKU_RECT_FRAME_BBOX_COVER_RATIO
+        and mask_stats["fill_ratio"] >= USER_SKU_RECT_FRAME_FILL_RATIO
+        and mask_stats["edge_touch_sides"] >= 3
+    )
+    edge_touch_border_heavy_content = (
+        mask_stats["edge_touch_ratio"] >= USER_SKU_BORDER_HEAVY_EDGE_RATIO
+        or mask_stats["edge_touch_sides"] >= 3
+    )
+    large_uniform_background_dominance = (
+        uniform_bg_dominance_ratio >= USER_SKU_UNIFORM_BG_DOMINANCE_RATIO
+    )
+    likely_screenshot_card_composition = rectangular_outer_frame_likelihood and (
+        edge_touch_border_heavy_content or large_uniform_background_dominance
+    )
+    low_confidence_segmentation_fallback = (
+        not mask_stats["has_foreground"]
+        or mask_stats["area_ratio"] < USER_SKU_MIN_FOREGROUND_AREA_RATIO
+        or mask_stats["area_ratio"] > USER_SKU_MAX_FOREGROUND_AREA_RATIO
+        or likely_screenshot_card_composition
+    )
+
+    return {
+        "rectangular_outer_frame_likelihood": rectangular_outer_frame_likelihood,
+        "edge_touch_border_heavy_content": edge_touch_border_heavy_content,
+        "edge_touch_ratio": mask_stats["edge_touch_ratio"],
+        "edge_touch_sides": mask_stats["edge_touch_sides"],
+        "large_uniform_background_dominance": large_uniform_background_dominance,
+        "uniform_bg_dominance_ratio": uniform_bg_dominance_ratio,
+        "likely_screenshot_card_composition": likely_screenshot_card_composition,
+        "low_confidence_segmentation_fallback": low_confidence_segmentation_fallback,
+        "foreground_area_ratio": mask_stats["area_ratio"],
+        "bbox_cover_w": mask_stats["bbox_cover_w"],
+        "bbox_cover_h": mask_stats["bbox_cover_h"],
+        "fill_ratio": mask_stats["fill_ratio"],
+    }
+
+
+def _extract_user_sku_product_crops(candidate_png_bytes: bytes) -> Tuple[bytes, bytes, Dict[str, Any]]:
+    with Image.open(io.BytesIO(candidate_png_bytes)) as img:
+        rgba = img.convert("RGBA")
+
+    mask = _build_user_sku_foreground_mask(rgba)
+    stats = _compute_user_sku_mask_stats(mask)
+    if not stats["has_foreground"]:
+        raise RuntimeError("No product foreground detected after isolation.")
+
+    bbox = mask.getbbox()
+    if not bbox:
+        raise RuntimeError("Unable to compute product crop bounds.")
+
+    original_alpha = rgba.getchannel("A")
+    alpha_lo, _ = original_alpha.getextrema()
+    if alpha_lo < 255:
+        combined_alpha = ImageChops.multiply(original_alpha, mask)
+    else:
+        combined_alpha = mask
+
+    cutout_rgba = rgba.copy()
+    cutout_rgba.putalpha(combined_alpha)
+    tight_cutout_rgba = cutout_rgba.crop(bbox)
+    tight_rgb = rgba.convert("RGB").crop(bbox)
+    return image_to_png_bytes(tight_cutout_rgba), image_to_png_bytes(tight_rgb), stats
+
+
 def _resolve_supabase_storage_bucket(base_url: str, service_key: str) -> str:
     global _SUPABASE_STORAGE_BUCKET_CACHE
 
@@ -1337,6 +1545,15 @@ def _run_user_sku_background_removal(image_png_bytes: bytes, model_name: str) ->
     return call_gemini_with_prompt(
         image_png_bytes=image_png_bytes,
         prompt=USER_SKU_BG_REMOVAL_PROMPT,
+        model_name=model_name,
+        aspect_ratio=None,
+    )
+
+
+def _run_user_sku_clipboard_product_isolation(image_png_bytes: bytes, model_name: str) -> bytes:
+    return call_gemini_with_prompt(
+        image_png_bytes=image_png_bytes,
+        prompt=USER_SKU_CLIPBOARD_ISOLATION_PROMPT,
         model_name=model_name,
         aspect_ratio=None,
     )
@@ -3548,6 +3765,8 @@ def build_vibode_edit_run_prompt(
         lines.extend(
             [
                 "Task: Add exactly one object using the provided SKU asset image.",
+                "Use only the isolated product from the SKU asset.",
+                "Ignore and never reproduce any source border, frame, card, clipboard, or UI container artifact as an in-room object.",
                 (
                     f"Place SKU '{sku_label}' roughly in the intended target area."
                     if sku_label
@@ -3581,6 +3800,8 @@ def build_vibode_edit_run_prompt(
         lines.extend(
             [
                 "Task: Replace the target object in the intended target area using the provided SKU asset image.",
+                "Use only the isolated product from the SKU asset.",
+                "Ignore and never reproduce any source border, frame, card, clipboard, or UI container artifact as an in-room object.",
                 (
                     f"Use SKU '{sku_label}' for the replacement."
                     if sku_label
@@ -4875,6 +5096,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
 @app.post("/api/vibode/user-skus/ingest", response_model=VibodeUserSkuIngestResponse)
 async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
     user_sku_id = "user_" + uuid4().hex
+    model_name = DEFAULT_MODEL_NAME
     source_url = request.imageUrl.strip() if request.imageUrl and request.imageUrl.strip() else None
     resolved_label = (request.label or "").strip() or "User Upload"
 
@@ -4954,7 +5176,7 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
     try:
         bg_removed_bytes = _run_user_sku_background_removal(
             image_png_bytes=original_png_bytes,
-            model_name=DEFAULT_MODEL_NAME,
+            model_name=model_name,
         )
         if not bg_removed_bytes:
             raise RuntimeError("Background removal returned empty bytes.")
@@ -4980,23 +5202,100 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
         {"skuId": user_sku_id, "bytes": len(bg_removed_bytes)},
     )
 
-    normalization_mode = "transparent"
+    candidate_product_bytes = bg_removed_bytes
+    gate_metrics = _analyze_user_sku_candidate(original_png_bytes, candidate_product_bytes)
+    print(
+        "[/api/vibode/user-skus/ingest] quality gates initial",
+        {
+            "skuId": user_sku_id,
+            "rectangularOuterFrameLikelihood": gate_metrics["rectangular_outer_frame_likelihood"],
+            "edgeTouchBorderHeavyContent": gate_metrics["edge_touch_border_heavy_content"],
+            "largeUniformBackgroundDominance": gate_metrics["large_uniform_background_dominance"],
+            "likelyScreenshotCardComposition": gate_metrics["likely_screenshot_card_composition"],
+            "lowConfidenceSegmentationFallback": gate_metrics["low_confidence_segmentation_fallback"],
+        },
+    )
+
+    if gate_metrics["likely_screenshot_card_composition"]:
+        print(
+            "[/api/vibode/user-skus/ingest] clipboard refinement start",
+            {"skuId": user_sku_id},
+        )
+        try:
+            candidate_product_bytes = _run_user_sku_clipboard_product_isolation(
+                image_png_bytes=original_png_bytes,
+                model_name=model_name,
+            )
+            gate_metrics = _analyze_user_sku_candidate(original_png_bytes, candidate_product_bytes)
+            print(
+                "[/api/vibode/user-skus/ingest] quality gates refined",
+                {
+                    "skuId": user_sku_id,
+                    "rectangularOuterFrameLikelihood": gate_metrics["rectangular_outer_frame_likelihood"],
+                    "edgeTouchBorderHeavyContent": gate_metrics["edge_touch_border_heavy_content"],
+                    "largeUniformBackgroundDominance": gate_metrics["large_uniform_background_dominance"],
+                    "likelyScreenshotCardComposition": gate_metrics["likely_screenshot_card_composition"],
+                    "lowConfidenceSegmentationFallback": gate_metrics["low_confidence_segmentation_fallback"],
+                },
+            )
+        except Exception as e:
+            print("[/api/vibode/user-skus/ingest] clipboard refinement failed:", e)
+            gate_metrics["low_confidence_segmentation_fallback"] = True
+
+    if gate_metrics["low_confidence_segmentation_fallback"]:
+        failed_reason = "low-confidence product isolation; screenshot/card artifacts likely"
+        failed_user_sku = VibodeUserSku(
+            skuId=user_sku_id,
+            label=resolved_label,
+            variants=[],
+            sourceUrl=source_url,
+            status="failed",
+            reason=failed_reason,
+        )
+        print(
+            "[/api/vibode/user-skus/ingest] final status",
+            {"skuId": user_sku_id, "status": "failed", "reason": failed_reason},
+        )
+        return VibodeUserSkuIngestResponse(userSku=failed_user_sku)
+
     try:
-        has_alpha = _has_transparency(bg_removed_bytes)
-        if has_alpha:
+        product_cutout_png_bytes, product_solid_crop_png_bytes, product_stats = _extract_user_sku_product_crops(
+            candidate_product_bytes
+        )
+    except Exception as e:
+        print("[/api/vibode/user-skus/ingest] product crop extraction failed:", e)
+        failed_reason = f"product isolation failed: {str(e)[:160]}"
+        failed_user_sku = VibodeUserSku(
+            skuId=user_sku_id,
+            label=resolved_label,
+            variants=[],
+            sourceUrl=source_url,
+            status="failed",
+            reason=failed_reason,
+        )
+        print(
+            "[/api/vibode/user-skus/ingest] final status",
+            {"skuId": user_sku_id, "status": "failed", "reason": failed_reason},
+        )
+        return VibodeUserSkuIngestResponse(userSku=failed_user_sku)
+
+    normalization_mode = "transparent_cutout"
+    try:
+        prefer_transparent = _has_transparency(product_cutout_png_bytes) and product_stats["fill_ratio"] < 0.98
+        if prefer_transparent:
             normalized_png_bytes, normalized_dims = _normalize_user_sku_transparent_png(
-                bg_removed_bytes,
+                product_cutout_png_bytes,
                 max_dimension=USER_SKU_NORMALIZED_MAX_DIM,
                 padding_ratio=USER_SKU_NORMALIZED_PADDING_RATIO,
             )
-            normalization_mode = "transparent"
+            normalization_mode = "transparent_cutout"
         else:
             normalized_png_bytes, normalized_dims = _normalize_user_sku_solid_bg_png(
-                bg_removed_bytes,
+                product_solid_crop_png_bytes,
                 max_dimension=USER_SKU_NORMALIZED_MAX_DIM,
                 padding_ratio=USER_SKU_NORMALIZED_PADDING_RATIO,
             )
-            normalization_mode = "solid_bg"
+            normalization_mode = "solid_tight_crop"
     except Exception as e:
         print("[/api/vibode/user-skus/ingest] normalization failed:", e)
         raise HTTPException(status_code=500, detail="Failed to normalize user SKU image.")
