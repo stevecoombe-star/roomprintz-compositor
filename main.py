@@ -4918,15 +4918,31 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
             target_bbox = placement_to_remove.bbox
             updated_placements.pop(target_idx)
     elif action == "swap":
-        target_placement_id = (target.placementId or "").strip()
+        target_placement_id = (target.placementId or "").strip() or None
+        target_sku_id = (target.skuId or "").strip()
+        swap_error_message = (
+            "swap requires target.placementId or target.skuId with finite params.x and params.y."
+        )
+
+        swap_x: Optional[float] = None
+        swap_y: Optional[float] = None
         if not target_placement_id:
-            return _vibode_edit_run_error(400, "target.placementId is required for swap.")
-        new_sku_id = str(params.get("newSkuId") or "").strip()
+            raw_x = params.get("x")
+            raw_y = params.get("y")
+            if not target_sku_id or raw_x is None or raw_y is None:
+                return _vibode_edit_run_error(400, swap_error_message)
+            try:
+                swap_x = float(raw_x)
+                swap_y = float(raw_y)
+            except Exception:
+                return _vibode_edit_run_error(400, swap_error_message)
+            if not (math.isfinite(swap_x) and math.isfinite(swap_y)):
+                return _vibode_edit_run_error(400, swap_error_message)
+
+        new_sku_id = (target_sku_id or str(params.get("newSkuId") or "").strip())
         if not new_sku_id:
-            return _vibode_edit_run_error(400, "params.newSkuId is required for swap.")
-        target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
-        if target_idx < 0:
-            return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+            return _vibode_edit_run_error(400, "target.skuId or params.newSkuId is required for swap.")
+        target_sku_id = new_sku_id
 
         sku = _find_eligible_sku(req.eligibleSkus, new_sku_id)
         if sku is None:
@@ -4941,15 +4957,72 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         except Exception:
             return _vibode_edit_run_error(400, f"Failed to fetch/prepare SKU image for skuId={new_sku_id}.")
 
-        placement_before = updated_placements[target_idx]
-        updated_placement = placement_before.model_copy(
-            update={
-                "skuId": new_sku_id,
-                "label": sku.label,
-                "source": sku.source if sku.source is not None else placement_before.source,
-            }
-        )
-        updated_placements[target_idx] = updated_placement
+        if target_placement_id:
+            target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
+            if target_idx < 0:
+                return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+            placement_before = updated_placements[target_idx]
+            updated_placement = placement_before.model_copy(
+                update={
+                    "skuId": new_sku_id,
+                    "label": sku.label,
+                    "source": sku.source if sku.source is not None else placement_before.source,
+                }
+            )
+            updated_placements[target_idx] = updated_placement
+        else:
+            box_size = 0.18
+            click_x = _clamp01(swap_x)
+            click_y = _clamp01(swap_y)
+            click_bbox = _normalized_bbox_for_storage(
+                ScenePlacementBbox(
+                    x=click_x - (box_size / 2.0),
+                    y=click_y - (box_size / 2.0),
+                    w=box_size,
+                    h=box_size,
+                )
+            )
+
+            hit_idx = -1
+            hit_area = float("inf")
+            for idx, placement in enumerate(updated_placements):
+                placement_bbox = placement.bbox
+                if not placement_bbox:
+                    continue
+                within_x = placement_bbox.x <= click_x <= (placement_bbox.x + placement_bbox.w)
+                within_y = placement_bbox.y <= click_y <= (placement_bbox.y + placement_bbox.h)
+                if not (within_x and within_y):
+                    continue
+                area = placement_bbox.w * placement_bbox.h
+                if area < hit_area:
+                    hit_area = area
+                    hit_idx = idx
+
+            if hit_idx >= 0:
+                placement_before = updated_placements[hit_idx]
+                updated_placement = placement_before.model_copy(
+                    update={
+                        "skuId": new_sku_id,
+                        "label": sku.label,
+                        "source": sku.source if sku.source is not None else placement_before.source,
+                    }
+                )
+                updated_placements[hit_idx] = updated_placement
+                target_placement_id = updated_placement.placementId
+            else:
+                updated_placement = ScenePlacement(
+                    placementId="pl_" + uuid4().hex,
+                    skuId=new_sku_id,
+                    label=sku.label,
+                    source=sku.source,
+                    bbox=click_bbox,
+                    rotationDeg=0.0,
+                    stageAdded=3,
+                    locked=False,
+                )
+                updated_placements.append(updated_placement)
+                target_placement_id = updated_placement.placementId
+
         target_bbox = updated_placement.bbox
         prompt = build_vibode_edit_run_prompt(
             action="swap",
