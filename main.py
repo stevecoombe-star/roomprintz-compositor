@@ -178,10 +178,29 @@ RATIO_MAP: Dict[str, float] = {
 SUPPORTED_RATIOS_ORDERED = ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
 
 _REQUEST_ID_CTX: ContextVar[str] = ContextVar("roomprintz_request_id", default="-")
+_REQUEST_ID_HEADER_MAX_LEN = 100
+_REQUEST_ID_ALLOWED_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-:"
+)
 
 
 def get_request_id() -> str:
     return _REQUEST_ID_CTX.get()
+
+
+def _sanitize_inbound_request_id(header_value: Optional[str]) -> Optional[str]:
+    if not header_value:
+        return None
+
+    candidate = header_value.strip()
+    if not candidate:
+        return None
+    if len(candidate) > _REQUEST_ID_HEADER_MAX_LEN:
+        return None
+    if any(ch not in _REQUEST_ID_ALLOWED_CHARS for ch in candidate):
+        return None
+
+    return candidate
 
 
 def _log_value(value: Any) -> str:
@@ -596,7 +615,7 @@ app = FastAPI()
 
 @app.middleware("http")
 async def add_request_id_middleware(request: Request, call_next):
-    request_id = uuid4().hex[:12]
+    request_id = _sanitize_inbound_request_id(request.headers.get("X-Request-Id")) or uuid4().hex[:12]
     token = _REQUEST_ID_CTX.set(request_id)
     try:
         response = await call_next(request)
@@ -1514,9 +1533,11 @@ def _supabase_storage_create_signed_url(
         elif parsed.path.startswith("/object/"):
             normalized_signed_url = parsed._replace(path=f"/storage/v1{parsed.path}").geturl()
         else:
-            print(
-                "[_supabase_storage_create_signed_url] Warning: unexpected absolute signedURL path prefix",
-                {"path": parsed.path},
+            log_event(
+                "supabase_signed_url_unexpected_path_prefix",
+                bucket=bucket,
+                path=normalized_path,
+                pathname=parsed.path,
             )
             normalized_signed_url = signed_url_value
     elif signed_url_value.startswith("/"):
@@ -1534,9 +1555,15 @@ def _supabase_storage_create_signed_url(
             normalized_signed_url = f"{base_url}/storage/v1/{signed_url_value}"
 
     if DEBUG_ROOMPRINTZ_PROMPT or DEBUG_ROOMPRINTZ_RATIO:
-        print(
-            "[_supabase_storage_create_signed_url] signedURL normalization",
-            {"original": signed_url_value, "normalized": normalized_signed_url},
+        parsed_normalized_signed_url = urlparse(normalized_signed_url)
+        log_event(
+            "supabase_signed_url_normalization",
+            bucket=bucket,
+            path=normalized_path,
+            normalization_occurred=(signed_url_value != normalized_signed_url),
+            host=parsed_normalized_signed_url.netloc,
+            pathname=parsed_normalized_signed_url.path,
+            had_query_string=bool(parsed_normalized_signed_url.query),
         )
     return normalized_signed_url
 
@@ -5168,10 +5195,37 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
 
 @app.post("/api/vibode/user-skus/ingest", response_model=VibodeUserSkuIngestResponse)
 async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
+    route = "/api/vibode/user-skus/ingest"
+    started_at = time.perf_counter()
     user_sku_id = "user_" + uuid4().hex
     model_name = DEFAULT_MODEL_NAME
     source_url = request.imageUrl.strip() if request.imageUrl and request.imageUrl.strip() else None
     resolved_label = (request.label or "").strip() or "User Upload"
+
+    def _duration_ms() -> int:
+        return int((time.perf_counter() - started_at) * 1000)
+
+    def _ingest_log(event: str, **fields: Any) -> None:
+        log_event(
+            event,
+            route=route,
+            sku_id=user_sku_id,
+            duration_ms=_duration_ms(),
+            **fields,
+        )
+
+    def _artifact_reason(metrics: Dict[str, Any]) -> str:
+        if metrics.get("likely_screenshot_card_composition"):
+            return "likely_screenshot_card_composition"
+        if metrics.get("low_confidence_segmentation_fallback"):
+            return "low_confidence_segmentation_fallback"
+        return "none"
+
+    _ingest_log(
+        "vibode_user_sku_ingest_started",
+        source="imageUrl" if source_url else "imageBase64",
+        status="started",
+    )
 
     if source_url:
         normalized_source_url = source_url.lower()
@@ -5179,21 +5233,23 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             normalized_source_url.startswith("http://")
             or normalized_source_url.startswith("https://")
         ):
+            _ingest_log(
+                "vibode_user_sku_ingest_failed",
+                status="failed",
+                error="Invalid imageUrl.",
+            )
             raise HTTPException(status_code=400, detail="Invalid imageUrl.")
         if (
             "localhost" in normalized_source_url
             or "127.0.0.1" in normalized_source_url
             or "0.0.0.0" in normalized_source_url
         ):
+            _ingest_log(
+                "vibode_user_sku_ingest_failed",
+                status="failed",
+                error="Invalid imageUrl.",
+            )
             raise HTTPException(status_code=400, detail="Invalid imageUrl.")
-
-    print(
-        "[/api/vibode/user-skus/ingest] image acquisition start",
-        {
-            "skuId": user_sku_id,
-            "source": "imageUrl" if source_url else "imageBase64",
-        },
-    )
 
     try:
         if source_url:
@@ -5205,24 +5261,56 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
         else:
             source_bytes, source_hint_mime = _decode_base64_image_with_mime(request.imageBase64 or "")
     except Exception as e:
-        print("[/api/vibode/user-skus/ingest] image acquisition failed:", e)
+        _ingest_log(
+            "vibode_user_sku_ingest_failed",
+            status="failed",
+            error=f"Failed to acquire image bytes: {str(e)[:160]}",
+        )
         raise HTTPException(status_code=400, detail="Failed to acquire image bytes.")
 
     source_mime = _infer_image_mime_type(source_bytes, fallback_mime=source_hint_mime)
-    print(
-        "[/api/vibode/user-skus/ingest] image acquisition complete",
-        {
-            "skuId": user_sku_id,
-            "bytes": len(source_bytes),
-            "mimeType": source_mime,
-        },
-    )
 
     try:
         original_png_bytes = _convert_image_bytes_to_png(source_bytes)
     except Exception as e:
-        print("[/api/vibode/user-skus/ingest] failed to decode input image:", e)
+        _ingest_log(
+            "vibode_user_sku_ingest_failed",
+            status="failed",
+            error=f"Invalid image payload: {str(e)[:160]}",
+        )
         raise HTTPException(status_code=400, detail="Invalid image payload.")
+
+    input_width: Optional[int] = None
+    input_height: Optional[int] = None
+    has_alpha = False
+    try:
+        with Image.open(io.BytesIO(original_png_bytes)) as input_img:
+            input_width, input_height = input_img.size
+            if "A" in input_img.getbands():
+                alpha_lo, _ = input_img.getchannel("A").getextrema()
+                has_alpha = alpha_lo < 255
+    except Exception as e:
+        _ingest_log(
+            "vibode_user_sku_ingest_image_dimensions_alpha",
+            input_width=None,
+            input_height=None,
+            has_alpha=False,
+            error=str(e)[:160],
+        )
+
+    _ingest_log(
+        "vibode_user_sku_ingest_source_image_loaded",
+        source="imageUrl" if source_url else "imageBase64",
+        input_bytes=len(source_bytes),
+        decoded_png_bytes=len(original_png_bytes),
+        mime_type=source_mime,
+    )
+    _ingest_log(
+        "vibode_user_sku_ingest_image_dimensions_alpha",
+        input_width=input_width,
+        input_height=input_height,
+        has_alpha=has_alpha,
+    )
 
     original_path = f"user-skus/{user_sku_id}/original.png"
     try:
@@ -5232,20 +5320,12 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             mime_type="image/png",
         )
     except Exception as e:
-        print("[/api/vibode/user-skus/ingest] original upload failed:", e)
+        _ingest_log(
+            "vibode_user_sku_ingest_failed",
+            status="failed",
+            error=f"Failed to upload original image: {str(e)[:160]}",
+        )
         raise HTTPException(status_code=500, detail="Failed to upload original image.")
-
-    print(
-        "[/api/vibode/user-skus/ingest] original upload complete",
-        {
-            "skuId": user_sku_id,
-            "path": original_path,
-            "bytes": len(original_png_bytes),
-            "mimeType": "image/png",
-        },
-    )
-
-    print("[/api/vibode/user-skus/ingest] background removal start", {"skuId": user_sku_id})
     try:
         bg_removed_bytes = _run_user_sku_background_removal(
             image_png_bytes=original_png_bytes,
@@ -5254,7 +5334,6 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
         if not bg_removed_bytes:
             raise RuntimeError("Background removal returned empty bytes.")
     except Exception as e:
-        print("[/api/vibode/user-skus/ingest] background removal failed:", e)
         failed_reason = f"background removal failed: {str(e)[:160]}"
         failed_user_sku = VibodeUserSku(
             skuId=user_sku_id,
@@ -5264,35 +5343,42 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             status="failed",
             reason=failed_reason,
         )
-        print(
-            "[/api/vibode/user-skus/ingest] final status",
-            {"skuId": user_sku_id, "status": "failed", "reason": failed_reason},
+        _ingest_log(
+            "vibode_user_sku_ingest_failed",
+            status="failed",
+            error=failed_reason,
         )
         return VibodeUserSkuIngestResponse(userSku=failed_user_sku)
 
-    print(
-        "[/api/vibode/user-skus/ingest] background removal complete",
-        {"skuId": user_sku_id, "bytes": len(bg_removed_bytes)},
-    )
-
     candidate_product_bytes = bg_removed_bytes
     gate_metrics = _analyze_user_sku_candidate(original_png_bytes, candidate_product_bytes)
-    print(
-        "[/api/vibode/user-skus/ingest] quality gates initial",
-        {
-            "skuId": user_sku_id,
-            "rectangularOuterFrameLikelihood": gate_metrics["rectangular_outer_frame_likelihood"],
-            "edgeTouchBorderHeavyContent": gate_metrics["edge_touch_border_heavy_content"],
-            "largeUniformBackgroundDominance": gate_metrics["large_uniform_background_dominance"],
-            "likelyScreenshotCardComposition": gate_metrics["likely_screenshot_card_composition"],
-            "lowConfidenceSegmentationFallback": gate_metrics["low_confidence_segmentation_fallback"],
-        },
+    _ingest_log(
+        "vibode_user_sku_ingest_background_estimation_completed",
+        dominant_bg_ratio=gate_metrics["uniform_bg_dominance_ratio"],
+    )
+    _ingest_log(
+        "vibode_user_sku_ingest_foreground_mask_analysis_completed",
+        foreground_area_ratio=gate_metrics["foreground_area_ratio"],
+        bbox_fill_ratio=gate_metrics["fill_ratio"],
+        edges_touched=gate_metrics["edge_touch_sides"],
+        rectangular_frame_likelihood=gate_metrics["rectangular_outer_frame_likelihood"],
+    )
+    _ingest_log(
+        "vibode_user_sku_ingest_artifact_suspicion_decision",
+        artifact_retry_triggered=gate_metrics["likely_screenshot_card_composition"],
+        artifact_reason=_artifact_reason(gate_metrics),
+        status=(
+            "retry"
+            if gate_metrics["likely_screenshot_card_composition"]
+            else ("failed" if gate_metrics["low_confidence_segmentation_fallback"] else "pass")
+        ),
     )
 
     if gate_metrics["likely_screenshot_card_composition"]:
-        print(
-            "[/api/vibode/user-skus/ingest] clipboard refinement start",
-            {"skuId": user_sku_id},
+        _ingest_log(
+            "vibode_user_sku_ingest_isolation_retry_started",
+            artifact_retry_triggered=True,
+            artifact_reason="likely_screenshot_card_composition",
         )
         try:
             candidate_product_bytes = _run_user_sku_clipboard_product_isolation(
@@ -5300,19 +5386,25 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
                 model_name=model_name,
             )
             gate_metrics = _analyze_user_sku_candidate(original_png_bytes, candidate_product_bytes)
-            print(
-                "[/api/vibode/user-skus/ingest] quality gates refined",
-                {
-                    "skuId": user_sku_id,
-                    "rectangularOuterFrameLikelihood": gate_metrics["rectangular_outer_frame_likelihood"],
-                    "edgeTouchBorderHeavyContent": gate_metrics["edge_touch_border_heavy_content"],
-                    "largeUniformBackgroundDominance": gate_metrics["large_uniform_background_dominance"],
-                    "likelyScreenshotCardComposition": gate_metrics["likely_screenshot_card_composition"],
-                    "lowConfidenceSegmentationFallback": gate_metrics["low_confidence_segmentation_fallback"],
-                },
+            _ingest_log(
+                "vibode_user_sku_ingest_isolation_retry_completed",
+                artifact_retry_triggered=True,
+                artifact_reason=_artifact_reason(gate_metrics),
+                status="completed",
+                dominant_bg_ratio=gate_metrics["uniform_bg_dominance_ratio"],
+                foreground_area_ratio=gate_metrics["foreground_area_ratio"],
+                bbox_fill_ratio=gate_metrics["fill_ratio"],
+                edges_touched=gate_metrics["edge_touch_sides"],
+                rectangular_frame_likelihood=gate_metrics["rectangular_outer_frame_likelihood"],
             )
         except Exception as e:
-            print("[/api/vibode/user-skus/ingest] clipboard refinement failed:", e)
+            _ingest_log(
+                "vibode_user_sku_ingest_isolation_retry_completed",
+                artifact_retry_triggered=True,
+                artifact_reason="clipboard_isolation_error",
+                status="failed",
+                error=str(e)[:160],
+            )
             gate_metrics["low_confidence_segmentation_fallback"] = True
 
     if gate_metrics["low_confidence_segmentation_fallback"]:
@@ -5325,9 +5417,11 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             status="failed",
             reason=failed_reason,
         )
-        print(
-            "[/api/vibode/user-skus/ingest] final status",
-            {"skuId": user_sku_id, "status": "failed", "reason": failed_reason},
+        _ingest_log(
+            "vibode_user_sku_ingest_failed",
+            status="failed",
+            artifact_reason=_artifact_reason(gate_metrics),
+            error=failed_reason,
         )
         return VibodeUserSkuIngestResponse(userSku=failed_user_sku)
 
@@ -5336,7 +5430,6 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             candidate_product_bytes
         )
     except Exception as e:
-        print("[/api/vibode/user-skus/ingest] product crop extraction failed:", e)
         failed_reason = f"product isolation failed: {str(e)[:160]}"
         failed_user_sku = VibodeUserSku(
             skuId=user_sku_id,
@@ -5346,9 +5439,10 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             status="failed",
             reason=failed_reason,
         )
-        print(
-            "[/api/vibode/user-skus/ingest] final status",
-            {"skuId": user_sku_id, "status": "failed", "reason": failed_reason},
+        _ingest_log(
+            "vibode_user_sku_ingest_failed",
+            status="failed",
+            error=failed_reason,
         )
         return VibodeUserSkuIngestResponse(userSku=failed_user_sku)
 
@@ -5370,22 +5464,12 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             )
             normalization_mode = "solid_tight_crop"
     except Exception as e:
-        print("[/api/vibode/user-skus/ingest] normalization failed:", e)
+        _ingest_log(
+            "vibode_user_sku_ingest_failed",
+            status="failed",
+            error=f"Failed to normalize user SKU image: {str(e)[:160]}",
+        )
         raise HTTPException(status_code=500, detail="Failed to normalize user SKU image.")
-
-    print(
-        "[/api/vibode/user-skus/ingest] normalized dimensions",
-        {
-            "skuId": user_sku_id,
-            "width": normalized_dims[0],
-            "height": normalized_dims[1],
-            "bytes": len(normalized_png_bytes),
-        },
-    )
-    print(
-        "[/api/vibode/user-skus/ingest] normalization mode",
-        {"skuId": user_sku_id, "normalizationMode": normalization_mode},
-    )
 
     normalized_path = f"user-skus/{user_sku_id}/normalized.png"
     try:
@@ -5396,16 +5480,30 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
         )
         normalized_url = _supabase_storage_create_signed_url(normalized_path)
     except Exception as e:
-        print("[/api/vibode/user-skus/ingest] normalized upload/sign failed:", e)
+        _ingest_log(
+            "vibode_user_sku_ingest_failed",
+            status="failed",
+            error=f"Failed to upload normalized user SKU image: {str(e)[:160]}",
+        )
         raise HTTPException(status_code=500, detail="Failed to upload normalized user SKU image.")
 
-    print(
-        "[/api/vibode/user-skus/ingest] final status",
-        {
-            "skuId": user_sku_id,
-            "status": "ready",
-            "normalizedPath": normalized_path,
-        },
+    _ingest_log(
+        "vibode_user_sku_ingest_normalization_output_completed",
+        input_width=input_width,
+        input_height=input_height,
+        has_alpha=has_alpha,
+        output_width=normalized_dims[0],
+        output_height=normalized_dims[1],
+        output_variant_count=1,
+        status="completed",
+    )
+    _ingest_log(
+        "vibode_user_sku_ingest_final_output_ready",
+        input_width=input_width,
+        input_height=input_height,
+        has_alpha=has_alpha,
+        output_variant_count=1,
+        status="ready",
     )
 
     return VibodeUserSkuIngestResponse(
