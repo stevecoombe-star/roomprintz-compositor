@@ -14,7 +14,7 @@ from typing import Any, Literal, Optional, Tuple, Dict, List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from PIL import Image, ImageChops, ImageFilter
 import requests
 try:
@@ -790,9 +790,15 @@ class VibodeEditRunTarget(BaseModel):
 class VibodeEditRunRequest(BaseModel):
     baseImageUrl: Optional[str] = None
     action: Literal["add", "remove", "swap", "rotate", "move"]
-    placements: List[ScenePlacement]
+    placements: List[ScenePlacement] = Field(default_factory=list)
     target: Optional[VibodeEditRunTarget] = None
     params: Optional[Dict[str, Any]] = None
+    placementId: Optional[str] = None
+    xNorm: Optional[float] = None
+    yNorm: Optional[float] = None
+    x: Optional[float] = None
+    y: Optional[float] = None
+    rotationDegrees: Optional[float] = None
     eligibleSkus: Optional[List[EligibleSku]] = None
     sceneId: Optional[str] = None
     modelVersion: Optional[str] = None
@@ -3810,6 +3816,13 @@ def _target_area_prompt_snippet(bbox: Optional[ScenePlacementBbox]) -> str:
     return f"The target edit should occur roughly near normalized location ({center_x:.4f}, {center_y:.4f})."
 
 
+def _target_area_point_prompt_snippet(x_norm: float, y_norm: float) -> str:
+    return (
+        "The target edit should occur at normalized location "
+        f"({x_norm:.4f}, {y_norm:.4f})."
+    )
+
+
 def _target_area_list_prompt_snippet(targets: List[ScenePlacementBbox]) -> str:
     if not targets:
         return "The target edits should occur roughly in the intended target areas."
@@ -3829,8 +3842,20 @@ def build_vibode_edit_run_prompt(
     params = params or {}
     bbox = target_placement.bbox if target_placement else None
     remove_target_bboxes = remove_target_bboxes or []
+    rotate_x_norm = _coerce_finite_float(params.get("xNorm")) if action == "rotate" else None
+    rotate_y_norm = _coerce_finite_float(params.get("yNorm")) if action == "rotate" else None
     if action == "remove" and remove_target_bboxes:
         target_guidance = _target_area_list_prompt_snippet(remove_target_bboxes)
+    elif (
+        action == "rotate"
+        and bbox is None
+        and rotate_x_norm is not None
+        and rotate_y_norm is not None
+    ):
+        target_guidance = _target_area_point_prompt_snippet(
+            _clamp01(rotate_x_norm),
+            _clamp01(rotate_y_norm),
+        )
     else:
         target_guidance = _target_area_prompt_snippet(bbox)
     lines = [
@@ -3901,18 +3926,44 @@ def build_vibode_edit_run_prompt(
         )
     elif action == "rotate":
         rotation_deg = params.get("rotationDeg")
-        lines.extend(
-            [
-                "Task: Rotate the target object in place in the intended target area.",
-                (
-                    f"Apply a {rotation_deg} degree rotation."
-                    if rotation_deg is not None
-                    else "Rotate to the requested orientation."
-                ),
-                "Preserve believable real-world scale and perspective.",
-                "Do not move any other object.",
-            ]
-        )
+        if rotation_deg is None:
+            rotation_deg = params.get("rotationDegrees")
+        has_coordinate_target = rotate_x_norm is not None and rotate_y_norm is not None
+        has_coordinate_only_target = has_coordinate_target and bbox is None
+        if has_coordinate_only_target:
+            lines.extend(
+                [
+                    "Task: Rotate only the single visible subject nearest the normalized target coordinate.",
+                    f"Treat ({_clamp01(rotate_x_norm):.4f}, {_clamp01(rotate_y_norm):.4f}) as the center of the intended edit.",
+                    "Keep the edit tightly localized around that point.",
+                    (
+                        f"Apply a {rotation_deg} degree rotation."
+                        if rotation_deg is not None
+                        else "Rotate to the requested orientation."
+                    ),
+                    "Do not rotate the full scene, walls, floor, or any unrelated nearby object.",
+                    "Do not move the subject to a different location.",
+                    "Do not change the subject scale.",
+                    "Preserve contact with the floor or supporting surface if visible.",
+                    "Preserve real-world perspective, shadows, lighting, and surrounding scene realism.",
+                    "Keep all non-target content unchanged except minimal local adjustments needed for a believable rotation.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "Task: Rotate the target object in place in the intended target area.",
+                    (
+                        f"Apply a {rotation_deg} degree rotation."
+                        if rotation_deg is not None
+                        else "Rotate to the requested orientation."
+                    ),
+                    "Keep the edit anchored on the resolved target object.",
+                    "Preserve believable real-world scale and perspective.",
+                    "Preserve surrounding scene realism and non-target objects.",
+                    "Do not move any other object.",
+                ]
+            )
     else:
         dx = params.get("dx")
         dy = params.get("dy")
@@ -5177,30 +5228,100 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
             sku_label=sku.label,
         )
     elif action == "rotate":
-        target_placement_id = (target.placementId or "").strip()
-        if not target_placement_id:
-            return _vibode_edit_run_error(400, "target.placementId is required for rotate.")
-        raw_rotation = params.get("rotationDeg")
+        rotate_target_placement_id = (target.placementId or "").strip()
+        if not rotate_target_placement_id:
+            rotate_target_placement_id = (req.placementId or "").strip()
+
+        rotate_x_norm, rotate_y_norm, rotate_coord_source = _resolve_normalized_point(
+            [
+                ("xNorm/yNorm", req.xNorm, req.yNorm),
+                ("x/y", req.x, req.y),
+                ("target.xNorm/yNorm", target.xNorm, target.yNorm),
+                ("target.x/y", target.x, target.y),
+                ("params.xNorm/yNorm", params.get("xNorm"), params.get("yNorm")),
+                ("params.x/y", params.get("x"), params.get("y")),
+            ]
+        )
+
+        raw_rotation = req.rotationDegrees
         if raw_rotation is None:
-            return _vibode_edit_run_error(400, "params.rotationDeg is required for rotate.")
+            raw_rotation = params.get("rotationDegrees")
+        if raw_rotation is None:
+            raw_rotation = params.get("rotationDeg")
+        if raw_rotation is None:
+            return _vibode_edit_run_error(
+                400,
+                "rotate requires rotationDegrees (or params.rotationDegrees / params.rotationDeg).",
+            )
         try:
-            rotation_deg = float(raw_rotation)
+            rotation_delta_deg = float(raw_rotation)
         except Exception:
-            return _vibode_edit_run_error(400, "params.rotationDeg must be a number.")
-        if not math.isfinite(rotation_deg):
-            return _vibode_edit_run_error(400, "params.rotationDeg must be a finite number.")
+            return _vibode_edit_run_error(400, "rotationDegrees must be a number.")
+        if not math.isfinite(rotation_delta_deg):
+            return _vibode_edit_run_error(400, "rotationDegrees must be a finite number.")
 
-        target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
-        if target_idx < 0:
-            return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+        target_idx = -1
+        if rotate_x_norm is not None and rotate_y_norm is not None:
+            rotate_hit_test_candidates: List[Dict[str, Any]] = []
+            for idx, placement in enumerate(updated_placements):
+                placement_bbox = placement.bbox
+                candidate_summary: Dict[str, Any] = {
+                    "idx": idx,
+                    "placementId": placement.placementId,
+                }
+                if placement_bbox:
+                    min_x = placement_bbox.x
+                    min_y = placement_bbox.y
+                    max_x = placement_bbox.x + placement_bbox.w
+                    max_y = placement_bbox.y + placement_bbox.h
+                    candidate_summary["bbox"] = {
+                        "x": round(placement_bbox.x, 4),
+                        "y": round(placement_bbox.y, 4),
+                        "w": round(placement_bbox.w, 4),
+                        "h": round(placement_bbox.h, 4),
+                    }
+                    candidate_summary["containsPoint"] = (
+                        min_x <= rotate_x_norm <= max_x and min_y <= rotate_y_norm <= max_y
+                    )
+                else:
+                    candidate_summary["bbox"] = None
+                    candidate_summary["containsPoint"] = False
+                rotate_hit_test_candidates.append(candidate_summary)
+            target_idx = _find_scene_placement_index_for_point(updated_placements, rotate_x_norm, rotate_y_norm)
+            if target_idx >= 0:
+                rotate_target_placement_id = updated_placements[target_idx].placementId
 
-        updated_placement = updated_placements[target_idx].model_copy(update={"rotationDeg": rotation_deg})
-        updated_placements[target_idx] = updated_placement
-        target_bbox = updated_placement.bbox
+        if target_idx < 0 and rotate_target_placement_id:
+            target_idx = _find_scene_placement_index(updated_placements, rotate_target_placement_id)
+        if target_idx >= 0:
+            target_placement = updated_placements[target_idx]
+            target_placement_id = target_placement.placementId
+            base_rotation_deg = _coerce_finite_float(target_placement.rotationDeg)
+            rotation_deg = _clamp_rotation_degrees((base_rotation_deg or 0.0) + rotation_delta_deg)
+
+            updated_placement = target_placement.model_copy(update={"rotationDeg": rotation_deg})
+            updated_placements[target_idx] = updated_placement
+            target_bbox = updated_placement.bbox
+            prompt_target_placement = updated_placement
+        else:
+            if rotate_x_norm is None or rotate_y_norm is None:
+                return _vibode_edit_run_error(
+                    400,
+                    "rotate requires finite xNorm/yNorm coordinates when no placement match is found.",
+                )
+            target_placement_id = None
+            target_bbox = None
+            prompt_target_placement = None
+
         prompt = build_vibode_edit_run_prompt(
             action="rotate",
-            target_placement=updated_placement,
-            params={"rotationDeg": rotation_deg},
+            target_placement=prompt_target_placement,
+            params={
+                "rotationDeg": rotation_delta_deg,
+                "rotationDegrees": rotation_delta_deg,
+                "xNorm": rotate_x_norm,
+                "yNorm": rotate_y_norm,
+            },
         )
     else:
         target_placement_id = (target.placementId or "").strip()
