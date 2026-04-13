@@ -789,7 +789,7 @@ class VibodeEditRunTarget(BaseModel):
 
 class VibodeEditRunRequest(BaseModel):
     baseImageUrl: Optional[str] = None
-    action: Literal["add", "remove", "swap", "rotate", "move"]
+    action: Literal["add", "remove", "swap", "rotate"]
     placements: List[ScenePlacement] = Field(default_factory=list)
     target: Optional[VibodeEditRunTarget] = None
     params: Optional[Dict[str, Any]] = None
@@ -866,22 +866,6 @@ class VibodeRotateRequest(BaseModel):
     baseImageUrl: Optional[str] = None
     cleanBase64: Optional[str] = None
     marks: Optional[List[VibodeRotateMark]] = None
-    modelVersion: Optional[str] = None
-    aspectRatio: Optional[AspectRatio] = "auto"
-
-
-class VibodeMoveMark(BaseModel):
-    id: str
-    xNorm: float
-    yNorm: float
-    dxNorm: float
-    dyNorm: float
-
-
-class VibodeMoveRequest(BaseModel):
-    imageUrl: Optional[str] = None
-    imageBase64: Optional[str] = None
-    marks: List[VibodeMoveMark]
     modelVersion: Optional[str] = None
     aspectRatio: Optional[AspectRatio] = "auto"
 
@@ -1987,12 +1971,6 @@ def _normalized_to_pixel(normalized_value: float, size: int) -> int:
     return max(0, min(int(round(clamped * (size - 1))), size - 1))
 
 
-def _clamp_move_delta(delta: float) -> float:
-    if not math.isfinite(delta):
-        return 0.0
-    return max(-1.0, min(1.0, float(delta)))
-
-
 def _draw_colored_disc_pixels(
     img: Image.Image,
     cx: int,
@@ -2130,167 +2108,6 @@ def render_vibode_rotate_overlay(image_png_bytes: bytes, marks: List[VibodeRotat
             _draw_purple_marker_pixels(img, cx, cy, marker_radius)
 
     return image_to_png_bytes(img)
-
-
-def render_vibode_move_overlay(base_img: Image.Image, marks: List[VibodeMoveMark]) -> Image.Image:
-    img = base_img.copy()
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-
-    width, height = img.size
-    min_dim = min(width, height)
-    anchor_radius = max(8, int(round(min_dim * 0.016)))
-    anchor_radius = min(anchor_radius, 28)
-    anchor_ring_width = max(2, int(round(anchor_radius * 0.28)))
-    line_width = max(3, int(round(anchor_radius * 0.52)))
-    head_len = max(8, int(round(anchor_radius * 1.05)))
-
-    teal_anchor = (25, 184, 174)
-    cyan_arrow = (35, 218, 255)
-    white = (255, 255, 255)
-    label_bg = (16, 22, 28)
-
-    if _HAS_IMAGE_DRAW and ImageDraw is not None:
-        draw = ImageDraw.Draw(img)
-        font = _load_marker_label_font(max(10, int(round(anchor_radius * 0.95))))
-
-        for idx, mark in enumerate(marks):
-            start_x = _normalized_to_pixel(mark.xNorm, width)
-            start_y = _normalized_to_pixel(mark.yNorm, height)
-            end_x_norm = max(0.0, min(1.0, float(mark.xNorm) + _clamp_move_delta(mark.dxNorm)))
-            end_y_norm = max(0.0, min(1.0, float(mark.yNorm) + _clamp_move_delta(mark.dyNorm)))
-            end_x = _normalized_to_pixel(end_x_norm, width)
-            end_y = _normalized_to_pixel(end_y_norm, height)
-
-            draw.line((start_x, start_y, end_x, end_y), fill=cyan_arrow, width=line_width)
-
-            cap_radius = max(2, int(round(line_width * 0.5)))
-            draw.ellipse(
-                (
-                    start_x - cap_radius,
-                    start_y - cap_radius,
-                    start_x + cap_radius,
-                    start_y + cap_radius,
-                ),
-                fill=cyan_arrow,
-            )
-            draw.ellipse(
-                (
-                    end_x - cap_radius,
-                    end_y - cap_radius,
-                    end_x + cap_radius,
-                    end_y + cap_radius,
-                ),
-                fill=cyan_arrow,
-            )
-
-            theta = math.atan2((end_y - start_y), (end_x - start_x))
-            left_theta = theta + math.radians(152)
-            right_theta = theta - math.radians(152)
-            left_x = int(round(end_x + (math.cos(left_theta) * head_len)))
-            left_y = int(round(end_y + (math.sin(left_theta) * head_len)))
-            right_x = int(round(end_x + (math.cos(right_theta) * head_len)))
-            right_y = int(round(end_y + (math.sin(right_theta) * head_len)))
-
-            draw.line((end_x, end_y, left_x, left_y), fill=cyan_arrow, width=max(2, line_width - 1))
-            draw.line((end_x, end_y, right_x, right_y), fill=cyan_arrow, width=max(2, line_width - 1))
-
-            anchor_outer_bbox = (
-                start_x - anchor_radius,
-                start_y - anchor_radius,
-                start_x + anchor_radius,
-                start_y + anchor_radius,
-            )
-            draw.ellipse(anchor_outer_bbox, fill=white)
-
-            anchor_inner_radius = max(2, anchor_radius - anchor_ring_width)
-            anchor_inner_bbox = (
-                start_x - anchor_inner_radius,
-                start_y - anchor_inner_radius,
-                start_x + anchor_inner_radius,
-                start_y + anchor_inner_radius,
-            )
-            draw.ellipse(anchor_inner_bbox, fill=teal_anchor)
-
-            label_radius = max(8, int(round(anchor_radius * 0.74)))
-            label_cx = start_x + anchor_radius + label_radius
-            label_cy = start_y - anchor_radius - label_radius
-            label_cx = max(label_radius, min(label_cx, width - 1 - label_radius))
-            label_cy = max(label_radius, min(label_cy, height - 1 - label_radius))
-            label_bbox = (
-                label_cx - label_radius,
-                label_cy - label_radius,
-                label_cx + label_radius,
-                label_cy + label_radius,
-            )
-            draw.ellipse(label_bbox, fill=label_bg, outline=white, width=1)
-            marker_label = str(idx + 1)
-            try:
-                draw.text(
-                    (label_cx, label_cy),
-                    marker_label,
-                    fill=white,
-                    font=font,
-                    anchor="mm",
-                    stroke_width=1,
-                    stroke_fill=(0, 0, 0),
-                )
-            except Exception:
-                draw.text((label_cx - 3, label_cy - 6), marker_label, fill=white, font=font)
-    else:
-        for idx, mark in enumerate(marks):
-            start_x = _normalized_to_pixel(mark.xNorm, width)
-            start_y = _normalized_to_pixel(mark.yNorm, height)
-            end_x_norm = max(0.0, min(1.0, float(mark.xNorm) + _clamp_move_delta(mark.dxNorm)))
-            end_y_norm = max(0.0, min(1.0, float(mark.yNorm) + _clamp_move_delta(mark.dyNorm)))
-            end_x = _normalized_to_pixel(end_x_norm, width)
-            end_y = _normalized_to_pixel(end_y_norm, height)
-
-            _draw_colored_line_pixels(
-                img=img,
-                x1=start_x,
-                y1=start_y,
-                x2=end_x,
-                y2=end_y,
-                color=cyan_arrow,
-                thickness=line_width,
-            )
-            theta = math.atan2((end_y - start_y), (end_x - start_x))
-            left_theta = theta + math.radians(152)
-            right_theta = theta - math.radians(152)
-            left_x = int(round(end_x + (math.cos(left_theta) * head_len)))
-            left_y = int(round(end_y + (math.sin(left_theta) * head_len)))
-            right_x = int(round(end_x + (math.cos(right_theta) * head_len)))
-            right_y = int(round(end_y + (math.sin(right_theta) * head_len)))
-            _draw_colored_line_pixels(
-                img=img,
-                x1=end_x,
-                y1=end_y,
-                x2=left_x,
-                y2=left_y,
-                color=cyan_arrow,
-                thickness=max(2, line_width - 1),
-            )
-            _draw_colored_line_pixels(
-                img=img,
-                x1=end_x,
-                y1=end_y,
-                x2=right_x,
-                y2=right_y,
-                color=cyan_arrow,
-                thickness=max(2, line_width - 1),
-            )
-
-            _draw_colored_disc_pixels(img=img, cx=start_x, cy=start_y, radius=anchor_radius, color=white)
-            _draw_colored_disc_pixels(
-                img=img,
-                cx=start_x,
-                cy=start_y,
-                radius=max(2, anchor_radius - anchor_ring_width),
-                color=teal_anchor,
-            )
-
-    return img
 
 
 def scale_placements_for_resized_room_image(
@@ -2632,34 +2449,6 @@ def _summarize_rotate_marks(
     }
 
 
-def _summarize_move_marks(
-    marks: List[VibodeMoveMark],
-    limit: int = 5,
-) -> Dict[str, object]:
-    preview: List[Dict[str, object]] = []
-    for idx, mark in enumerate(marks[:limit]):
-        clamped_x = max(0.0, min(1.0, float(mark.xNorm)))
-        clamped_y = max(0.0, min(1.0, float(mark.yNorm)))
-        clamped_dx = _clamp_move_delta(mark.dxNorm)
-        clamped_dy = _clamp_move_delta(mark.dyNorm)
-        preview.append(
-            {
-                "markerIndex": idx + 1,
-                "markId": mark.id,
-                "xNorm": round(clamped_x, 4),
-                "yNorm": round(clamped_y, 4),
-                "dxNorm": round(clamped_dx, 4),
-                "dyNorm": round(clamped_dy, 4),
-                "endXNorm": round(max(0.0, min(1.0, clamped_x + clamped_dx)), 4),
-                "endYNorm": round(max(0.0, min(1.0, clamped_y + clamped_dy)), 4),
-            }
-        )
-    return {
-        "count": len(marks),
-        "preview": preview,
-    }
-
-
 def maybe_dump_prepared_room_images(
     room_clean_png_bytes: bytes,
     room_marked_png_bytes: bytes,
@@ -2789,50 +2578,6 @@ def maybe_dump_vibode_rotate_images(
         )
     except Exception as e:
         print("[maybe_dump_vibode_rotate_images] failed:", e)
-
-
-def maybe_dump_vibode_move_images(
-    room_clean_png_bytes: bytes,
-    room_move_overlay_png_bytes: bytes,
-    output_png_bytes: bytes,
-    stable_seed: str,
-    output_dir: Optional[str] = None,
-) -> None:
-    if not _env_truthy("VIBODE_DUMP_ANNOTATED_IMAGE"):
-        return
-
-    try:
-        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
-        resolved_dir = output_dir or os.getenv("VIBODE_DEBUG_DIR") or "tmp/vibode_debug"
-        abs_dir = os.path.abspath(resolved_dir)
-        os.makedirs(abs_dir, exist_ok=True)
-
-        normalized_seed = (stable_seed or "").strip() or timestamp
-        short_id = hashlib.sha256(normalized_seed.encode("utf-8")).hexdigest()[:8]
-        file_prefix = f"vibode_move_{timestamp}_{short_id}"
-
-        clean_path = os.path.join(abs_dir, f"{file_prefix}_clean.png")
-        overlay_path = os.path.join(abs_dir, f"{file_prefix}_overlay.png")
-        output_path = os.path.join(abs_dir, f"{file_prefix}_output.png")
-
-        with open(clean_path, "wb") as handle:
-            handle.write(room_clean_png_bytes)
-        with open(overlay_path, "wb") as handle:
-            handle.write(room_move_overlay_png_bytes)
-        with open(output_path, "wb") as handle:
-            handle.write(output_png_bytes)
-
-        print(
-            "[maybe_dump_vibode_move_images] wrote:",
-            {
-                "clean": clean_path,
-                "overlay": overlay_path,
-                "output": output_path,
-                "stableSeed": normalized_seed,
-            },
-        )
-    except Exception as e:
-        print("[maybe_dump_vibode_move_images] failed:", e)
 
 
 def prepare_sku_png_bytes(image_bytes: bytes) -> bytes:
@@ -3499,102 +3244,6 @@ def build_vibode_rotate_prompt(marks: List[VibodeRotateMark]) -> str:
     return "\n".join(lines)
 
 
-def build_vibode_move_prompt(marks: List[VibodeMoveMark]) -> str:
-    marker_count = len(marks)
-    lines = [
-        "You are a professional real-estate photo editor.",
-        "",
-        "You are given exactly two images in this order:",
-        "1) Image 1 is the clean/base room image and is the source of truth.",
-        f"2) Image 2 is the same room with numbered move overlays (anchor + arrow) for markers 1..{marker_count}.",
-        "",
-        "Critical interpretation:",
-        "- Each marker's anchor identifies exactly one object to edit.",
-        "- Each marker's arrow is a translation vector only.",
-        "- Translation only: move the object in-place by the exact vector shown.",
-        "- Do not interpret the arrow as rotation.",
-        "",
-        "Hard constraints to preserve:",
-        "- Preserve lighting and shadows (direction, softness, and intensity).",
-        "- Preserve camera perspective.",
-        "- Preserve object scale.",
-        "- Preserve object rotation.",
-        "- Keep all non-target objects unchanged.",
-        "",
-        "Strict prohibitions:",
-        "- Do not restage the room.",
-        "- Do not relight the scene.",
-        "- Do not change materials or colors.",
-        "- Do not add or remove items.",
-        "- Do not leave markers, arrows, numbers, text, logos, or watermarks in the final image.",
-        "",
-        "Apply these translations in marker order:",
-    ]
-
-    for idx, mark in enumerate(marks):
-        marker_index = idx + 1
-        clamped_x = max(0.0, min(1.0, float(mark.xNorm)))
-        clamped_y = max(0.0, min(1.0, float(mark.yNorm)))
-        clamped_dx = _clamp_move_delta(mark.dxNorm)
-        clamped_dy = _clamp_move_delta(mark.dyNorm)
-        end_x = max(0.0, min(1.0, clamped_x + clamped_dx))
-        end_y = max(0.0, min(1.0, clamped_y + clamped_dy))
-        lines.extend(
-            [
-                (
-                    f"- Marker #{marker_index}: Move ONLY the object at anchor #{marker_index} "
-                    f"from ({clamped_x:.4f}, {clamped_y:.4f}) to ({end_x:.4f}, {end_y:.4f}) "
-                    f"using translation vector ({clamped_dx:.4f}, {clamped_dy:.4f})."
-                ),
-                "  Translation only. Keep rotation, scale, perspective, lighting, and shadows unchanged.",
-            ]
-        )
-
-    return "\n".join(lines)
-
-
-def _parse_and_clamp_move_marks(marks: List[VibodeMoveMark]) -> List[VibodeMoveMark]:
-    if not marks:
-        raise HTTPException(status_code=400, detail="marks must be non-empty.")
-
-    parsed_marks: List[VibodeMoveMark] = []
-    for idx, mark in enumerate(marks):
-        raw_x = float(mark.xNorm)
-        raw_y = float(mark.yNorm)
-        raw_dx = float(mark.dxNorm)
-        raw_dy = float(mark.dyNorm)
-        if (
-            not math.isfinite(raw_x)
-            or not math.isfinite(raw_y)
-            or not math.isfinite(raw_dx)
-            or not math.isfinite(raw_dy)
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"marks[{idx}] has invalid values; xNorm, yNorm, dxNorm, and dyNorm "
-                    "must be finite numbers."
-                ),
-            )
-
-        clamped_x = max(0.0, min(1.0, raw_x))
-        clamped_y = max(0.0, min(1.0, raw_y))
-        clamped_dx = _clamp_move_delta(raw_dx)
-        clamped_dy = _clamp_move_delta(raw_dy)
-        parsed_marks.append(
-            mark.model_copy(
-                update={
-                    "xNorm": clamped_x,
-                    "yNorm": clamped_y,
-                    "dxNorm": clamped_dx,
-                    "dyNorm": clamped_dy,
-                }
-            )
-        )
-
-    return parsed_marks
-
-
 def _extract_rotate_marks(
     freeze_payload: Dict[str, Any],
     request_marks: Optional[List[VibodeRotateMark]],
@@ -3833,7 +3482,7 @@ def _target_area_list_prompt_snippet(targets: List[ScenePlacementBbox]) -> str:
 
 
 def build_vibode_edit_run_prompt(
-    action: Literal["add", "remove", "swap", "rotate", "move"],
+    action: Literal["add", "remove", "swap", "rotate"],
     target_placement: Optional[ScenePlacement],
     params: Optional[Dict[str, Any]],
     sku_label: Optional[str] = None,
@@ -3965,20 +3614,7 @@ def build_vibode_edit_run_prompt(
                 ]
             )
     else:
-        dx = params.get("dx")
-        dy = params.get("dy")
-        lines.extend(
-            [
-                "Task: Move the target object to the updated intended target area.",
-                (
-                    f"Translation vector normalized is (dx={dx}, dy={dy})."
-                    if dx is not None and dy is not None
-                    else "Move to the requested updated target area."
-                ),
-                "Preserve believable real-world scale and perspective.",
-                "Do not alter any other object.",
-            ]
-        )
+        raise ValueError(f"Unsupported vibode edit action: {action}")
 
     return "\n".join(lines)
 
@@ -5324,45 +4960,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
             },
         )
     else:
-        target_placement_id = (target.placementId or "").strip()
-        if not target_placement_id:
-            return _vibode_edit_run_error(400, "target.placementId is required for move.")
-        raw_dx = params.get("dx")
-        raw_dy = params.get("dy")
-        if raw_dx is None or raw_dy is None:
-            return _vibode_edit_run_error(400, "params.dx and params.dy are required for move.")
-        try:
-            dx = float(raw_dx)
-            dy = float(raw_dy)
-        except Exception:
-            return _vibode_edit_run_error(400, "params.dx and params.dy must be numbers.")
-        if not (math.isfinite(dx) and math.isfinite(dy)):
-            return _vibode_edit_run_error(400, "params.dx and params.dy must be finite numbers.")
-
-        target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
-        if target_idx < 0:
-            return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
-        target_placement = updated_placements[target_idx]
-        if not target_placement.bbox:
-            return _vibode_edit_run_error(400, f"placementId={target_placement_id} is missing bbox for move.")
-
-        normalized_bbox = _normalized_bbox_for_storage(target_placement.bbox)
-        moved_bbox = _normalized_bbox_for_storage(
-            ScenePlacementBbox(
-                x=normalized_bbox.x + dx,
-                y=normalized_bbox.y + dy,
-                w=normalized_bbox.w,
-                h=normalized_bbox.h,
-            )
-        )
-        updated_placement = target_placement.model_copy(update={"bbox": moved_bbox})
-        updated_placements[target_idx] = updated_placement
-        target_bbox = updated_placement.bbox
-        prompt = build_vibode_edit_run_prompt(
-            action="move",
-            target_placement=updated_placement,
-            params={"dx": dx, "dy": dy},
-        )
+        return _vibode_edit_run_error(400, f"Unsupported action: {action}")
 
     room_overlay_png_bytes = room_png_bytes
     _debug_log_vibode_edit_run(
@@ -6140,133 +5738,6 @@ async def vibode_rotate(req: VibodeRotateRequest):
         debug_ratio = "passthrough"
 
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
-
-@app.post("/vibode/move", response_model=VibodeComposeResponse)
-async def vibode_move(req: VibodeMoveRequest):
-    marks_ordered = _parse_and_clamp_move_marks(req.marks)
-
-    image_source_kind = "imageBase64"
-    if req.imageBase64 and req.imageBase64.strip():
-        try:
-            room_raw_bytes = _decode_base64_image(req.imageBase64)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid base64 room image data")
-    elif req.imageUrl and req.imageUrl.strip():
-        image_source_kind = "imageUrl"
-        try:
-            room_raw_bytes = _fetch_image_bytes_from_url(req.imageUrl)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Failed to fetch imageUrl image data")
-    else:
-        raise HTTPException(status_code=400, detail="Provide either imageBase64 or imageUrl.")
-
-    model_name = resolve_model_name_for_route("/vibode/move", req.modelVersion)
-
-    try:
-        room_orig_img = _safe_open_image(room_raw_bytes)
-        orig_w, orig_h = room_orig_img.size
-    except Exception as e:
-        print("[/vibode/move] Error decoding room image dimensions:", e)
-        raise HTTPException(status_code=400, detail="Could not process room image")
-
-    applied_ratio: Optional[str] = None
-    aspect_ratio_to_send: Optional[str] = None
-    try:
-        log_continuation_aspect_ratio_omitted("/vibode/move")
-        room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
-        applied_ratio = None
-        aspect_ratio_to_send = None
-    except Exception as e:
-        print("[/vibode/move] Error preparing room image:", e)
-        raise HTTPException(status_code=400, detail="Could not process room image")
-
-    try:
-        room_pre_overlay_img = _safe_open_image(room_png_bytes)
-        new_w, new_h = room_pre_overlay_img.size
-    except Exception as e:
-        print("[/vibode/move] Error decoding prepared room image dimensions:", e)
-        raise HTTPException(status_code=500, detail="Failed to prepare room overlay image")
-
-    try:
-        overlay_img = render_vibode_move_overlay(room_pre_overlay_img, marks_ordered)
-        room_overlay_png_bytes = image_to_png_bytes(overlay_img)
-    except Exception as e:
-        print("[/vibode/move] Error drawing move markers:", e)
-        raise HTTPException(status_code=500, detail="Failed to draw move markers")
-
-    move_prompt = build_vibode_move_prompt(marks_ordered)
-    move_prompt_hash = _short_prompt_hash(move_prompt)
-    move_prompt_first_line = _prompt_first_line(move_prompt)
-
-    print(
-        "[/vibode/move] Received request:",
-        {
-            "marks": len(marks_ordered),
-            "marks_summary": _summarize_move_marks(marks_ordered),
-            "sourceImage": image_source_kind,
-            "imageUrlProvided": bool(req.imageUrl and req.imageUrl.strip()),
-            "room_bytes_len": len(room_raw_bytes),
-            "room_png_len": len(room_png_bytes),
-            "originalDims": (orig_w, orig_h),
-            "preparedDims": (new_w, new_h),
-            "modelVersion": req.modelVersion,
-            "modelName": model_name,
-            "requestedAspectRatio": req.aspectRatio,
-            "appliedAspectRatio": applied_ratio,
-            "sentAspectRatio": aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
-            "maxInputLongEdge": MAX_INPUT_LONG_EDGE_INT,
-        },
-    )
-    print(
-        "[/vibode/move] Prompt summary:",
-        {
-            "prompt_hash": move_prompt_hash,
-            "prompt_first_line": move_prompt_first_line,
-            "marks_summary": _summarize_move_marks(marks_ordered),
-        },
-    )
-    if VIBODE_LOG_PROMPTS:
-        print("\n===== VIBODE MOVE PROMPT SENT TO GEMINI =====\n")
-        print(move_prompt)
-        print("\n==============================================\n")
-
-    try:
-        out_bytes = call_gemini_multimodal(
-            prompt=move_prompt,
-            room_png_bytes=room_png_bytes,
-            room_overlay_png_bytes=room_overlay_png_bytes,
-            sku_png_bytes_list=[],
-            model_name=model_name,
-            aspect_ratio=aspect_ratio_to_send,
-        )
-    except Exception as e:
-        log_event("vibode_move_processing_failed", error=str(e))
-        raise HTTPException(status_code=500, detail="Error during move")
-
-    if not out_bytes:
-        raise HTTPException(status_code=500, detail="Move returned empty image")
-
-    move_dump_seed = (
-        move_prompt_hash
-        + "|"
-        + "|".join(mark.id for mark in marks_ordered)
-        + f"|{len(room_png_bytes)}|{len(room_overlay_png_bytes)}"
-    )
-    maybe_dump_vibode_move_images(
-        room_clean_png_bytes=room_png_bytes,
-        room_move_overlay_png_bytes=room_overlay_png_bytes,
-        output_png_bytes=out_bytes,
-        stable_seed=move_dump_seed,
-    )
-
-    data_url = make_data_url(out_bytes, mime_type="image/png")
-
-    debug_ratio: Optional[str] = None
-    if DEBUG_ROOMPRINTZ_RATIO:
-        debug_ratio = "passthrough"
-
-    return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
-
 
 # Quick test:
 # curl -sS -X POST "http://localhost:8000/api/vibode/user-skus/ingest" -H "Content-Type: application/json" -d '{"label":"Demo SKU","imageUrl":"https://example.com/product.png"}'
