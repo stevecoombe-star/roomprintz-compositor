@@ -781,6 +781,10 @@ class EligibleSku(BaseModel):
 class VibodeEditRunTarget(BaseModel):
     placementId: Optional[str] = None
     skuId: Optional[str] = None
+    xNorm: Optional[float] = None
+    yNorm: Optional[float] = None
+    x: Optional[float] = None
+    y: Optional[float] = None
 
 
 class VibodeEditRunRequest(BaseModel):
@@ -3666,6 +3670,61 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _coerce_finite_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _resolve_normalized_point(
+    candidates: List[Tuple[str, Any, Any]],
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    for source, raw_x, raw_y in candidates:
+        parsed_x = _coerce_finite_float(raw_x)
+        parsed_y = _coerce_finite_float(raw_y)
+        if parsed_x is None or parsed_y is None:
+            continue
+        return _clamp01(parsed_x), _clamp01(parsed_y), source
+    return None, None, None
+
+
+def _target_bbox_from_point(x: float, y: float, box_size: float = 0.18) -> ScenePlacementBbox:
+    return _normalized_bbox_for_storage(
+        ScenePlacementBbox(
+            x=x - (box_size / 2.0),
+            y=y - (box_size / 2.0),
+            w=box_size,
+            h=box_size,
+        )
+    )
+
+
+def _find_scene_placement_index_for_point(
+    placements: List[ScenePlacement], x: float, y: float
+) -> int:
+    hit_idx = -1
+    hit_area = float("inf")
+    for idx, placement in enumerate(placements):
+        placement_bbox = placement.bbox
+        if not placement_bbox:
+            continue
+        within_x = placement_bbox.x <= x <= (placement_bbox.x + placement_bbox.w)
+        within_y = placement_bbox.y <= y <= (placement_bbox.y + placement_bbox.h)
+        if not (within_x and within_y):
+            continue
+        area = placement_bbox.w * placement_bbox.h
+        if area < hit_area:
+            hit_area = area
+            hit_idx = idx
+    return hit_idx
+
+
 def _sanitize_storage_segment(raw_value: Optional[str], fallback: str) -> str:
     source = (raw_value or "").strip()
     if not source:
@@ -4888,11 +4947,19 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         )
     elif action == "remove":
         remove_targets = params.get("removeTargets")
-        if isinstance(remove_targets, list) and remove_targets:
-            remove_target_bboxes: List[ScenePlacementBbox] = []
-            remove_target_placement_ids: set[str] = set()
-            target_placement_id = (target.placementId or "").strip() or None
+        remove_target_bboxes: List[ScenePlacementBbox] = []
+        remove_target_placement_ids: set[str] = set()
+        target_placement_id = (target.placementId or "").strip() or None
 
+        print(
+            "[/api/vibode/edit-run][remove] incoming payload:",
+            {
+                "target": target.model_dump(exclude_none=True),
+                "params": params,
+            },
+        )
+
+        if isinstance(remove_targets, list):
             for remove_target in remove_targets:
                 if not isinstance(remove_target, dict):
                     continue
@@ -4907,32 +4974,53 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
                         remove_target_bbox = None
                     if remove_target_bbox:
                         remove_target_bboxes.append(_normalized_bbox_for_storage(remove_target_bbox))
+                        continue
+                remove_target_x, remove_target_y, _ = _resolve_normalized_point(
+                    [
+                        ("removeTarget.xNorm/yNorm", remove_target.get("xNorm"), remove_target.get("yNorm")),
+                        ("removeTarget.x/y", remove_target.get("x"), remove_target.get("y")),
+                    ]
+                )
+                if remove_target_x is not None and remove_target_y is not None:
+                    remove_target_bboxes.append(_target_bbox_from_point(remove_target_x, remove_target_y))
 
-            if not remove_target_bboxes and remove_target_placement_ids:
-                for placement in updated_placements:
-                    if placement.placementId in remove_target_placement_ids and placement.bbox:
-                        remove_target_bboxes.append(_normalized_bbox_for_storage(placement.bbox))
+        if not remove_target_bboxes and remove_target_placement_ids:
+            for placement in updated_placements:
+                if placement.placementId in remove_target_placement_ids and placement.bbox:
+                    remove_target_bboxes.append(_normalized_bbox_for_storage(placement.bbox))
 
-            if not remove_target_bboxes:
-                return _vibode_edit_run_error(400, "removeTargets did not include any valid target areas.")
+        remove_x_norm, remove_y_norm, remove_coord_source = _resolve_normalized_point(
+            [
+                ("target.xNorm/yNorm", target.xNorm, target.yNorm),
+                ("target.x/y", target.x, target.y),
+                ("params.xNorm/yNorm", params.get("xNorm"), params.get("yNorm")),
+                ("params.x/y", params.get("x"), params.get("y")),
+            ]
+        )
+        if remove_x_norm is not None and remove_y_norm is not None:
+            print(
+                "[/api/vibode/edit-run][remove] normalized target:",
+                {
+                    "xNorm": round(remove_x_norm, 4),
+                    "yNorm": round(remove_y_norm, 4),
+                    "source": remove_coord_source,
+                },
+            )
+        else:
+            print("[/api/vibode/edit-run][remove] normalized target: (none)")
 
+        if not remove_target_bboxes and remove_x_norm is not None and remove_y_norm is not None:
+            remove_target_bboxes.append(_target_bbox_from_point(remove_x_norm, remove_y_norm))
+
+        if remove_target_bboxes:
             prompt = build_vibode_edit_run_prompt(
                 action="remove",
                 target_placement=None,
                 params=params,
                 remove_target_bboxes=remove_target_bboxes,
             )
-            target_bbox = remove_target_bboxes[0] if remove_target_bboxes else None
-            if remove_target_placement_ids:
-                updated_placements = [
-                    placement
-                    for placement in updated_placements
-                    if placement.placementId not in remove_target_placement_ids
-                ]
-        else:
-            target_placement_id = (target.placementId or "").strip()
-            if not target_placement_id:
-                return _vibode_edit_run_error(400, "target.placementId is required for remove.")
+            target_bbox = remove_target_bboxes[0]
+        elif target_placement_id:
             target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
             if target_idx < 0:
                 return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
@@ -4943,7 +5031,38 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
                 params=params,
             )
             target_bbox = placement_to_remove.bbox
-            updated_placements.pop(target_idx)
+        elif remove_target_placement_ids:
+            prompt = build_vibode_edit_run_prompt(
+                action="remove",
+                target_placement=None,
+                params=params,
+                remove_target_bboxes=[],
+            )
+        else:
+            return _vibode_edit_run_error(
+                400,
+                "remove requires target.xNorm/target.yNorm, target.x/target.y, params.xNorm/params.yNorm, "
+                "target.placementId, or params.removeTargets.",
+            )
+
+        if remove_target_placement_ids:
+            updated_placements = [
+                placement
+                for placement in updated_placements
+                if placement.placementId not in remove_target_placement_ids
+            ]
+        elif target_placement_id:
+            target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
+            if target_idx >= 0:
+                updated_placements.pop(target_idx)
+        elif remove_x_norm is not None and remove_y_norm is not None:
+            hit_idx = _find_scene_placement_index_for_point(updated_placements, remove_x_norm, remove_y_norm)
+            if hit_idx >= 0:
+                target_placement_id = updated_placements[hit_idx].placementId
+                hit_bbox = updated_placements[hit_idx].bbox
+                if target_bbox is None and hit_bbox:
+                    target_bbox = _normalized_bbox_for_storage(hit_bbox)
+                updated_placements.pop(hit_idx)
     elif action == "swap":
         target_placement_id = (target.placementId or "").strip() or None
         target_sku_id = (target.skuId or "").strip()
