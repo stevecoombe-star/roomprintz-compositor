@@ -3481,6 +3481,30 @@ def _target_area_list_prompt_snippet(targets: List[ScenePlacementBbox]) -> str:
     return f"The target edits should occur roughly near normalized locations: {centers}."
 
 
+def _remove_target_area_prompt_snippet(bbox: Optional[ScenePlacementBbox]) -> str:
+    if not bbox:
+        return (
+            "Treat the provided normalized coordinate as the exact user-selected point for removal."
+        )
+    center_x = bbox.x + (bbox.w / 2.0)
+    center_y = bbox.y + (bbox.h / 2.0)
+    return (
+        "Treat normalized location "
+        f"({center_x:.4f}, {center_y:.4f}) as the exact user-selected point for removal."
+    )
+
+
+def _remove_target_area_list_prompt_snippet(targets: List[ScenePlacementBbox]) -> str:
+    if not targets:
+        return (
+            "Treat the provided normalized coordinate as the exact user-selected point for removal."
+        )
+    centers = ", ".join(
+        f"({target.x + (target.w / 2.0):.4f}, {target.y + (target.h / 2.0):.4f})" for target in targets
+    )
+    return f"Exact normalized removal target point(s): {centers}."
+
+
 def build_vibode_edit_run_prompt(
     action: Literal["add", "remove", "swap", "rotate"],
     target_placement: Optional[ScenePlacement],
@@ -3493,8 +3517,11 @@ def build_vibode_edit_run_prompt(
     remove_target_bboxes = remove_target_bboxes or []
     rotate_x_norm = _coerce_finite_float(params.get("xNorm")) if action == "rotate" else None
     rotate_y_norm = _coerce_finite_float(params.get("yNorm")) if action == "rotate" else None
-    if action == "remove" and remove_target_bboxes:
-        target_guidance = _target_area_list_prompt_snippet(remove_target_bboxes)
+    if action == "remove":
+        if remove_target_bboxes:
+            target_guidance = _remove_target_area_list_prompt_snippet(remove_target_bboxes)
+        else:
+            target_guidance = _remove_target_area_prompt_snippet(bbox)
     elif (
         action == "rotate"
         and bbox is None
@@ -3542,18 +3569,33 @@ def build_vibode_edit_run_prompt(
         if remove_target_bboxes:
             lines.extend(
                 [
-                    "Task: Remove only the target objects in the intended target areas.",
-                    "Fill background naturally.",
-                    "Do not remove surrounding room content.",
-                    "Do not alter other objects.",
+                    "Task: Perform precise, coordinate-first object removal at the target point(s).",
+                    "For each target point, treat it independently and use a tight spatial radius around the exact coordinate to identify only the single foreground object or object region centered there.",
+                    "When overlap is ambiguous, select only the centered foreground object or object region nearest that target point.",
+                    "Remove only that one object or object region per provided target point.",
+                    "Keep each edit bounded to the minimum area required to remove the target cleanly.",
+                    "Preserve all surrounding objects, furniture, walls, layout, and overall scene composition.",
+                    "Do not reposition, restyle, alter, improve, or otherwise change any non-target content.",
+                    "Reconstruct the removed area naturally from nearby visual context.",
+                    "Match original lighting, perspective, shadows, and textures.",
+                    "Do not infer broader user intent, do not remove additional objects, and do not introduce new objects or design changes.",
+                    "If no clear removable object exists exactly at a target coordinate, prefer no meaningful change rather than a broad or speculative edit.",
                 ]
             )
         else:
             lines.extend(
                 [
-                    "Task: Remove only the target object in the intended target area.",
-                    "Fill background naturally.",
-                    "Do not remove surrounding room content.",
+                    "Task: Perform precise, coordinate-first object removal at the exact user-selected point.",
+                    "Use a tight spatial radius around that coordinate to identify only the single foreground object or object region centered there.",
+                    "When overlap is ambiguous, select only the centered foreground object or object region nearest that coordinate.",
+                    "Remove only that single object or object region at the target location.",
+                    "Keep the edit bounded to the minimum area required to remove the target cleanly.",
+                    "Preserve all surrounding objects, furniture, walls, layout, and overall scene composition.",
+                    "Do not reposition, restyle, alter, improve, or otherwise change any non-target content.",
+                    "Reconstruct the removed area naturally from nearby visual context.",
+                    "Match original lighting, perspective, shadows, and textures.",
+                    "Do not infer broader user intent, do not remove additional objects, and do not introduce new objects or design changes.",
+                    "If no clear removable object exists at the coordinate, prefer no meaningful change rather than a broad or speculative edit.",
                 ]
             )
     elif action == "swap":
