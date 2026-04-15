@@ -1217,6 +1217,130 @@ def _estimate_corner_background_rgb(img_rgb: Image.Image) -> Tuple[int, int, int
     )
 
 
+def _histogram_percentile(hist: List[int], percentile: float) -> int:
+    total = float(sum(hist))
+    if total <= 0:
+        return 0
+    threshold = max(1.0, total * min(1.0, max(0.0, percentile)))
+    running = 0.0
+    for idx, count in enumerate(hist):
+        running += count
+        if running >= threshold:
+            return idx
+    return max(0, len(hist) - 1)
+
+
+def _estimate_local_background_rgb(
+    img_rgb: Image.Image,
+    bbox: Tuple[int, int, int, int],
+) -> Tuple[int, int, int]:
+    width, height = img_rgb.size
+    left = max(0, min(width, bbox[0]))
+    top = max(0, min(height, bbox[1]))
+    right = max(left + 1, min(width, bbox[2]))
+    bottom = max(top + 1, min(height, bbox[3]))
+    region = img_rgb.crop((left, top, right, bottom))
+    region_w, region_h = region.size
+    if region_w < 2 or region_h < 2:
+        return _estimate_corner_background_rgb(img_rgb)
+
+    band = max(1, int(round(min(region_w, region_h) * 0.08)))
+    samples: List[Tuple[int, int, int]] = []
+    pixels = region.load()
+
+    for x in range(region_w):
+        for y in range(band):
+            samples.append(pixels[x, y])
+            samples.append(pixels[x, max(0, region_h - 1 - y)])
+    for y in range(band, max(band, region_h - band)):
+        for x in range(band):
+            samples.append(pixels[x, y])
+            samples.append(pixels[max(0, region_w - 1 - x), y])
+
+    if not samples:
+        return _estimate_corner_background_rgb(img_rgb)
+
+    rs = sorted(px[0] for px in samples)
+    gs = sorted(px[1] for px in samples)
+    bs = sorted(px[2] for px in samples)
+    mid_idx = len(samples) // 2
+    return (rs[mid_idx], gs[mid_idx], bs[mid_idx])
+
+
+def _find_user_sku_outer_bbox_from_binary_mask(
+    binary_mask: Image.Image,
+) -> Optional[Tuple[int, int, int, int]]:
+    mask = binary_mask.convert("L")
+    width, height = mask.size
+    if width <= 0 or height <= 0:
+        return None
+
+    pixels = mask.load()
+    row_counts = [0] * height
+    col_counts = [0] * width
+    for y in range(height):
+        row_total = 0
+        for x in range(width):
+            if pixels[x, y] >= 128:
+                row_total += 1
+                col_counts[x] += 1
+        row_counts[y] = row_total
+
+    min_row_pixels = max(1, int(round(width * 0.002)))
+    min_col_pixels = max(1, int(round(height * 0.002)))
+
+    top = next((y for y, count in enumerate(row_counts) if count >= min_row_pixels), None)
+    bottom = next(
+        (y for y in range(height - 1, -1, -1) if row_counts[y] >= min_row_pixels),
+        None,
+    )
+    left = next((x for x, count in enumerate(col_counts) if count >= min_col_pixels), None)
+    right = next(
+        (x for x in range(width - 1, -1, -1) if col_counts[x] >= min_col_pixels),
+        None,
+    )
+
+    if top is None or bottom is None or left is None or right is None:
+        return mask.getbbox()
+    if left > right or top > bottom:
+        return mask.getbbox()
+
+    return (left, top, right + 1, bottom + 1)
+
+
+def _detect_user_sku_outer_bbox_from_flat_background(
+    candidate_rgba: Image.Image,
+) -> Tuple[Optional[Tuple[int, int, int, int]], Image.Image]:
+    candidate_rgb = candidate_rgba.convert("RGB")
+    bg_r, bg_g, bg_b = _estimate_corner_background_rgb(candidate_rgb)
+    bg = Image.new("RGB", candidate_rgb.size, (bg_r, bg_g, bg_b))
+    diff_rgb = ImageChops.difference(candidate_rgb, bg)
+
+    # Use the strongest per-channel difference so pale products are less likely to be clipped.
+    diff_r, diff_g, diff_b = diff_rgb.split()
+    diff_max = ImageChops.lighter(ImageChops.lighter(diff_r, diff_g), diff_b)
+    diff_hist = diff_max.histogram()
+    diff_p90 = _histogram_percentile(diff_hist, 0.90)
+    diff_p97 = _histogram_percentile(diff_hist, 0.97)
+    threshold = max(
+        8,
+        min(
+            40,
+            int(
+                round(
+                    max(
+                        USER_SKU_FOREGROUND_COLOR_DISTANCE_THRESHOLD * 0.45,
+                        (diff_p90 * 0.55) + (diff_p97 * 0.45),
+                    )
+                )
+            ),
+        ),
+    )
+    outer_mask = diff_max.point(lambda v: 255 if v >= threshold else 0, mode="L")
+    bbox = _find_user_sku_outer_bbox_from_binary_mask(outer_mask)
+    return bbox, outer_mask
+
+
 def _count_mask_pixels(mask: Image.Image) -> int:
     return sum(1 for px in mask.getdata() if px >= 128)
 
@@ -1358,25 +1482,56 @@ def _refine_user_sku_foreground_mask(
         min(width, bbox[2] + pad),
         min(height, bbox[3] + pad),
     )
-
-    source_rgb = source_rgba.convert("RGB")
-    bg_r, bg_g, bg_b = _estimate_corner_background_rgb(source_rgb)
-    bg = Image.new("RGB", source_rgb.size, (bg_r, bg_g, bg_b))
-    source_diff = ImageChops.difference(source_rgb, bg).convert("L")
-    relaxed_threshold = max(10, int(round(USER_SKU_FOREGROUND_COLOR_DISTANCE_THRESHOLD * 0.5)))
-    source_fg = source_diff.point(lambda v: 255 if v >= relaxed_threshold else 0, mode="L")
-
     bbox_gate = Image.new("L", candidate_binary.size, 0)
     bbox_gate.paste(255, expanded_bbox)
-    source_fg = ImageChops.multiply(source_fg, bbox_gate)
 
-    candidate_expanded = candidate_binary.filter(ImageFilter.MaxFilter(size=5))
-    combined = ImageChops.lighter(source_fg, candidate_expanded)
+    source_rgb = source_rgba.convert("RGB")
+    bg_r, bg_g, bg_b = _estimate_local_background_rgb(source_rgb, expanded_bbox)
+    bg = Image.new("RGB", source_rgb.size, (bg_r, bg_g, bg_b))
+    source_diff = ImageChops.difference(source_rgb, bg).convert("L")
+    diff_hist = source_diff.crop(expanded_bbox).histogram()
+    diff_p55 = _histogram_percentile(diff_hist, 0.55)
+    diff_p75 = _histogram_percentile(diff_hist, 0.75)
+    diff_p90 = _histogram_percentile(diff_hist, 0.90)
+    adaptive_threshold = max(
+        8,
+        min(
+            40,
+            int(round((diff_p55 * 0.30) + (diff_p75 * 0.50) + (diff_p90 * 0.20))),
+        ),
+    )
+    strong_threshold = min(56, adaptive_threshold + 10)
+
+    source_fg_soft = source_diff.point(lambda v: 255 if v >= adaptive_threshold else 0, mode="L")
+    source_fg_strong = source_diff.point(lambda v: 255 if v >= strong_threshold else 0, mode="L")
+    source_fg_soft = ImageChops.multiply(source_fg_soft, bbox_gate)
+    source_fg_strong = ImageChops.multiply(source_fg_strong, bbox_gate)
+
+    candidate_seed = candidate_binary.filter(ImageFilter.MinFilter(size=3))
+    candidate_guardrail = candidate_binary.filter(ImageFilter.MaxFilter(size=5))
+    candidate_guardrail = candidate_guardrail.filter(ImageFilter.MaxFilter(size=5))
+    source_fg_guarded = ImageChops.multiply(source_fg_soft, candidate_guardrail)
+
+    # Preserve low-contrast boundaries near the candidate contour.
+    edge_map = source_rgb.convert("L").filter(ImageFilter.FIND_EDGES)
+    edge_hist = edge_map.crop(expanded_bbox).histogram()
+    edge_threshold = max(
+        10,
+        min(30, int(round(_histogram_percentile(edge_hist, 0.75) * 0.80))),
+    )
+    edge_support = edge_map.point(lambda v: 255 if v >= edge_threshold else 0, mode="L")
+    edge_support = ImageChops.multiply(edge_support, bbox_gate)
+    edge_support = ImageChops.multiply(edge_support, candidate_guardrail)
+
+    combined = ImageChops.lighter(source_fg_guarded, source_fg_strong)
+    combined = ImageChops.lighter(combined, edge_support)
+    combined = ImageChops.lighter(combined, candidate_seed)
 
     source_alpha = source_rgba.getchannel("A")
     source_alpha_lo, _ = source_alpha.getextrema()
     if source_alpha_lo < 255:
         source_alpha_mask = source_alpha.point(lambda a: 255 if a >= 8 else 0, mode="L")
+        source_alpha_mask = ImageChops.multiply(source_alpha_mask, bbox_gate)
         combined = ImageChops.lighter(combined, source_alpha_mask)
 
     combined = combined.filter(ImageFilter.MaxFilter(size=3))
@@ -1507,6 +1662,16 @@ def _extract_user_sku_product_crops(
 ) -> Tuple[bytes, bytes, Dict[str, Any]]:
     with Image.open(io.BytesIO(candidate_png_bytes)) as img:
         candidate_rgba = img.convert("RGBA")
+
+    # Primary fast path for Gemini RGB isolates:
+    # detect only an outer bbox from flat-background color difference and crop directly.
+    outer_bbox, outer_mask = _detect_user_sku_outer_bbox_from_flat_background(candidate_rgba)
+    if outer_bbox:
+        outer_stats = _compute_user_sku_mask_stats(outer_mask)
+        if outer_stats["has_foreground"]:
+            tight_cutout_rgba = candidate_rgba.crop(outer_bbox)
+            tight_rgb = candidate_rgba.convert("RGB").crop(outer_bbox)
+            return image_to_png_bytes(tight_cutout_rgba), image_to_png_bytes(tight_rgb), outer_stats
 
     source_rgba = candidate_rgba
     if source_png_bytes:
@@ -5550,10 +5715,14 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             )
             normalization_mode = "transparent_cutout"
         else:
+            with Image.open(io.BytesIO(product_solid_crop_png_bytes)) as solid_crop_img:
+                solid_crop_rgb = solid_crop_img.convert("RGB")
+            sampled_bg_rgb = _estimate_corner_background_rgb(solid_crop_rgb)
             normalized_png_bytes, normalized_dims = _normalize_user_sku_solid_bg_png(
                 product_solid_crop_png_bytes,
                 max_dimension=USER_SKU_NORMALIZED_MAX_DIM,
                 padding_ratio=USER_SKU_NORMALIZED_PADDING_RATIO,
+                bg_rgb=sampled_bg_rgb,
             )
             normalization_mode = "solid_tight_crop"
     except Exception as e:
