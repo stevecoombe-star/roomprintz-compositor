@@ -108,7 +108,11 @@ USER_SKU_BG_REMOVAL_PROMPT = (
     "No checkerboard pattern.\n"
     "Do not simulate transparency.\n"
     "Preserve the product's exact shape, scale, and materials.\n"
-    "Keep clean edges.\n"
+    "Do not brighten, whiten, normalize, or globally increase contrast/exposure on the product.\n"
+    "Preserve highlight detail and subtle near-white tonal gradients; avoid flattening light areas into pure white.\n"
+    "Retain material texture and fine detail (fabric texture, stitching, grain, and surface detail), especially on pale/neutral products.\n"
+    "Keep clean but natural edges and clear separation from the background; do not let light object edges melt or fade.\n"
+    "Avoid aggressive cleanup, beautification, or stylization; prefer faithful reproduction of the original product appearance.\n"
     "Include a small margin around the product."
 )
 USER_SKU_CLIPBOARD_ISOLATION_PROMPT = (
@@ -1307,6 +1311,79 @@ def _build_user_sku_foreground_mask(img_rgba: Image.Image) -> Image.Image:
     return base_mask
 
 
+def _fill_user_sku_mask_internal_holes(binary_mask: Image.Image) -> Image.Image:
+    if not _HAS_IMAGE_DRAW or ImageDraw is None or not hasattr(ImageDraw, "floodfill"):
+        # Fallback when flood fill is unavailable: mild closing to reduce visible gaps.
+        closed = binary_mask.filter(ImageFilter.MaxFilter(size=5))
+        return closed.filter(ImageFilter.MinFilter(size=3))
+
+    width, height = binary_mask.size
+    traced = binary_mask.convert("L")
+    seeds = [
+        (0, 0),
+        (max(0, width - 1), 0),
+        (0, max(0, height - 1)),
+        (max(0, width - 1), max(0, height - 1)),
+    ]
+    for x in range(width):
+        seeds.append((x, 0))
+        seeds.append((x, max(0, height - 1)))
+    for y in range(height):
+        seeds.append((0, y))
+        seeds.append((max(0, width - 1), y))
+
+    # Mark border-connected background as 64, leaving enclosed 0-valued holes untouched.
+    for seed in seeds:
+        if traced.getpixel(seed) == 0:
+            ImageDraw.floodfill(traced, seed, 64)
+
+    # Convert enclosed holes (0) to foreground while keeping traced background (64) transparent.
+    return traced.point(lambda v: 0 if v == 64 else 255, mode="L")
+
+
+def _refine_user_sku_foreground_mask(
+    source_rgba: Image.Image,
+    candidate_mask: Image.Image,
+) -> Image.Image:
+    candidate_binary = candidate_mask.convert("L").point(lambda v: 255 if v >= 128 else 0, mode="L")
+    bbox = candidate_binary.getbbox()
+    if not bbox:
+        return candidate_binary
+
+    width, height = candidate_binary.size
+    pad = max(4, int(round(min(width, height) * 0.015)))
+    expanded_bbox = (
+        max(0, bbox[0] - pad),
+        max(0, bbox[1] - pad),
+        min(width, bbox[2] + pad),
+        min(height, bbox[3] + pad),
+    )
+
+    source_rgb = source_rgba.convert("RGB")
+    bg_r, bg_g, bg_b = _estimate_corner_background_rgb(source_rgb)
+    bg = Image.new("RGB", source_rgb.size, (bg_r, bg_g, bg_b))
+    source_diff = ImageChops.difference(source_rgb, bg).convert("L")
+    relaxed_threshold = max(10, int(round(USER_SKU_FOREGROUND_COLOR_DISTANCE_THRESHOLD * 0.5)))
+    source_fg = source_diff.point(lambda v: 255 if v >= relaxed_threshold else 0, mode="L")
+
+    bbox_gate = Image.new("L", candidate_binary.size, 0)
+    bbox_gate.paste(255, expanded_bbox)
+    source_fg = ImageChops.multiply(source_fg, bbox_gate)
+
+    candidate_expanded = candidate_binary.filter(ImageFilter.MaxFilter(size=5))
+    combined = ImageChops.lighter(source_fg, candidate_expanded)
+
+    source_alpha = source_rgba.getchannel("A")
+    source_alpha_lo, _ = source_alpha.getextrema()
+    if source_alpha_lo < 255:
+        source_alpha_mask = source_alpha.point(lambda a: 255 if a >= 8 else 0, mode="L")
+        combined = ImageChops.lighter(combined, source_alpha_mask)
+
+    combined = combined.filter(ImageFilter.MaxFilter(size=3))
+    combined = combined.filter(ImageFilter.MinFilter(size=3))
+    return _fill_user_sku_mask_internal_holes(combined)
+
+
 def _compute_user_sku_mask_stats(mask: Image.Image) -> Dict[str, Any]:
     binary_mask = mask.convert("L").point(lambda v: 255 if v >= 128 else 0, mode="L")
     width, height = binary_mask.size
@@ -1424,30 +1501,41 @@ def _analyze_user_sku_candidate(
     }
 
 
-def _extract_user_sku_product_crops(candidate_png_bytes: bytes) -> Tuple[bytes, bytes, Dict[str, Any]]:
+def _extract_user_sku_product_crops(
+    candidate_png_bytes: bytes,
+    source_png_bytes: Optional[bytes] = None,
+) -> Tuple[bytes, bytes, Dict[str, Any]]:
     with Image.open(io.BytesIO(candidate_png_bytes)) as img:
-        rgba = img.convert("RGBA")
+        candidate_rgba = img.convert("RGBA")
 
-    mask = _build_user_sku_foreground_mask(rgba)
+    source_rgba = candidate_rgba
+    if source_png_bytes:
+        with Image.open(io.BytesIO(source_png_bytes)) as source_img:
+            decoded_source_rgba = source_img.convert("RGBA")
+        if decoded_source_rgba.size == candidate_rgba.size:
+            source_rgba = decoded_source_rgba
+
+    candidate_mask = _build_user_sku_foreground_mask(candidate_rgba)
+    mask = _refine_user_sku_foreground_mask(source_rgba, candidate_mask)
     stats = _compute_user_sku_mask_stats(mask)
     if not stats["has_foreground"]:
         raise RuntimeError("No product foreground detected after isolation.")
 
-    bbox = mask.getbbox()
+    bbox = candidate_mask.getbbox() or mask.getbbox()
     if not bbox:
         raise RuntimeError("Unable to compute product crop bounds.")
 
-    original_alpha = rgba.getchannel("A")
+    original_alpha = source_rgba.getchannel("A")
     alpha_lo, _ = original_alpha.getextrema()
     if alpha_lo < 255:
         combined_alpha = ImageChops.multiply(original_alpha, mask)
     else:
         combined_alpha = mask
 
-    cutout_rgba = rgba.copy()
+    cutout_rgba = source_rgba.copy()
     cutout_rgba.putalpha(combined_alpha)
     tight_cutout_rgba = cutout_rgba.crop(bbox)
-    tight_rgb = rgba.convert("RGB").crop(bbox)
+    tight_rgb = source_rgba.convert("RGB").crop(bbox)
     return image_to_png_bytes(tight_cutout_rgba), image_to_png_bytes(tight_rgb), stats
 
 
@@ -5421,7 +5509,8 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
 
     try:
         product_cutout_png_bytes, product_solid_crop_png_bytes, product_stats = _extract_user_sku_product_crops(
-            candidate_product_bytes
+            candidate_product_bytes,
+            source_png_bytes=original_png_bytes,
         )
         _log_debug_checkpoint(
             "masked_crop",
