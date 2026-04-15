@@ -66,6 +66,8 @@ DEBUG_ROOMPRINTZ_STAGE3_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_STAGE3_PROMPT", "0"
 
 # Toggle ratio debug return
 DEBUG_ROOMPRINTZ_RATIO = os.getenv("DEBUG_ROOMPRINTZ_RATIO", "0") == "1"
+# Toggle ingest checkpoint image metrics logging (off by default)
+DEBUG_USER_SKU_INGEST_METRICS = os.getenv("DEBUG_USER_SKU_INGEST_METRICS", "0") == "1"
 
 # Optional: cap input size to keep cost + latency down (resize down only; never upscale)
 # Set to "" to disable.
@@ -1213,6 +1215,74 @@ def _estimate_corner_background_rgb(img_rgb: Image.Image) -> Tuple[int, int, int
 
 def _count_mask_pixels(mask: Image.Image) -> int:
     return sum(1 for px in mask.getdata() if px >= 128)
+
+
+def _compute_user_sku_image_debug_metrics(image_png_bytes: bytes) -> Dict[str, Any]:
+    with Image.open(io.BytesIO(image_png_bytes)) as img:
+        source_mode = img.mode or ""
+        rgba = img.convert("RGBA")
+        width, height = rgba.size
+        total_pixels = max(1, width * height)
+
+        alpha = rgba.getchannel("A")
+        alpha_hist = alpha.histogram()
+        alpha_nonzero = sum(alpha_hist[1:])
+        alpha_ge_250 = sum(alpha_hist[250:])
+        alpha_lo, alpha_hi = alpha.getextrema()
+        has_alpha = not (alpha_lo == 255 and alpha_hi == 255)
+
+        gray = rgba.convert("L")
+        hist = gray.histogram()
+        lum_total = float(sum(hist))
+        weighted_lum = sum(idx * count for idx, count in enumerate(hist))
+        mean_luminance = (weighted_lum / lum_total) if lum_total > 0 else 0.0
+
+        def _percentile_from_hist(percentile: float) -> int:
+            threshold = max(1.0, lum_total * percentile)
+            running = 0.0
+            for idx, count in enumerate(hist):
+                running += count
+                if running >= threshold:
+                    return idx
+            return 255
+
+        p95_luminance = _percentile_from_hist(0.95)
+        p99_luminance = _percentile_from_hist(0.99)
+
+        lum_ge_245 = sum(hist[245:])
+        lum_ge_250 = sum(hist[250:])
+        lum_ge_254 = sum(hist[254:])
+
+        content_mask: Optional[Image.Image] = None
+        if has_alpha:
+            content_mask = alpha.point(lambda a: 255 if a > 0 else 0, mode="L")
+        else:
+            # Approximate non-background content when alpha isn't available.
+            content_mask = gray.point(lambda v: 255 if v < 250 else 0, mode="L")
+        bbox = content_mask.getbbox() if content_mask else None
+        content_bbox = (
+            {"left": bbox[0], "top": bbox[1], "right": bbox[2], "bottom": bbox[3]}
+            if bbox
+            else None
+        )
+
+        metrics: Dict[str, Any] = {
+            "width": width,
+            "height": height,
+            "mode": source_mode or rgba.mode,
+            "has_alpha": has_alpha,
+            "mean_luminance": round(mean_luminance, 4),
+            "p95_luminance": p95_luminance,
+            "p99_luminance": p99_luminance,
+            "lum_ge_245_ratio": round(lum_ge_245 / float(total_pixels), 6),
+            "lum_ge_250_ratio": round(lum_ge_250 / float(total_pixels), 6),
+            "lum_ge_254_ratio": round(lum_ge_254 / float(total_pixels), 6),
+            "content_bbox": content_bbox,
+        }
+        if has_alpha:
+            metrics["alpha_nonzero_ratio"] = round(alpha_nonzero / float(total_pixels), 6)
+            metrics["alpha_ge_250_ratio"] = round(alpha_ge_250 / float(total_pixels), 6)
+        return metrics
 
 
 def _build_user_sku_foreground_mask(img_rgba: Image.Image) -> Image.Image:
@@ -5094,6 +5164,29 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             **fields,
         )
 
+    def _log_debug_checkpoint(
+        checkpoint: str,
+        image_png_bytes: bytes,
+        extra_metrics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not DEBUG_USER_SKU_INGEST_METRICS:
+            return
+        try:
+            metrics = _compute_user_sku_image_debug_metrics(image_png_bytes)
+            if extra_metrics:
+                metrics.update(extra_metrics)
+            _ingest_log(
+                "vibode_user_sku_ingest_debug_checkpoint",
+                checkpoint=checkpoint,
+                metrics=metrics,
+            )
+        except Exception as e:
+            _ingest_log(
+                "vibode_user_sku_ingest_debug_checkpoint_failed",
+                checkpoint=checkpoint,
+                error=str(e)[:160],
+            )
+
     def _artifact_reason(metrics: Dict[str, Any]) -> str:
         if metrics.get("likely_screenshot_card_composition"):
             return "likely_screenshot_card_composition"
@@ -5191,6 +5284,7 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
         input_height=input_height,
         has_alpha=has_alpha,
     )
+    _log_debug_checkpoint("original_png", original_png_bytes)
 
     original_path = f"user-skus/{user_sku_id}/original.png"
     try:
@@ -5232,6 +5326,16 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
 
     candidate_product_bytes = bg_removed_bytes
     gate_metrics = _analyze_user_sku_candidate(original_png_bytes, candidate_product_bytes)
+    _log_debug_checkpoint(
+        "gemini_isolated",
+        candidate_product_bytes,
+        extra_metrics={
+            "mask_foreground_coverage_ratio": round(
+                float(gate_metrics.get("foreground_area_ratio", 0.0)),
+                6,
+            )
+        },
+    )
     _ingest_log(
         "vibode_user_sku_ingest_background_estimation_completed",
         dominant_bg_ratio=gate_metrics["uniform_bg_dominance_ratio"],
@@ -5266,6 +5370,16 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
                 model_name=model_name,
             )
             gate_metrics = _analyze_user_sku_candidate(original_png_bytes, candidate_product_bytes)
+            _log_debug_checkpoint(
+                "gemini_isolated_retry",
+                candidate_product_bytes,
+                extra_metrics={
+                    "mask_foreground_coverage_ratio": round(
+                        float(gate_metrics.get("foreground_area_ratio", 0.0)),
+                        6,
+                    )
+                },
+            )
             _ingest_log(
                 "vibode_user_sku_ingest_isolation_retry_completed",
                 artifact_retry_triggered=True,
@@ -5309,6 +5423,16 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
         product_cutout_png_bytes, product_solid_crop_png_bytes, product_stats = _extract_user_sku_product_crops(
             candidate_product_bytes
         )
+        _log_debug_checkpoint(
+            "masked_crop",
+            product_cutout_png_bytes,
+            extra_metrics={
+                "mask_foreground_coverage_ratio": round(
+                    float(product_stats.get("area_ratio", 0.0)),
+                    6,
+                )
+            },
+        )
     except Exception as e:
         failed_reason = f"product isolation failed: {str(e)[:160]}"
         failed_user_sku = VibodeUserSku(
@@ -5350,6 +5474,7 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
             error=f"Failed to normalize user SKU image: {str(e)[:160]}",
         )
         raise HTTPException(status_code=500, detail="Failed to normalize user SKU image.")
+    _log_debug_checkpoint("normalized_output", normalized_png_bytes)
 
     normalized_path = f"user-skus/{user_sku_id}/normalized.png"
     try:
