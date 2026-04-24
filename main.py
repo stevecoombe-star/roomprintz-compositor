@@ -84,6 +84,7 @@ ALLOW_FLASH_NON_SQUARE = os.getenv("ROOMPRINTZ_ALLOW_FLASH_NON_SQUARE", "1") == 
 USER_SKU_MAX_INPUT_BYTES = 12 * 1024 * 1024  # 12 MB
 USER_SKU_NORMALIZED_MAX_DIM = 1536
 USER_SKU_NORMALIZED_PADDING_RATIO = 0.03
+USER_SKU_FORCED_PREVIEW_BG_RGB = (237, 237, 237)
 USER_SKU_INGEST_TIMEOUT_SECONDS = 10.0
 SUPABASE_SIGNED_URL_TTL_SECONDS = 7 * 24 * 60 * 60
 SUPABASE_STORAGE_UPLOAD_TIMEOUT_SECONDS = 20.0
@@ -880,6 +881,7 @@ class VibodeUserSkuIngestRequest(BaseModel):
     imageUrl: Optional[str] = None
     imageBase64: Optional[str] = None
     label: Optional[str] = None
+    normalization: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
     def validate_image_input(self) -> "VibodeUserSkuIngestRequest":
@@ -1907,6 +1909,7 @@ def _normalize_user_sku_transparent_png(
     image_bytes: bytes,
     max_dimension: int = USER_SKU_NORMALIZED_MAX_DIM,
     padding_ratio: float = USER_SKU_NORMALIZED_PADDING_RATIO,
+    background_rgb: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[bytes, Tuple[int, int]]:
     with Image.open(io.BytesIO(image_bytes)) as img:
         rgba = img.convert("RGBA")
@@ -1946,6 +1949,11 @@ def _normalize_user_sku_transparent_png(
             ),
             resample=Image.LANCZOS,
         )
+
+    if background_rgb is not None:
+        flattened = Image.new("RGB", padded.size, background_rgb)
+        flattened.paste(padded, (0, 0), padded)
+        return image_to_png_bytes(flattened), flattened.size
 
     return image_to_png_bytes(padded), padded.size
 
@@ -2558,6 +2566,54 @@ def _env_truthy(var_name: str) -> bool:
     if not value:
         return False
     return value.strip().lower() in ("1", "true", "yes")
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+    return None
+
+
+def _extract_user_sku_preview_bg_override_flags(
+    ingest_req: VibodeUserSkuIngestRequest,
+    http_request: Request,
+) -> Dict[str, Any]:
+    normalization_block = ingest_req.normalization if isinstance(ingest_req.normalization, dict) else {}
+    header_bg_rgb = (http_request.headers.get("x-roomprintz-normalized-preview-bg-rgb") or "").strip()
+    header_bg_mode = (http_request.headers.get("x-roomprintz-normalized-preview-bg-mode") or "").strip()
+    body_bg_mode_raw = normalization_block.get("previewBackgroundMode")
+    body_bg_rgb_raw = normalization_block.get("previewBackgroundRgb")
+    body_bg_mode = body_bg_mode_raw.strip() if isinstance(body_bg_mode_raw, str) else ""
+    body_bg_rgb = body_bg_rgb_raw.strip() if isinstance(body_bg_rgb_raw, str) else ""
+    disable_sampled = _coerce_optional_bool(normalization_block.get("disableSampledBackground"))
+    disable_dominant = _coerce_optional_bool(normalization_block.get("disableDominantBackground"))
+
+    override_requested = any(
+        (
+            bool(header_bg_rgb),
+            bool(header_bg_mode),
+            bool(body_bg_mode),
+            bool(body_bg_rgb),
+            disable_sampled is True,
+            disable_dominant is True,
+        )
+    )
+
+    return {
+        "override_requested": override_requested,
+        "header_bg_rgb_present": bool(header_bg_rgb),
+        "header_bg_mode_present": bool(header_bg_mode),
+        "body_bg_mode_present": bool(body_bg_mode),
+        "body_bg_rgb_present": bool(body_bg_rgb),
+        "disable_sampled_background": disable_sampled,
+        "disable_dominant_background": disable_dominant,
+    }
 
 
 # Toggle full prompt logging for Vibode routes (off by default to avoid log spam)
@@ -5397,13 +5453,14 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
 
 
 @app.post("/api/vibode/user-skus/ingest", response_model=VibodeUserSkuIngestResponse)
-async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
+async def ingest_user_sku(ingest_req: VibodeUserSkuIngestRequest, http_request: Request):
     route = "/api/vibode/user-skus/ingest"
     started_at = time.perf_counter()
     user_sku_id = "user_" + uuid4().hex
     model_name = DEFAULT_MODEL_NAME
-    source_url = request.imageUrl.strip() if request.imageUrl and request.imageUrl.strip() else None
-    resolved_label = (request.label or "").strip() or "User Upload"
+    source_url = ingest_req.imageUrl.strip() if ingest_req.imageUrl and ingest_req.imageUrl.strip() else None
+    resolved_label = (ingest_req.label or "").strip() or "User Upload"
+    preview_bg_override_flags = _extract_user_sku_preview_bg_override_flags(ingest_req, http_request)
 
     def _duration_ms() -> int:
         return int((time.perf_counter() - started_at) * 1000)
@@ -5485,7 +5542,7 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
                 max_bytes=USER_SKU_MAX_INPUT_BYTES,
             )
         else:
-            source_bytes, source_hint_mime = _decode_base64_image_with_mime(request.imageBase64 or "")
+            source_bytes, source_hint_mime = _decode_base64_image_with_mime(ingest_req.imageBase64 or "")
     except Exception as e:
         _ingest_log(
             "vibode_user_sku_ingest_failed",
@@ -5707,24 +5764,42 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
     normalization_mode = "transparent_cutout"
     try:
         prefer_transparent = _has_transparency(product_cutout_png_bytes) and product_stats["fill_ratio"] < 0.98
+        forced_preview_bg = (
+            USER_SKU_FORCED_PREVIEW_BG_RGB
+            if preview_bg_override_flags["override_requested"]
+            else None
+        )
         if prefer_transparent:
             normalized_png_bytes, normalized_dims = _normalize_user_sku_transparent_png(
                 product_cutout_png_bytes,
                 max_dimension=USER_SKU_NORMALIZED_MAX_DIM,
                 padding_ratio=USER_SKU_NORMALIZED_PADDING_RATIO,
+                background_rgb=forced_preview_bg,
             )
-            normalization_mode = "transparent_cutout"
+            normalization_mode = (
+                "transparent_cutout_forced_preview_bg"
+                if forced_preview_bg is not None
+                else "transparent_cutout"
+            )
         else:
             with Image.open(io.BytesIO(product_solid_crop_png_bytes)) as solid_crop_img:
                 solid_crop_rgb = solid_crop_img.convert("RGB")
-            sampled_bg_rgb = _estimate_corner_background_rgb(solid_crop_rgb)
+            sampled_bg_rgb = (
+                USER_SKU_FORCED_PREVIEW_BG_RGB
+                if forced_preview_bg is not None
+                else _estimate_corner_background_rgb(solid_crop_rgb)
+            )
             normalized_png_bytes, normalized_dims = _normalize_user_sku_solid_bg_png(
                 product_solid_crop_png_bytes,
                 max_dimension=USER_SKU_NORMALIZED_MAX_DIM,
                 padding_ratio=USER_SKU_NORMALIZED_PADDING_RATIO,
                 bg_rgb=sampled_bg_rgb,
             )
-            normalization_mode = "solid_tight_crop"
+            normalization_mode = (
+                "solid_tight_crop_forced_preview_bg"
+                if forced_preview_bg is not None
+                else "solid_tight_crop"
+            )
     except Exception as e:
         _ingest_log(
             "vibode_user_sku_ingest_failed",
@@ -5758,6 +5833,13 @@ async def ingest_user_sku(request: VibodeUserSkuIngestRequest):
         output_width=normalized_dims[0],
         output_height=normalized_dims[1],
         output_variant_count=1,
+        normalization_mode=normalization_mode,
+        forced_preview_bg_rgb=(
+            list(USER_SKU_FORCED_PREVIEW_BG_RGB)
+            if preview_bg_override_flags["override_requested"]
+            else None
+        ),
+        preview_bg_override_flags=preview_bg_override_flags,
         status="completed",
     )
     _ingest_log(
