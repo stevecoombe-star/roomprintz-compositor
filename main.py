@@ -259,6 +259,29 @@ def _extract_operation_id_from_job_id(scope_id: str, job_id: str) -> Optional[in
         return None
 
 
+def _snapshot_paste_to_place_scope_state(scope_id: str, job_id: Optional[str] = None) -> Dict[str, Any]:
+    _cleanup_expired_paste_to_place_scopes()
+    scope_state = _PASTE_TO_PLACE_JOBS_BY_SCOPE.get(scope_id)
+    if not scope_state:
+        return {
+            "exists": False,
+            "latestJobId": None,
+            "latestOperationId": None,
+            "cancelledCount": 0,
+            "jobIsCancelled": False if job_id else None,
+        }
+    cancelled_job_ids = scope_state.get("cancelledJobIds", set())
+    if not isinstance(cancelled_job_ids, set):
+        cancelled_job_ids = set(cancelled_job_ids or [])
+    return {
+        "exists": True,
+        "latestJobId": scope_state.get("latestJobId"),
+        "latestOperationId": scope_state.get("latestOperationId"),
+        "cancelledCount": len(cancelled_job_ids),
+        "jobIsCancelled": (job_id in cancelled_job_ids) if job_id else None,
+    }
+
+
 def mark_latest(scope_id: str, job_id: str) -> None:
     _cleanup_expired_paste_to_place_scopes()
     scope_state = _PASTE_TO_PLACE_JOBS_BY_SCOPE.setdefault(
@@ -306,12 +329,40 @@ def get_state(scope_id: str, job_id: str) -> Literal["active", "stale", "cancell
     return "active"
 
 
-def _extract_paste_to_place_control(request: Request) -> Optional[Dict[str, str]]:
+def _extract_paste_to_place_control(
+    request: Request,
+    route: str,
+    *,
+    log_missing_headers: bool = False,
+) -> Optional[Dict[str, str]]:
     job_id = (request.headers.get(PASTE_TO_PLACE_JOB_ID_HEADER) or "").strip()
     scope_id = (request.headers.get(PASTE_TO_PLACE_SCOPE_ID_HEADER) or "").strip()
     if not job_id or not scope_id:
+        if log_missing_headers:
+            log_event(
+                "paste_to_place_headers_missing",
+                route=route,
+                has_scope_id_header=bool(scope_id),
+                has_job_id_header=bool(job_id),
+            )
         return None
+    operation_id = _extract_operation_id_from_job_id(scope_id, job_id)
+    before_mark_latest = _snapshot_paste_to_place_scope_state(scope_id, job_id)
     mark_latest(scope_id, job_id)
+    after_mark_latest = _snapshot_paste_to_place_scope_state(scope_id, job_id)
+    state_after_mark_latest = get_state(scope_id, job_id)
+    log_event(
+        "paste_to_place_request_arrived",
+        route=route,
+        scope_id=scope_id,
+        job_id=job_id,
+        parsed_operation_id=operation_id,
+        latest_job_id_before=before_mark_latest["latestJobId"],
+        latest_operation_id_before=before_mark_latest["latestOperationId"],
+        latest_job_id_after=after_mark_latest["latestJobId"],
+        latest_operation_id_after=after_mark_latest["latestOperationId"],
+        state_after_mark_latest=state_after_mark_latest,
+    )
     return {"scopeId": scope_id, "jobId": job_id}
 
 
@@ -325,6 +376,14 @@ def _ensure_paste_to_place_job_active(
     scope_id = control["scopeId"]
     job_id = control["jobId"]
     state = get_state(scope_id, job_id)
+    log_event(
+        "paste_to_place_checkpoint",
+        route=route,
+        checkpoint=checkpoint,
+        scope_id=scope_id,
+        job_id=job_id,
+        state=state,
+    )
     if state not in ("stale", "cancelled"):
         return None
     log_event(
@@ -4351,7 +4410,24 @@ async def cancel_paste_to_place_job(req: PasteToPlaceCancelRequest):
     job_id = (req.jobId or "").strip()
     if not scope_id or not job_id:
         raise HTTPException(status_code=400, detail="scopeId and jobId are required.")
+    operation_id = _extract_operation_id_from_job_id(scope_id, job_id)
+    state_before_cancel = _snapshot_paste_to_place_scope_state(scope_id, job_id)
+    log_event(
+        "paste_to_place_cancel_request",
+        scope_id=scope_id,
+        job_id=job_id,
+        parsed_operation_id=operation_id,
+        registry_state_before_cancel=state_before_cancel,
+    )
     mark_cancelled(scope_id, job_id)
+    state_after_cancel = _snapshot_paste_to_place_scope_state(scope_id, job_id)
+    log_event(
+        "paste_to_place_cancel_marked",
+        scope_id=scope_id,
+        job_id=job_id,
+        parsed_operation_id=operation_id,
+        registry_state_after_cancel=state_after_cancel,
+    )
     return {"ok": True}
 
 
@@ -4794,7 +4870,14 @@ async def vibode_full_vibe(req: VibodeFreezeRequest):
 @app.post("/api/vibode/stage-run", response_model=VibodeComposeResponse)
 async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
     route = "/api/vibode/stage-run"
-    paste_to_place_control = _extract_paste_to_place_control(http_request)
+    paste_to_place_control = _extract_paste_to_place_control(
+        http_request,
+        route,
+        log_missing_headers=True,
+    )
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "arrival_post_mark_latest")
+    if early_exit:
+        return early_exit
     _reject_if_vibode_strict_missing(
         route,
         _collect_vibode_stage_run_missing_fields(req),
@@ -5054,6 +5137,9 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
         return early_exit
     try:
         if req.stage == 3:
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "before_provider_call")
+            if early_exit:
+                return early_exit
             out_bytes = call_gemini_multimodal(
                 prompt=prompt,
                 room_png_bytes=room_png_bytes,
@@ -5063,6 +5149,9 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
                 aspect_ratio=aspect_ratio_to_send,
             )
         else:
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "before_provider_call")
+            if early_exit:
+                return early_exit
             out_bytes = call_gemini_with_prompt(
                 image_png_bytes=room_png_bytes,
                 prompt=prompt,
@@ -5091,7 +5180,14 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
 @app.post("/api/vibode/edit-run", response_model=VibodeEditRunResponse)
 async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
     route = "/api/vibode/edit-run"
-    paste_to_place_control = _extract_paste_to_place_control(http_request)
+    paste_to_place_control = _extract_paste_to_place_control(
+        http_request,
+        route,
+        log_missing_headers=True,
+    )
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "arrival_post_mark_latest")
+    if early_exit:
+        return early_exit
     # v1 targeting is text-only using normalized bbox coordinates; this can be upgraded to mask/overlay targeting later.
     action = req.action
     params = req.params or {}
@@ -5581,8 +5677,14 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
                 gemini_multimodal_kwargs["room_overlay_png_bytes"] = room_overlay_png_bytes
             if "aspect_ratio" in gemini_multimodal_sig.parameters:
                 gemini_multimodal_kwargs["aspect_ratio"] = aspect_ratio_to_send
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "before_provider_call")
+            if early_exit:
+                return early_exit
             out_bytes = call_gemini_multimodal(**gemini_multimodal_kwargs)
         else:
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "before_provider_call")
+            if early_exit:
+                return early_exit
             out_bytes = call_gemini_with_prompt(
                 image_png_bytes=room_png_bytes,
                 prompt=prompt,
@@ -6154,7 +6256,7 @@ async def vibode_remove(req: VibodeRemoveRequest):
 @app.post("/vibode/swap", response_model=VibodeSwapResponse)
 async def vibode_swap(req: VibodeSwapRequest, http_request: Request):
     route = "/vibode/swap"
-    paste_to_place_control = _extract_paste_to_place_control(http_request)
+    paste_to_place_control = _extract_paste_to_place_control(http_request, route)
     _reject_if_vibode_strict_missing(route, _collect_vibode_swap_missing_fields(req))
 
     if not req.cleanBase64 or not req.cleanBase64.strip():
