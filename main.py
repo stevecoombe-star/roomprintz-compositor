@@ -225,6 +225,185 @@ def log_event(event: str, **fields: Any) -> None:
     print("[roomprintz]", " ".join(parts))
 
 
+PASTE_TO_PLACE_JOB_ID_HEADER = "x-vibode-paste-to-place-job-id"
+PASTE_TO_PLACE_SCOPE_ID_HEADER = "x-vibode-paste-to-place-scope-id"
+PASTE_TO_PLACE_CANCELLED_CODE = "PASTE_TO_PLACE_CANCELLED"
+PASTE_TO_PLACE_JOB_TTL_SECONDS = 10 * 60
+PASTE_TO_PLACE_MAX_CANCELLED_IDS_PER_SCOPE = 128
+# Best-effort in-memory cancellation; it may not stop an already-started
+# provider generation request. Full provider request abort is a future pass.
+_PASTE_TO_PLACE_JOBS_BY_SCOPE: Dict[str, Dict[str, Any]] = {}
+
+
+def _cleanup_expired_paste_to_place_scopes(now: Optional[float] = None) -> None:
+    now_ts = time.time() if now is None else now
+    expired_scope_ids = [
+        scope_id
+        for scope_id, state in _PASTE_TO_PLACE_JOBS_BY_SCOPE.items()
+        if now_ts - float(state.get("updatedAt") or 0) > PASTE_TO_PLACE_JOB_TTL_SECONDS
+    ]
+    for scope_id in expired_scope_ids:
+        _PASTE_TO_PLACE_JOBS_BY_SCOPE.pop(scope_id, None)
+
+
+def _extract_operation_id_from_job_id(scope_id: str, job_id: str) -> Optional[int]:
+    prefix = f"{scope_id}:"
+    if not job_id.startswith(prefix):
+        return None
+    operation_id = job_id[len(prefix) :].strip()
+    if not operation_id:
+        return None
+    try:
+        return int(operation_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_paste_to_place_scope_state(scope_id: str, job_id: Optional[str] = None) -> Dict[str, Any]:
+    _cleanup_expired_paste_to_place_scopes()
+    scope_state = _PASTE_TO_PLACE_JOBS_BY_SCOPE.get(scope_id)
+    if not scope_state:
+        return {
+            "exists": False,
+            "latestJobId": None,
+            "latestOperationId": None,
+            "cancelledCount": 0,
+            "jobIsCancelled": False if job_id else None,
+        }
+    cancelled_job_ids = scope_state.get("cancelledJobIds", set())
+    if not isinstance(cancelled_job_ids, set):
+        cancelled_job_ids = set(cancelled_job_ids or [])
+    return {
+        "exists": True,
+        "latestJobId": scope_state.get("latestJobId"),
+        "latestOperationId": scope_state.get("latestOperationId"),
+        "cancelledCount": len(cancelled_job_ids),
+        "jobIsCancelled": (job_id in cancelled_job_ids) if job_id else None,
+    }
+
+
+def mark_latest(scope_id: str, job_id: str) -> None:
+    _cleanup_expired_paste_to_place_scopes()
+    scope_state = _PASTE_TO_PLACE_JOBS_BY_SCOPE.setdefault(
+        scope_id,
+        {"latestJobId": None, "latestOperationId": None, "cancelledJobIds": set(), "updatedAt": time.time()},
+    )
+    operation_id = _extract_operation_id_from_job_id(scope_id, job_id)
+    latest_operation_id = scope_state.get("latestOperationId")
+    # Keep latest monotonic because older queued jobs may arrive after newer ones.
+    if operation_id is not None and (latest_operation_id is None or operation_id >= latest_operation_id):
+        scope_state["latestJobId"] = job_id
+        scope_state["latestOperationId"] = operation_id
+    elif operation_id is None:
+        scope_state["latestJobId"] = job_id
+    scope_state["updatedAt"] = time.time()
+
+
+def mark_cancelled(scope_id: str, job_id: str) -> None:
+    _cleanup_expired_paste_to_place_scopes()
+    scope_state = _PASTE_TO_PLACE_JOBS_BY_SCOPE.setdefault(
+        scope_id,
+        {"latestJobId": None, "latestOperationId": None, "cancelledJobIds": set(), "updatedAt": time.time()},
+    )
+    cancelled_job_ids = scope_state.setdefault("cancelledJobIds", set())
+    cancelled_job_ids.add(job_id)
+    while len(cancelled_job_ids) > PASTE_TO_PLACE_MAX_CANCELLED_IDS_PER_SCOPE:
+        removable_job_ids = [cancelled_id for cancelled_id in cancelled_job_ids if cancelled_id != job_id]
+        cancelled_job_ids.remove(removable_job_ids[0] if removable_job_ids else next(iter(cancelled_job_ids)))
+    scope_state["updatedAt"] = time.time()
+
+
+def get_state(scope_id: str, job_id: str) -> Literal["active", "stale", "cancelled", "unknown"]:
+    _cleanup_expired_paste_to_place_scopes()
+    scope_state = _PASTE_TO_PLACE_JOBS_BY_SCOPE.get(scope_id)
+    if not scope_state:
+        return "unknown"
+    scope_state["updatedAt"] = time.time()
+    if job_id in scope_state.get("cancelledJobIds", set()):
+        return "cancelled"
+    latest_job_id = scope_state.get("latestJobId")
+    if not latest_job_id:
+        return "unknown"
+    if latest_job_id != job_id:
+        return "stale"
+    return "active"
+
+
+def _extract_paste_to_place_control(
+    request: Request,
+    route: str,
+    *,
+    log_missing_headers: bool = False,
+) -> Optional[Dict[str, str]]:
+    job_id = (request.headers.get(PASTE_TO_PLACE_JOB_ID_HEADER) or "").strip()
+    scope_id = (request.headers.get(PASTE_TO_PLACE_SCOPE_ID_HEADER) or "").strip()
+    if not job_id or not scope_id:
+        if log_missing_headers:
+            log_event(
+                "paste_to_place_headers_missing",
+                route=route,
+                has_scope_id_header=bool(scope_id),
+                has_job_id_header=bool(job_id),
+            )
+        return None
+    operation_id = _extract_operation_id_from_job_id(scope_id, job_id)
+    before_mark_latest = _snapshot_paste_to_place_scope_state(scope_id, job_id)
+    mark_latest(scope_id, job_id)
+    after_mark_latest = _snapshot_paste_to_place_scope_state(scope_id, job_id)
+    state_after_mark_latest = get_state(scope_id, job_id)
+    log_event(
+        "paste_to_place_request_arrived",
+        route=route,
+        scope_id=scope_id,
+        job_id=job_id,
+        parsed_operation_id=operation_id,
+        latest_job_id_before=before_mark_latest["latestJobId"],
+        latest_operation_id_before=before_mark_latest["latestOperationId"],
+        latest_job_id_after=after_mark_latest["latestJobId"],
+        latest_operation_id_after=after_mark_latest["latestOperationId"],
+        state_after_mark_latest=state_after_mark_latest,
+    )
+    return {"scopeId": scope_id, "jobId": job_id}
+
+
+def _ensure_paste_to_place_job_active(
+    control: Optional[Dict[str, str]],
+    route: str,
+    checkpoint: str,
+) -> Optional[JSONResponse]:
+    if not control:
+        return None
+    scope_id = control["scopeId"]
+    job_id = control["jobId"]
+    state = get_state(scope_id, job_id)
+    log_event(
+        "paste_to_place_checkpoint",
+        route=route,
+        checkpoint=checkpoint,
+        scope_id=scope_id,
+        job_id=job_id,
+        state=state,
+    )
+    if state not in ("stale", "cancelled"):
+        return None
+    log_event(
+        "paste_to_place_job_early_exit",
+        route=route,
+        checkpoint=checkpoint,
+        scope_id=scope_id,
+        job_id=job_id,
+        state=state,
+    )
+    return JSONResponse(
+        status_code=409,
+        content={
+            "code": PASTE_TO_PLACE_CANCELLED_CODE,
+            "cancelled": True,
+            "reason": state,
+        },
+    )
+
+
 def resolve_model_name_for_route(route: str, model_version: Optional[str]) -> str:
     model_name = resolve_model_name(model_version)
     log_event(
@@ -636,6 +815,11 @@ async def add_request_id_middleware(request: Request, call_next):
 
 class HealthResponse(BaseModel):
     status: str
+
+
+class PasteToPlaceCancelRequest(BaseModel):
+    scopeId: str
+    jobId: str
 
 
 class StageRoomRequest(BaseModel):
@@ -4220,6 +4404,33 @@ async def health_check():
     return HealthResponse(status="ok")
 
 
+@app.post("/api/vibode/paste-to-place/cancel")
+async def cancel_paste_to_place_job(req: PasteToPlaceCancelRequest):
+    scope_id = (req.scopeId or "").strip()
+    job_id = (req.jobId or "").strip()
+    if not scope_id or not job_id:
+        raise HTTPException(status_code=400, detail="scopeId and jobId are required.")
+    operation_id = _extract_operation_id_from_job_id(scope_id, job_id)
+    state_before_cancel = _snapshot_paste_to_place_scope_state(scope_id, job_id)
+    log_event(
+        "paste_to_place_cancel_request",
+        scope_id=scope_id,
+        job_id=job_id,
+        parsed_operation_id=operation_id,
+        registry_state_before_cancel=state_before_cancel,
+    )
+    mark_cancelled(scope_id, job_id)
+    state_after_cancel = _snapshot_paste_to_place_scope_state(scope_id, job_id)
+    log_event(
+        "paste_to_place_cancel_marked",
+        scope_id=scope_id,
+        job_id=job_id,
+        parsed_operation_id=operation_id,
+        registry_state_after_cancel=state_after_cancel,
+    )
+    return {"ok": True}
+
+
 @app.post("/stage-room", response_model=StageRoomResponse)
 async def stage_room(req: StageRoomRequest):
     wants_photo_tools = (
@@ -4657,14 +4868,26 @@ async def vibode_full_vibe(req: VibodeFreezeRequest):
 
 
 @app.post("/api/vibode/stage-run", response_model=VibodeComposeResponse)
-async def vibode_stage_run(req: VibodeStageRunRequest):
+async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
+    route = "/api/vibode/stage-run"
+    paste_to_place_control = _extract_paste_to_place_control(
+        http_request,
+        route,
+        log_missing_headers=True,
+    )
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "arrival_post_mark_latest")
+    if early_exit:
+        return early_exit
     _reject_if_vibode_strict_missing(
-        "/api/vibode/stage-run",
+        route,
         _collect_vibode_stage_run_missing_fields(req),
     )
 
-    model_name = resolve_model_name_for_route("/api/vibode/stage-run", req.modelVersion)
+    model_name = resolve_model_name_for_route(route, req.modelVersion)
 
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "base_image_resolve")
+    if early_exit:
+        return early_exit
     try:
         room_raw_bytes = _resolve_vibode_stage_run_room_raw_bytes(req)
     except HTTPException:
@@ -4685,6 +4908,9 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
     # Do NOT omit aspect_ratio for continuation or edit flows, otherwise
     # Gemini will return square (1:1) outputs.
     is_continuation = bool(req.isContinuation)
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "room_prepare")
+    if early_exit:
+        return early_exit
     try:
         if is_continuation:
             room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
@@ -4757,6 +4983,9 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
         catalog_skus = [sku for sku in eligible_skus if not _is_user_sku(sku)]
         selected_skus = (user_skus + catalog_skus)[:target_count]
         for idx, sku in enumerate(selected_skus):
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "sku_prepare")
+            if early_exit:
+                return early_exit
             image_ref: Optional[str] = None
 
             resolver = globals().get("resolveIkeaSkuImageUrl") or globals().get("resolve_ikea_sku_image_url")
@@ -4903,8 +5132,14 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
             print(prompt)
             print("[/api/vibode/stage-run][stage3-debug] full Stage 3 prompt text (exact) END")
 
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "model_call")
+    if early_exit:
+        return early_exit
     try:
         if req.stage == 3:
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "before_provider_call")
+            if early_exit:
+                return early_exit
             out_bytes = call_gemini_multimodal(
                 prompt=prompt,
                 room_png_bytes=room_png_bytes,
@@ -4914,6 +5149,9 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
                 aspect_ratio=aspect_ratio_to_send,
             )
         else:
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "before_provider_call")
+            if early_exit:
+                return early_exit
             out_bytes = call_gemini_with_prompt(
                 image_png_bytes=room_png_bytes,
                 prompt=prompt,
@@ -4927,6 +5165,9 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
     if not out_bytes:
         raise HTTPException(status_code=500, detail="Stage run returned empty image")
 
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "final_response")
+    if early_exit:
+        return early_exit
     data_url = make_data_url(out_bytes, mime_type="image/png")
 
     debug_ratio: Optional[str] = None
@@ -4937,7 +5178,16 @@ async def vibode_stage_run(req: VibodeStageRunRequest):
 
 
 @app.post("/api/vibode/edit-run", response_model=VibodeEditRunResponse)
-async def vibode_edit_run(req: VibodeEditRunRequest):
+async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
+    route = "/api/vibode/edit-run"
+    paste_to_place_control = _extract_paste_to_place_control(
+        http_request,
+        route,
+        log_missing_headers=True,
+    )
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "arrival_post_mark_latest")
+    if early_exit:
+        return early_exit
     # v1 targeting is text-only using normalized bbox coordinates; this can be upgraded to mask/overlay targeting later.
     action = req.action
     params = req.params or {}
@@ -4947,13 +5197,16 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         return _vibode_edit_run_error(400, "baseImageUrl is required.")
 
     base_image_url_kind = "data-url" if req.baseImageUrl.strip().startswith("data:image/") else "remote-url"
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "base_image_fetch")
+    if early_exit:
+        return early_exit
     try:
         print("[/api/vibode/edit-run] baseImageUrl kind:", base_image_url_kind)
         room_raw_bytes = _load_image_ref_bytes(req.baseImageUrl.strip())
     except Exception:
         return _vibode_edit_run_error(400, "Failed to fetch baseImageUrl image data.")
 
-    model_name = resolve_model_name_for_route("/api/vibode/edit-run", req.modelVersion)
+    model_name = resolve_model_name_for_route(route, req.modelVersion)
     # IMPORTANT:
     # Gemini image generation defaults to 1:1 when `image_config.aspect_ratio`
     # is omitted from the request. For Vibode continuation flows we preserve
@@ -4963,6 +5216,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
     #
     # Do NOT omit aspect_ratio for continuation or edit flows, otherwise
     # Gemini will return square (1:1) outputs.
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "room_prepare")
+    if early_exit:
+        return early_exit
     try:
         room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
         source_w, source_h = _safe_open_image(room_raw_bytes).size
@@ -5018,6 +5274,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         if not sku_image_ref:
             return _vibode_edit_run_error(400, f"eligibleSkus skuId={target_sku_id} is missing variants[].imageUrl.")
 
+        early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "sku_prepare")
+        if early_exit:
+            return early_exit
         try:
             sku_raw_bytes = _load_image_ref_bytes(sku_image_ref)
             sku_png_bytes_list = [_convert_image_bytes_to_png(sku_raw_bytes)]
@@ -5205,6 +5464,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         if not sku_image_ref:
             return _vibode_edit_run_error(400, f"eligibleSkus skuId={new_sku_id} is missing variants[].imageUrl.")
 
+        early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "sku_prepare")
+        if early_exit:
+            return early_exit
         try:
             sku_raw_bytes = _load_image_ref_bytes(sku_image_ref)
             sku_png_bytes_list = [_convert_image_bytes_to_png(sku_raw_bytes)]
@@ -5399,6 +5661,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         prompt=prompt,
         sku_images_count=len(sku_png_bytes_list) if action in ("add", "swap") else None,
     )
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "model_call")
+    if early_exit:
+        return early_exit
     try:
         if action in ("add", "swap"):
             gemini_multimodal_sig = inspect.signature(call_gemini_multimodal)
@@ -5412,8 +5677,14 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
                 gemini_multimodal_kwargs["room_overlay_png_bytes"] = room_overlay_png_bytes
             if "aspect_ratio" in gemini_multimodal_sig.parameters:
                 gemini_multimodal_kwargs["aspect_ratio"] = aspect_ratio_to_send
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "before_provider_call")
+            if early_exit:
+                return early_exit
             out_bytes = call_gemini_multimodal(**gemini_multimodal_kwargs)
         else:
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "before_provider_call")
+            if early_exit:
+                return early_exit
             out_bytes = call_gemini_with_prompt(
                 image_png_bytes=room_png_bytes,
                 prompt=prompt,
@@ -5427,6 +5698,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
     print(f"[/api/vibode/edit-run] output bytes={len(out_bytes) if out_bytes else 0}")
     if not out_bytes:
         return _vibode_edit_run_error(500, "Edit run returned empty image.")
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "output_prepare")
+    if early_exit:
+        return early_exit
     try:
         if _infer_image_mime_type(out_bytes) != "image/png":
             out_bytes = _convert_image_bytes_to_png(out_bytes)
@@ -5437,6 +5711,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
     scene_folder = _sanitize_storage_segment(req.sceneId, uuid4().hex)
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
     output_path = f"vibode-edits/{scene_folder}/{timestamp}_{action}.png"
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "upload")
+    if early_exit:
+        return early_exit
     try:
         _supabase_storage_upload_bytes(
             object_path=output_path,
@@ -5449,6 +5726,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest):
         return _vibode_edit_run_error(500, "Failed to upload edited image.")
 
     print(f"[/api/vibode/edit-run] uploaded path={output_path}")
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "final_response")
+    if early_exit:
+        return early_exit
     return VibodeEditRunResponse(imageUrl=signed_url, placements=updated_placements)
 
 
@@ -5974,8 +6254,10 @@ async def vibode_remove(req: VibodeRemoveRequest):
     return VibodeComposeResponse(imageUrl=data_url, appliedAspectRatio=debug_ratio)
 
 @app.post("/vibode/swap", response_model=VibodeSwapResponse)
-async def vibode_swap(req: VibodeSwapRequest):
-    _reject_if_vibode_strict_missing("/vibode/swap", _collect_vibode_swap_missing_fields(req))
+async def vibode_swap(req: VibodeSwapRequest, http_request: Request):
+    route = "/vibode/swap"
+    paste_to_place_control = _extract_paste_to_place_control(http_request, route)
+    _reject_if_vibode_strict_missing(route, _collect_vibode_swap_missing_fields(req))
 
     if not req.cleanBase64 or not req.cleanBase64.strip():
         raise HTTPException(status_code=400, detail="cleanBase64 is required.")
@@ -6011,10 +6293,13 @@ async def vibode_swap(req: VibodeSwapRequest):
                 detail=f"replacementAssets[{idx}].imageUrl is required.",
             )
 
-    model_name = resolve_model_name_for_route("/vibode/swap", req.modelVersion)
+    model_name = resolve_model_name_for_route(route, req.modelVersion)
     marks_ordered = list(req.marks)  # Preserve request order: marker index -> replacement index.
     mapped_replacements = req.replacementAssets[: len(marks_ordered)]
 
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "base_image_decode")
+    if early_exit:
+        return early_exit
     try:
         room_raw_bytes = _decode_base64_image(req.cleanBase64)
     except Exception:
@@ -6029,6 +6314,9 @@ async def vibode_swap(req: VibodeSwapRequest):
 
     applied_ratio: Optional[str] = None
     aspect_ratio_to_send: Optional[str] = None
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "room_prepare")
+    if early_exit:
+        return early_exit
     try:
         log_continuation_aspect_ratio_omitted("/vibode/swap")
         room_png_bytes = prepare_passthrough_png_bytes(room_raw_bytes)
@@ -6051,6 +6339,9 @@ async def vibode_swap(req: VibodeSwapRequest):
         resized_size=(new_w, new_h),
     )
 
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "overlay_prepare")
+    if early_exit:
+        return early_exit
     try:
         room_overlay_png_bytes = render_vibode_swap_overlay(room_png_bytes, marks_for_overlay)
     except Exception as e:
@@ -6065,6 +6356,9 @@ async def vibode_swap(req: VibodeSwapRequest):
     replacement_png_bytes_list: List[bytes] = []
     try:
         for asset in mapped_replacements:
+            early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "replacement_prepare")
+            if early_exit:
+                return early_exit
             replacement_raw_bytes = _fetch_image_bytes_from_url(asset.imageUrl)
             replacement_png_bytes_list.append(prepare_sku_png_bytes(replacement_raw_bytes))
     except Exception as e:
@@ -6104,6 +6398,9 @@ async def vibode_swap(req: VibodeSwapRequest):
         print(VIBODE_SWAP_PROMPT)
         print("\n==============================================\n")
 
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "model_call")
+    if early_exit:
+        return early_exit
     try:
         out_bytes = call_gemini_multimodal(
             prompt=VIBODE_SWAP_PROMPT,
@@ -6120,6 +6417,9 @@ async def vibode_swap(req: VibodeSwapRequest):
     if not out_bytes:
         raise HTTPException(status_code=500, detail="Swap returned empty image")
 
+    early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "final_response")
+    if early_exit:
+        return early_exit
     data_url = make_data_url(out_bytes, mime_type="image/png")
     return VibodeSwapResponse(imageUrl=data_url)
 
