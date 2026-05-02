@@ -4068,6 +4068,15 @@ def _remove_target_area_list_prompt_snippet(targets: List[ScenePlacementBbox]) -
     return f"Exact normalized removal target point(s): {centers}."
 
 
+def _normalize_remove_label(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text or text == "object":
+        return None
+    return text
+
+
 def build_vibode_edit_run_prompt(
     action: Literal["add", "remove", "swap", "rotate"],
     target_placement: Optional[ScenePlacement],
@@ -4129,38 +4138,79 @@ def build_vibode_edit_run_prompt(
             ]
         )
     elif action == "remove":
+        remove_label = _normalize_remove_label(params.get("removeLabel"))
+        remove_instruction = str(params.get("instruction") or "").strip()
+        remove_prompt_override = str(params.get("prompt") or "").strip()
+        has_remove_instruction = bool(remove_instruction or remove_prompt_override)
+        remove_detail_line = remove_instruction or remove_prompt_override
         if remove_target_bboxes:
-            lines.extend(
-                [
-                    "Task: Perform precise, coordinate-first object removal at the target point(s).",
-                    "For each target point, treat it independently and use a tight spatial radius around the exact coordinate to identify only the single foreground object or object region centered there.",
-                    "When overlap is ambiguous, select only the centered foreground object or object region nearest that target point.",
-                    "Remove only that one object or object region per provided target point.",
-                    "Keep each edit bounded to the minimum area required to remove the target cleanly.",
-                    "Preserve all surrounding objects, furniture, walls, layout, and overall scene composition.",
-                    "Do not reposition, restyle, alter, improve, or otherwise change any non-target content.",
-                    "Reconstruct the removed area naturally from nearby visual context.",
-                    "Match original lighting, perspective, shadows, and textures.",
-                    "Do not infer broader user intent, do not remove additional objects, and do not introduce new objects or design changes.",
-                    "If no clear removable object exists exactly at a target coordinate, prefer no meaningful change rather than a broad or speculative edit.",
-                ]
-            )
+            if remove_label:
+                lines.extend(
+                    [
+                        f"Task: Remove only the {remove_label} located at the target point(s).",
+                        f"Use the normalized target coordinate(s) to identify which {remove_label} is intended.",
+                        f"Remove the full visible {remove_label} as a coherent object, including connected parts and contact shadows, not merely a small patch around a coordinate.",
+                        "Keep each edit bounded to only that targeted object and its contact shadows.",
+                        "Preserve all surrounding objects, furniture, walls, layout, and overall scene composition.",
+                        "Do not reposition, restyle, alter, improve, or otherwise change any non-target content.",
+                        "Reconstruct the removed area naturally from nearby visual context.",
+                        "Match original lighting, perspective, shadows, and textures.",
+                        "Do not infer broader user intent, do not remove additional objects, and do not introduce new objects or design changes.",
+                        "If no clear matching target object exists at a target coordinate, prefer no meaningful change rather than a broad or speculative edit.",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "Task: Perform precise, coordinate-first object removal at the target point(s).",
+                        "For each target point, treat it independently and use the coordinate to identify only the single foreground object centered there.",
+                        "When overlap is ambiguous, select only the centered foreground object nearest that target point.",
+                        "Remove only that one object per provided target point.",
+                        "Keep each edit bounded to the minimum area required to remove the target cleanly.",
+                        "Preserve all surrounding objects, furniture, walls, layout, and overall scene composition.",
+                        "Do not reposition, restyle, alter, improve, or otherwise change any non-target content.",
+                        "Reconstruct the removed area naturally from nearby visual context.",
+                        "Match original lighting, perspective, shadows, and textures.",
+                        "Do not infer broader user intent, do not remove additional objects, and do not introduce new objects or design changes.",
+                        "If no clear removable object exists exactly at a target coordinate, prefer no meaningful change rather than a broad or speculative edit.",
+                    ]
+                )
+            if has_remove_instruction:
+                lines.append(f"Additional user remove instruction: {remove_detail_line}")
         else:
-            lines.extend(
-                [
-                    "Task: Perform precise, coordinate-first object removal at the exact user-selected point.",
-                    "Use a tight spatial radius around that coordinate to identify only the single foreground object or object region centered there.",
-                    "When overlap is ambiguous, select only the centered foreground object or object region nearest that coordinate.",
-                    "Remove only that single object or object region at the target location.",
-                    "Keep the edit bounded to the minimum area required to remove the target cleanly.",
-                    "Preserve all surrounding objects, furniture, walls, layout, and overall scene composition.",
-                    "Do not reposition, restyle, alter, improve, or otherwise change any non-target content.",
-                    "Reconstruct the removed area naturally from nearby visual context.",
-                    "Match original lighting, perspective, shadows, and textures.",
-                    "Do not infer broader user intent, do not remove additional objects, and do not introduce new objects or design changes.",
-                    "If no clear removable object exists at the coordinate, prefer no meaningful change rather than a broad or speculative edit.",
-                ]
-            )
+            if remove_label:
+                lines.extend(
+                    [
+                        f"Task: Remove only the {remove_label} located at the exact user-selected point.",
+                        f"Use the normalized target coordinate to identify which {remove_label} is intended.",
+                        f"Remove the full visible {remove_label} as a coherent object, including connected parts and contact shadows, not merely a small patch around the coordinate.",
+                        "Keep the edit bounded to only that targeted object and its contact shadows.",
+                        "Preserve all surrounding objects, furniture, walls, layout, and overall scene composition.",
+                        "Do not reposition, restyle, alter, improve, or otherwise change any non-target content.",
+                        "Reconstruct the removed area naturally from nearby visual context.",
+                        "Match original lighting, perspective, shadows, and textures.",
+                        "Do not infer broader user intent, do not remove additional objects, and do not introduce new objects or design changes.",
+                        "If no clear matching target object exists at the coordinate, prefer no meaningful change rather than a broad or speculative edit.",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "Task: Perform precise, coordinate-first object removal at the exact user-selected point.",
+                        "Use the coordinate to identify only the single foreground object centered there.",
+                        "When overlap is ambiguous, select only the centered foreground object nearest that coordinate.",
+                        "Remove only that single object at the target location.",
+                        "Keep the edit bounded to the minimum area required to remove the target cleanly.",
+                        "Preserve all surrounding objects, furniture, walls, layout, and overall scene composition.",
+                        "Do not reposition, restyle, alter, improve, or otherwise change any non-target content.",
+                        "Reconstruct the removed area naturally from nearby visual context.",
+                        "Match original lighting, perspective, shadows, and textures.",
+                        "Do not infer broader user intent, do not remove additional objects, and do not introduce new objects or design changes.",
+                        "If no clear removable object exists at the coordinate, prefer no meaningful change rather than a broad or speculative edit.",
+                    ]
+                )
+            if has_remove_instruction:
+                lines.append(f"Additional user remove instruction: {remove_detail_line}")
     elif action == "swap":
         lines.extend(
             [
@@ -4262,6 +4312,13 @@ def _debug_log_vibode_edit_run(
         remove_targets = params.get("removeTargets")
         remove_targets_count = len(remove_targets) if isinstance(remove_targets, list) else 0
         print(f"  remove_targets={remove_targets_count}")
+    if action == "remove":
+        remove_label = _normalize_remove_label(params.get("removeLabel"))
+        print(f"  remove_label={remove_label if remove_label else '(generic-object)'}")
+        has_remove_instruction = bool(
+            str(params.get("instruction") or "").strip() or str(params.get("prompt") or "").strip()
+        )
+        print(f"  remove_instruction_present={'yes' if has_remove_instruction else 'no'}")
     if target_bbox:
         print(
             "  bbox="
