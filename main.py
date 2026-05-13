@@ -75,6 +75,7 @@ MAX_INPUT_LONG_EDGE = os.getenv("ROOMPRINTZ_MAX_INPUT_LONG_EDGE", "2048").strip(
 MAX_INPUT_LONG_EDGE_INT = (
     int(MAX_INPUT_LONG_EDGE) if MAX_INPUT_LONG_EDGE.isdigit() else None
 )
+STAGE_ROOM_MAX_REFERENCE_IMAGES = 8
 
 # ✅ CHANGE: beta testing wants ALL ratios for Gemini 2.5 Flash.
 # We keep the env var, but default it to "1" so Flash is NOT forced to 1:1.
@@ -822,6 +823,12 @@ class PasteToPlaceCancelRequest(BaseModel):
     jobId: str
 
 
+class StageRoomReferenceImage(BaseModel):
+    imageBase64: Optional[str] = None
+    mimeType: Optional[str] = None
+    sourceUrl: Optional[str] = None
+
+
 class StageRoomRequest(BaseModel):
     imageBase64: str
     styleId: Optional[str] = None
@@ -843,6 +850,9 @@ class StageRoomRequest(BaseModel):
 
     # ✅ Continuation mode (Continue from this image)
     isContinuation: bool = False
+    referenceImageUrls: Optional[List[str]] = None
+    referenceImageBase64s: Optional[List[str]] = None
+    referenceImages: Optional[List[StageRoomReferenceImage]] = None
 
 
 class StageRoomResponse(BaseModel):
@@ -1094,6 +1104,7 @@ def call_gemini_with_prompt(
     prompt: str,
     model_name: str,
     aspect_ratio: Optional[str] = None,
+    additional_image_png_bytes_list: Optional[List[bytes]] = None,
 ) -> bytes:
     """
     If aspect_ratio is None, we OMIT image_config.aspect_ratio entirely
@@ -1101,13 +1112,15 @@ def call_gemini_with_prompt(
     """
     started_at = time.perf_counter()
     logged_terminal_failure = False
+    additional_images = additional_image_png_bytes_list or []
     log_event(
         "model_call_start",
         function="call_gemini_with_prompt",
         model_name=model_name,
         modality="image+text",
         aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
-        image_count=1,
+        image_count=1 + len(additional_images),
+        additional_image_count=len(additional_images),
         input_png_bytes=len(image_png_bytes),
     )
     try:
@@ -1116,17 +1129,28 @@ def call_gemini_with_prompt(
         if aspect_ratio:
             config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio)
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[
-                prompt,
+        contents = [
+            prompt,
+            types.Part(
+                inline_data=types.Blob(
+                    data=image_png_bytes,
+                    mime_type="image/png",
+                )
+            ),
+        ]
+        for extra_png_bytes in additional_images:
+            contents.append(
                 types.Part(
                     inline_data=types.Blob(
-                        data=image_png_bytes,
+                        data=extra_png_bytes,
                         mime_type="image/png",
                     )
-                ),
-            ],
+                )
+            )
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=contents,
             config=types.GenerateContentConfig(**config_kwargs),
         )
 
@@ -1197,6 +1221,7 @@ def run_fusion(
     room_type: Optional[str],
     model_name: str,
     aspect_ratio: Optional[str],
+    reference_image_png_bytes_list: Optional[List[bytes]] = None,
 ) -> bytes:
     prompt = build_roomprintz_prompt(
         enhance_photo=enhance_photo,
@@ -1210,7 +1235,13 @@ def run_fusion(
         room_type=room_type,
     )
 
-    return call_gemini_with_prompt(image_png_bytes, prompt, model_name, aspect_ratio)
+    return call_gemini_with_prompt(
+        image_png_bytes=image_png_bytes,
+        prompt=prompt,
+        model_name=model_name,
+        aspect_ratio=aspect_ratio,
+        additional_image_png_bytes_list=reference_image_png_bytes_list,
+    )
 
 
 def run_photo_tools(
@@ -1225,6 +1256,7 @@ def run_photo_tools(
     room_type: Optional[str],
     model_name: str,
     aspect_ratio: Optional[str],
+    reference_image_png_bytes_list: Optional[List[bytes]] = None,
 ) -> bytes:
     return run_fusion(
         image_png_bytes=image_png_bytes,
@@ -1239,7 +1271,47 @@ def run_photo_tools(
         room_type=room_type,
         model_name=model_name,
         aspect_ratio=aspect_ratio,
+        reference_image_png_bytes_list=reference_image_png_bytes_list,
     )
+
+
+def _collect_stage_room_reference_png_bytes(
+    req: StageRoomRequest,
+    max_additional_refs: int = STAGE_ROOM_MAX_REFERENCE_IMAGES,
+) -> List[bytes]:
+    # Preferred source: structured candidate refs from referenceImages[].imageBase64.
+    # Legacy fallback: referenceImageBase64s only when structured refs have no embedded images.
+    structured_payloads: List[str] = []
+    for ref in req.referenceImages or []:
+        payload = (ref.imageBase64 or "").strip()
+        if payload:
+            structured_payloads.append(payload)
+
+    legacy_payloads: List[str] = []
+    if not structured_payloads:
+        for payload in req.referenceImageBase64s or []:
+            trimmed = (payload or "").strip()
+            if trimmed:
+                legacy_payloads.append(trimmed)
+
+    raw_payloads = structured_payloads if structured_payloads else legacy_payloads
+    reference_payloads: List[str] = []
+    seen_payloads: set[str] = set()
+    for payload in raw_payloads:
+        if payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+        reference_payloads.append(payload)
+
+    additional_png_bytes: List[bytes] = []
+    for payload in reference_payloads[:max_additional_refs]:
+        try:
+            raw_bytes = _decode_base64_image(payload)
+            additional_png_bytes.append(prepare_sku_png_bytes(raw_bytes))
+        except Exception as e:
+            print("[/stage-room] Skipping invalid embedded reference image:", str(e))
+
+    return additional_png_bytes
 
 
 def make_data_url(image_bytes: bytes, mime_type: str = "image/png") -> str:
@@ -4541,6 +4613,28 @@ async def stage_room(req: StageRoomRequest):
         print("[/stage-room] Error preparing image:", e)
         raise HTTPException(status_code=400, detail="Could not process image")
 
+    reference_image_urls_count = len(req.referenceImageUrls or [])
+    reference_image_base64s_count = len(req.referenceImageBase64s or [])
+    reference_images_count = len(req.referenceImages or [])
+    reference_image_png_bytes_list = _collect_stage_room_reference_png_bytes(req)
+    final_multimodal_image_input_count = 1 + len(reference_image_png_bytes_list)
+    print(
+        "[/stage-room] Reference image debug:",
+        {
+            "referenceImageUrlsCount": reference_image_urls_count,
+            "referenceImageBase64sCount": reference_image_base64s_count,
+            "referenceImagesCount": reference_images_count,
+            "maxAdditionalRefs": STAGE_ROOM_MAX_REFERENCE_IMAGES,
+            "acceptedAdditionalRefs": len(reference_image_png_bytes_list),
+            "finalMultimodalImageInputCount": final_multimodal_image_input_count,
+        },
+    )
+    if reference_image_urls_count > 0:
+        print(
+            "[/stage-room] referenceImageUrls are accepted by schema but ignored in adapter "
+            "(embedded base64 refs are prioritized)."
+        )
+
     print(
         "[/stage-room] Received request:",
         {
@@ -4573,6 +4667,7 @@ async def stage_room(req: StageRoomRequest):
                 room_type=req.roomType,
                 model_name=model_name,
                 aspect_ratio=aspect_ratio_to_send,
+                reference_image_png_bytes_list=reference_image_png_bytes_list,
             )
         else:
             out_bytes = run_photo_tools(
@@ -4587,6 +4682,7 @@ async def stage_room(req: StageRoomRequest):
                 room_type=req.roomType,
                 model_name=model_name,
                 aspect_ratio=aspect_ratio_to_send,
+                reference_image_png_bytes_list=reference_image_png_bytes_list,
             )
     except Exception as e:
         log_event("stage_room_processing_failed", error=str(e))
