@@ -4149,6 +4149,89 @@ def _normalize_remove_label(value: Any) -> Optional[str]:
     return text
 
 
+def _is_guided_remove_mode(params: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(params, dict):
+        return False
+    mode = str(params.get("mode") or "").strip().lower()
+    return mode == "guidance-image"
+
+
+def _extract_guided_remove_prompt_text(params: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(params, dict):
+        return ""
+    candidates = (
+        params.get("guidancePromptText"),
+        params.get("guidancePrompt"),
+        params.get("prompt"),
+        params.get("instruction"),
+    )
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _extract_guided_remove_image_data_url(params: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(params, dict):
+        return ""
+    return str(params.get("guidanceImageDataUrl") or "").strip()
+
+
+def _looks_like_supported_guidance_data_url(image_ref: str) -> bool:
+    value = (image_ref or "").strip().lower()
+    return (
+        value.startswith("data:image/png;base64,")
+        or value.startswith("data:image/jpeg;base64,")
+        or value.startswith("data:image/jpg;base64,")
+    )
+
+
+def _extract_guidance_manifest_target_counts(guidance_manifest: Any) -> Dict[str, int]:
+    counts = {"manifest": 0, "detected": 0, "manual": 0}
+    if not isinstance(guidance_manifest, dict):
+        return counts
+
+    targets = guidance_manifest.get("targets")
+    if isinstance(targets, list):
+        counts["manifest"] = len(targets)
+    elif isinstance(guidance_manifest.get("targetCount"), int):
+        counts["manifest"] = max(0, int(guidance_manifest.get("targetCount")))
+
+    detected = guidance_manifest.get("detectedTargetCount")
+    if isinstance(detected, int):
+        counts["detected"] = max(0, int(detected))
+    elif isinstance(guidance_manifest.get("detectedTargets"), list):
+        counts["detected"] = len(guidance_manifest.get("detectedTargets"))
+
+    manual = guidance_manifest.get("manualTargetCount")
+    if isinstance(manual, int):
+        counts["manual"] = max(0, int(manual))
+    elif isinstance(guidance_manifest.get("manualTargets"), list):
+        counts["manual"] = len(guidance_manifest.get("manualTargets"))
+
+    return counts
+
+
+def _sanitize_edit_run_remove_params_for_log(params: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = dict(params or {})
+    guidance_image_data_url = sanitized.get("guidanceImageDataUrl")
+    if isinstance(guidance_image_data_url, str) and guidance_image_data_url:
+        is_data_url = guidance_image_data_url.strip().startswith("data:image/")
+        sanitized["guidanceImageDataUrl"] = (
+            f"(data-url omitted, chars={len(guidance_image_data_url.strip())})"
+            if is_data_url
+            else "(non-data-url value omitted)"
+        )
+    guidance_manifest = sanitized.get("guidanceManifest")
+    if isinstance(guidance_manifest, dict):
+        sanitized["guidanceManifest"] = {
+            "keys": sorted(list(guidance_manifest.keys())),
+            "targetCounts": _extract_guidance_manifest_target_counts(guidance_manifest),
+        }
+    return sanitized
+
+
 def build_vibode_edit_run_prompt(
     action: Literal["add", "remove", "swap", "rotate"],
     target_placement: Optional[ScenePlacement],
@@ -4379,7 +4462,8 @@ def _debug_log_vibode_edit_run(
     print(f"  eligible_skus={eligible_skus_count}")
     print(f"  target_placement_id={target_placement_id if target_placement_id else '(none)'}")
     print(f"  target_sku_id={target_sku_id if target_sku_id else '(none)'}")
-    print(f"  params={params}")
+    params_for_log = _sanitize_edit_run_remove_params_for_log(params) if action == "remove" else params
+    print(f"  params={params_for_log}")
     if "removeTargets" in params:
         remove_targets = params.get("removeTargets")
         remove_targets_count = len(remove_targets) if isinstance(remove_targets, list) else 0
@@ -5401,6 +5485,8 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
     target_placement_id: Optional[str] = None
     target_sku_id: Optional[str] = None
     target_bbox: Optional[ScenePlacementBbox] = None
+    guided_remove_mode = False
+    guided_remove_overlay_png_bytes: Optional[bytes] = None
 
     if action == "add":
         target_sku_id = (target.skuId or "").strip()
@@ -5470,12 +5556,30 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
         remove_target_bboxes: List[ScenePlacementBbox] = []
         remove_target_placement_ids: set[str] = set()
         target_placement_id = (target.placementId or "").strip() or None
+        guided_remove_mode = _is_guided_remove_mode(params)
+        guidance_image_data_url = _extract_guided_remove_image_data_url(params)
+        guidance_manifest = params.get("guidanceManifest")
+        guidance_manifest_target_counts = _extract_guidance_manifest_target_counts(guidance_manifest)
+        guided_prompt_text = _extract_guided_remove_prompt_text(params)
+        remove_targets_count = len(remove_targets) if isinstance(remove_targets, list) else 0
 
         print(
             "[/api/vibode/edit-run][remove] incoming payload:",
             {
                 "target": target.model_dump(exclude_none=True),
-                "params": params,
+                "params": _sanitize_edit_run_remove_params_for_log(params),
+            },
+        )
+        print(
+            "[/api/vibode/edit-run][remove] mode:",
+            {
+                "guided": guided_remove_mode,
+                "hasGuidanceImage": bool(guidance_image_data_url),
+                "manifestTargetCount": guidance_manifest_target_counts["manifest"],
+                "detectedTargetCount": guidance_manifest_target_counts["detected"],
+                "manualTargetCount": guidance_manifest_target_counts["manual"],
+                "requestRemoveTargetsCount": remove_targets_count,
+                "modelVersion": model_name,
             },
         )
 
@@ -5532,38 +5636,92 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
         if not remove_target_bboxes and remove_x_norm is not None and remove_y_norm is not None:
             remove_target_bboxes.append(_target_bbox_from_point(remove_x_norm, remove_y_norm))
 
-        if remove_target_bboxes:
-            prompt = build_vibode_edit_run_prompt(
-                action="remove",
-                target_placement=None,
-                params=params,
-                remove_target_bboxes=remove_target_bboxes,
-            )
-            target_bbox = remove_target_bboxes[0]
-        elif target_placement_id:
-            target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
-            if target_idx < 0:
-                return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
-            placement_to_remove = updated_placements[target_idx]
-            prompt = build_vibode_edit_run_prompt(
-                action="remove",
-                target_placement=placement_to_remove,
-                params=params,
-            )
-            target_bbox = placement_to_remove.bbox
-        elif remove_target_placement_ids:
-            prompt = build_vibode_edit_run_prompt(
-                action="remove",
-                target_placement=None,
-                params=params,
-                remove_target_bboxes=[],
+        if guided_remove_mode:
+            if not guidance_image_data_url:
+                return _vibode_edit_run_error(400, "Guided remove requires guidanceImageDataUrl.")
+            if not _looks_like_supported_guidance_data_url(guidance_image_data_url):
+                return _vibode_edit_run_error(
+                    400,
+                    "Guided remove guidanceImageDataUrl must be a PNG or JPEG data URL.",
+                )
+            try:
+                guidance_raw_bytes, guidance_hint_mime = _decode_base64_image_with_mime(
+                    guidance_image_data_url
+                )
+                guidance_mime = _infer_image_mime_type(
+                    guidance_raw_bytes,
+                    fallback_mime=guidance_hint_mime,
+                )
+            except Exception:
+                return _vibode_edit_run_error(400, "Guided remove guidanceImageDataUrl is invalid.")
+            if guidance_mime not in ("image/png", "image/jpeg", "image/jpg"):
+                return _vibode_edit_run_error(
+                    400,
+                    "Guided remove guidanceImageDataUrl must decode to PNG or JPEG image bytes.",
+                )
+            try:
+                guided_remove_overlay_png_bytes = prepare_passthrough_png_bytes(guidance_raw_bytes)
+            except Exception:
+                return _vibode_edit_run_error(400, "Guided remove guidance image could not be processed.")
+
+            remove_label = _normalize_remove_label(params.get("removeLabel"))
+            if guided_prompt_text:
+                prompt = guided_prompt_text
+            elif remove_label:
+                prompt = (
+                    f"Remove only the highlighted {remove_label} targets indicated in the guidance image. "
+                    "Use Image 1 as the clean source room, Image 2 as guidance-only markup, "
+                    "and preserve all non-target scene content."
+                )
+            else:
+                prompt = (
+                    "Remove only the highlighted targets indicated in the guidance image. "
+                    "Use Image 1 as the clean source room, Image 2 as guidance-only markup, "
+                    "and preserve all non-target scene content."
+                )
+            target_bbox = remove_target_bboxes[0] if remove_target_bboxes else None
+            print(
+                "[/api/vibode/edit-run][remove] guided remove validated:",
+                {
+                    "guidanceMime": guidance_mime,
+                    "guidancePngBytes": len(guided_remove_overlay_png_bytes),
+                    "removeTargetsCount": len(remove_target_bboxes),
+                    "modelVersion": model_name,
+                },
             )
         else:
-            return _vibode_edit_run_error(
-                400,
-                "remove requires target.xNorm/target.yNorm, target.x/target.y, params.xNorm/params.yNorm, "
-                "target.placementId, or params.removeTargets.",
-            )
+            if remove_target_bboxes:
+                prompt = build_vibode_edit_run_prompt(
+                    action="remove",
+                    target_placement=None,
+                    params=params,
+                    remove_target_bboxes=remove_target_bboxes,
+                )
+                target_bbox = remove_target_bboxes[0]
+            elif target_placement_id:
+                target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
+                if target_idx < 0:
+                    return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+                placement_to_remove = updated_placements[target_idx]
+                prompt = build_vibode_edit_run_prompt(
+                    action="remove",
+                    target_placement=placement_to_remove,
+                    params=params,
+                )
+                target_bbox = placement_to_remove.bbox
+            elif remove_target_placement_ids:
+                prompt = build_vibode_edit_run_prompt(
+                    action="remove",
+                    target_placement=None,
+                    params=params,
+                    remove_target_bboxes=[],
+                )
+            else:
+                return _vibode_edit_run_error(
+                    400,
+                    "remove requires target.xNorm/target.yNorm, target.x/target.y, params.xNorm/params.yNorm, "
+                    "target.placementId, or params.removeTargets.",
+                )
 
         if remove_target_placement_ids:
             updated_placements = [
@@ -5798,7 +5956,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
     else:
         return _vibode_edit_run_error(400, f"Unsupported action: {action}")
 
-    room_overlay_png_bytes = room_png_bytes
+    room_overlay_png_bytes = guided_remove_overlay_png_bytes or room_png_bytes
     _debug_log_vibode_edit_run(
         action=action,
         model_name=model_name,
@@ -5818,7 +5976,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
     if early_exit:
         return early_exit
     try:
-        if action in ("add", "swap"):
+        if action in ("add", "swap") or (action == "remove" and guided_remove_mode):
             gemini_multimodal_sig = inspect.signature(call_gemini_multimodal)
             gemini_multimodal_kwargs: Dict[str, Any] = {
                 "prompt": prompt,
