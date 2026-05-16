@@ -4159,8 +4159,15 @@ def _is_guided_remove_mode(params: Optional[Dict[str, Any]]) -> bool:
 def _extract_guided_remove_prompt_text(params: Optional[Dict[str, Any]]) -> str:
     if not isinstance(params, dict):
         return ""
+    candidate = params.get("guidancePromptText")
+    text = str(candidate or "").strip()
+    return text
+
+
+def _extract_guided_remove_prompt_override(params: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(params, dict):
+        return ""
     candidates = (
-        params.get("guidancePromptText"),
         params.get("guidancePrompt"),
         params.get("prompt"),
         params.get("instruction"),
@@ -4276,7 +4283,9 @@ def _summarize_guided_remove_for_log(
 
     remove_targets = params.get("removeTargets")
     request_target_count = len(remove_targets) if isinstance(remove_targets, list) else 0
-    prompt_chars = _prompt_length(prompt or _extract_guided_remove_prompt_text(params))
+    prompt_chars = _prompt_length(
+        prompt or _build_guided_remove_prompt(params, guidance_manifest_target_counts)
+    )
     prompt_present = prompt_chars > 0
 
     guidance_image_summary = "(none)"
@@ -4308,6 +4317,43 @@ def _summarize_guided_remove_for_log(
     if guidance_png_bytes_len is not None:
         summary["guidancePngBytes"] = guidance_png_bytes_len
     return summary
+
+
+def _build_guided_remove_prompt(
+    params: Dict[str, Any],
+    guidance_manifest_target_counts: Dict[str, int],
+) -> str:
+    prompt_override = _extract_guided_remove_prompt_override(params)
+    if prompt_override:
+        return prompt_override
+
+    guidance_prompt_text = _extract_guided_remove_prompt_text(params)
+    lines = [
+        "Use Image 1 as the source room image.",
+        "Use Image 2 only to identify removal targets.",
+        "Remove the numbered furniture targets listed below.",
+        "If red X markers are present, also remove objects directly under red X markers.",
+        "Do not keep numbers, circles, red Xs, labels, or markers in the final result.",
+        "The final image must be a natural photorealistic room photo matching Image 1.",
+        "Do not output a mask, silhouette, line drawing, segmentation map, colored region map, black-background image, or annotated guidance image.",
+        "Preserve all unmarked furniture and decor.",
+        "Preserve camera angle, room layout, lighting, materials, floor, walls, windows, and remaining objects.",
+        "Reconstruct hidden background naturally.",
+        "Do not redesign, restyle, refurnish, or add new objects.",
+        "If a marker appears on empty wall/floor because of user error, ignore it unless there is a clear object directly under it.",
+    ]
+
+    detected_target_count = int(guidance_manifest_target_counts.get("detected", 0) or 0)
+    manual_target_count = int(guidance_manifest_target_counts.get("manual", 0) or 0)
+    if detected_target_count > 0 and manual_target_count == 0:
+        lines.append(
+            "There are no red X manual markers in Image 2. Remove only the numbered targets listed above. Ignore the black/transparent/annotation styling of Image 2; it is only a target-location guide."
+        )
+
+    if guidance_prompt_text:
+        lines.extend(["", guidance_prompt_text])
+
+    return "\n".join(lines)
 
 
 def build_vibode_edit_run_prompt(
@@ -4657,6 +4703,32 @@ def call_gemini_multimodal(
             part = candidate.content.parts[0]
             out_bytes = part.inline_data.data
         except Exception as e:
+            candidates = getattr(response, "candidates", None)
+            candidate_count = len(candidates) if isinstance(candidates, list) else 0
+            first_candidate_finish_reason = "(none)"
+            first_candidate_part_count = 0
+            first_candidate_image_parts = 0
+            first_candidate_text_parts = 0
+            first_candidate_text_snippet = ""
+            if candidate_count > 0:
+                first_candidate = candidates[0]
+                finish_reason = getattr(first_candidate, "finish_reason", None)
+                if finish_reason is not None:
+                    first_candidate_finish_reason = str(finish_reason)
+                first_content = getattr(first_candidate, "content", None)
+                first_parts = getattr(first_content, "parts", None) if first_content is not None else None
+                if isinstance(first_parts, list):
+                    first_candidate_part_count = len(first_parts)
+                    for response_part in first_parts:
+                        inline_data = getattr(response_part, "inline_data", None)
+                        inline_bytes = getattr(inline_data, "data", None) if inline_data is not None else None
+                        if inline_bytes:
+                            first_candidate_image_parts += 1
+                        text_part = getattr(response_part, "text", None)
+                        if isinstance(text_part, str) and text_part.strip():
+                            first_candidate_text_parts += 1
+                            if not first_candidate_text_snippet:
+                                first_candidate_text_snippet = text_part.strip()[:240]
             log_event(
                 "model_call_extract_failed",
                 function="call_gemini_multimodal",
@@ -4665,6 +4737,12 @@ def call_gemini_multimodal(
                 aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
                 sku_count=len(sku_png_bytes_list),
                 error=str(e),
+                candidate_count=candidate_count,
+                first_candidate_finish_reason=first_candidate_finish_reason,
+                first_candidate_part_count=first_candidate_part_count,
+                first_candidate_image_parts=first_candidate_image_parts,
+                first_candidate_text_parts=first_candidate_text_parts,
+                first_candidate_text_snippet=first_candidate_text_snippet,
             )
             logged_terminal_failure = True
             raise RuntimeError("Could not extract generated image from Gemini response")
@@ -5663,7 +5741,6 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
         guidance_image_data_url = _extract_guided_remove_image_data_url(params)
         guidance_manifest = params.get("guidanceManifest")
         guidance_manifest_target_counts = _extract_guidance_manifest_target_counts(guidance_manifest)
-        guided_prompt_text = _extract_guided_remove_prompt_text(params)
         remove_targets_count = len(remove_targets) if isinstance(remove_targets, list) else 0
 
         if guided_remove_mode:
@@ -5801,21 +5878,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
             except Exception:
                 return _vibode_edit_run_error(400, "Guided remove guidance image could not be processed.")
 
-            remove_label = _normalize_remove_label(params.get("removeLabel"))
-            if guided_prompt_text:
-                prompt = guided_prompt_text
-            elif remove_label:
-                prompt = (
-                    f"Remove only the highlighted {remove_label} targets indicated in the guidance image. "
-                    "Use Image 1 as the clean source room, Image 2 as guidance-only markup, "
-                    "and preserve all non-target scene content."
-                )
-            else:
-                prompt = (
-                    "Remove only the highlighted targets indicated in the guidance image. "
-                    "Use Image 1 as the clean source room, Image 2 as guidance-only markup, "
-                    "and preserve all non-target scene content."
-                )
+            prompt = _build_guided_remove_prompt(params, guidance_manifest_target_counts)
             target_bbox = remove_target_bboxes[0] if remove_target_bboxes else None
             print(
                 "[/api/vibode/edit-run][remove] guided remove validated:",
@@ -5824,6 +5887,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
                     "guidancePngBytes": len(guided_remove_overlay_png_bytes),
                     "removeTargetsCount": len(remove_target_bboxes),
                     "modelVersion": model_name,
+                    "promptChars": _prompt_length(prompt),
                 },
             )
             guided_remove_summary = _summarize_guided_remove_for_log(
