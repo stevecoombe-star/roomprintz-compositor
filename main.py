@@ -89,8 +89,10 @@ USER_SKU_FORCED_PREVIEW_BG_RGB = (237, 237, 237)
 USER_SKU_INGEST_TIMEOUT_SECONDS = 10.0
 SUPABASE_SIGNED_URL_TTL_SECONDS = 7 * 24 * 60 * 60
 SUPABASE_STORAGE_UPLOAD_TIMEOUT_SECONDS = 20.0
+SUPABASE_USAGE_WRITE_TIMEOUT_SECONDS = 2.5
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").strip()
 SUPABASE_SERVICE_KEY = (os.getenv("SUPABASE_SERVICE_KEY") or "").strip()
+SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 SUPABASE_STORAGE_BUCKET = (
     os.getenv("SUPABASE_STORAGE_BUCKET")
     or os.getenv("NEXT_PUBLIC_SUPABASE_STORAGE_BUCKET")
@@ -190,10 +192,44 @@ _REQUEST_ID_HEADER_MAX_LEN = 100
 _REQUEST_ID_ALLOWED_CHARS = set(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-:"
 )
+_VIBODE_CORRELATION_ID_MAX_LEN = 140
+_VIBODE_CORRELATION_ALLOWED_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-:"
+)
+_OPERATION_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_operation_id", default=None)
+_ATTEMPT_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_attempt_id", default=None)
+_ROUTE_PATH_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_route_path", default=None)
+_PROVIDER_ATTEMPT_SEQ_CTX: ContextVar[int] = ContextVar("roomprintz_provider_attempt_seq", default=0)
+VIBODE_REQUEST_ID_HEADER = "x-vibode-request-id"
+VIBODE_OPERATION_ID_HEADER = "x-vibode-operation-id"
+VIBODE_ATTEMPT_ID_HEADER = "x-vibode-attempt-id"
 
 
 def get_request_id() -> str:
     return _REQUEST_ID_CTX.get()
+
+
+def get_operation_id() -> Optional[str]:
+    return _OPERATION_ID_CTX.get()
+
+
+def get_attempt_id() -> Optional[str]:
+    return _ATTEMPT_ID_CTX.get()
+
+
+def get_route_path() -> Optional[str]:
+    return _ROUTE_PATH_CTX.get()
+
+
+def _next_provider_attempt_id() -> str:
+    inbound_attempt_id = get_attempt_id()
+    if inbound_attempt_id:
+        next_seq = _PROVIDER_ATTEMPT_SEQ_CTX.get() + 1
+        _PROVIDER_ATTEMPT_SEQ_CTX.set(next_seq)
+        if next_seq == 1:
+            return inbound_attempt_id
+        return f"{inbound_attempt_id}:{next_seq}"
+    return uuid4().hex
 
 
 def _sanitize_inbound_request_id(header_value: Optional[str]) -> Optional[str]:
@@ -208,6 +244,19 @@ def _sanitize_inbound_request_id(header_value: Optional[str]) -> Optional[str]:
     if any(ch not in _REQUEST_ID_ALLOWED_CHARS for ch in candidate):
         return None
 
+    return candidate
+
+
+def _sanitize_vibode_correlation_id(header_value: Optional[str]) -> Optional[str]:
+    if not header_value:
+        return None
+    candidate = str(header_value).strip()
+    if not candidate:
+        return None
+    if len(candidate) > _VIBODE_CORRELATION_ID_MAX_LEN:
+        return None
+    if any(ch not in _VIBODE_CORRELATION_ALLOWED_CHARS for ch in candidate):
+        return None
     return candidate
 
 
@@ -802,13 +851,28 @@ app = FastAPI()
 
 @app.middleware("http")
 async def add_request_id_middleware(request: Request, call_next):
-    request_id = _sanitize_inbound_request_id(request.headers.get("X-Request-Id")) or uuid4().hex[:12]
+    vibode_request_id = _sanitize_vibode_correlation_id(request.headers.get(VIBODE_REQUEST_ID_HEADER))
+    request_id = (
+        vibode_request_id
+        or _sanitize_inbound_request_id(request.headers.get("X-Request-Id"))
+        or uuid4().hex[:12]
+    )
+    operation_id = _sanitize_vibode_correlation_id(request.headers.get(VIBODE_OPERATION_ID_HEADER))
+    attempt_id = _sanitize_vibode_correlation_id(request.headers.get(VIBODE_ATTEMPT_ID_HEADER))
     token = _REQUEST_ID_CTX.set(request_id)
+    operation_token = _OPERATION_ID_CTX.set(operation_id)
+    attempt_token = _ATTEMPT_ID_CTX.set(attempt_id)
+    route_token = _ROUTE_PATH_CTX.set(request.url.path if request.url and request.url.path else None)
+    seq_token = _PROVIDER_ATTEMPT_SEQ_CTX.set(0)
     try:
         response = await call_next(request)
         response.headers["X-Request-Id"] = request_id
         return response
     finally:
+        _PROVIDER_ATTEMPT_SEQ_CTX.reset(seq_token)
+        _ROUTE_PATH_CTX.reset(route_token)
+        _ATTEMPT_ID_CTX.reset(attempt_token)
+        _OPERATION_ID_CTX.reset(operation_token)
         _REQUEST_ID_CTX.reset(token)
 
 
@@ -1111,6 +1175,12 @@ def call_gemini_with_prompt(
     (premium continuation behavior).
     """
     started_at = time.perf_counter()
+    provider_attempt_id = _next_provider_attempt_id()
+    accounting_status = "failed"
+    accounting_error_code: Optional[str] = None
+    accounting_error_message: Optional[str] = None
+    accounting_usage_metrics: Dict[str, Any] = {}
+    response: Optional[Any] = None
     logged_terminal_failure = False
     additional_images = additional_image_png_bytes_list or []
     log_event(
@@ -1153,6 +1223,7 @@ def call_gemini_with_prompt(
             contents=contents,
             config=types.GenerateContentConfig(**config_kwargs),
         )
+        accounting_usage_metrics = _extract_provider_usage_metrics(response)
 
         try:
             candidate = response.candidates[0]
@@ -1192,9 +1263,14 @@ def call_gemini_with_prompt(
             output_png_bytes=len(out_bytes),
             latency_ms=int((time.perf_counter() - started_at) * 1000),
         )
+        accounting_status = "success"
         return out_bytes
 
     except Exception as e:
+        accounting_error_code = type(e).__name__
+        accounting_error_message = str(e)
+        if response is not None and not accounting_usage_metrics:
+            accounting_usage_metrics = _extract_provider_usage_metrics(response)
         if not logged_terminal_failure:
             log_event(
                 "model_call_failed",
@@ -1206,6 +1282,16 @@ def call_gemini_with_prompt(
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
             )
         raise
+    finally:
+        _write_gemini_usage_event_best_effort(
+            attempt_id=provider_attempt_id,
+            model_name=model_name,
+            status=accounting_status,
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+            error_code=accounting_error_code,
+            error_message=accounting_error_message,
+            usage_metrics=accounting_usage_metrics,
+        )
 
 
 def run_fusion(
@@ -2141,6 +2227,198 @@ def _supabase_storage_create_signed_url(
             had_query_string=bool(parsed_normalized_signed_url.query),
         )
     return normalized_signed_url
+
+
+def _require_supabase_usage_config() -> Tuple[str, str]:
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL is required.")
+    service_key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SERVICE_KEY
+    if not service_key:
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SERVICE_KEY is required.")
+    return SUPABASE_URL.rstrip("/"), service_key
+
+
+def _usage_value_to_json(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _usage_value_to_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_usage_value_to_json(v) for v in value]
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        try:
+            return _usage_value_to_json(value.model_dump())
+        except Exception:
+            return str(value)
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        try:
+            return _usage_value_to_json(value.to_dict())
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _extract_provider_usage_metrics(response: Any) -> Dict[str, Any]:
+    usage_obj = None
+    if response is not None:
+        usage_obj = getattr(response, "usage_metadata", None) or getattr(response, "usage", None)
+    usage_json = _usage_value_to_json(usage_obj)
+    return usage_json if isinstance(usage_json, dict) else {}
+
+
+def _extract_int_usage_value(usage_metrics: Dict[str, Any], *keys: str) -> Optional[int]:
+    for key in keys:
+        value = usage_metrics.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(float(value))
+            except Exception:
+                continue
+    return None
+
+
+def _write_gemini_usage_event_best_effort(
+    *,
+    attempt_id: str,
+    model_name: str,
+    status: str,
+    latency_ms: int,
+    error_code: Optional[str],
+    error_message: Optional[str],
+    usage_metrics: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        base_url, service_key = _require_supabase_usage_config()
+        usage_data = usage_metrics or {}
+        route_path = get_route_path() or "unknown"
+        metadata_payload: Dict[str, Any] = {}
+        if error_message:
+            metadata_payload["error_message"] = (error_message or "")[:4000]
+        if usage_data:
+            metadata_payload["provider_usage"] = usage_data
+        full_payload = {
+            "attempt_id": attempt_id,
+            "retry_of_attempt_id": None,
+            "is_retry": False,
+            "request_id": get_request_id() if get_request_id() != "-" else None,
+            "operation_id": get_operation_id(),
+            "provider_request_id": None,
+            "service": "roomprintz-compositor",
+            "provider": "google_gemini",
+            "model": model_name,
+            "status": status,
+            "latency_ms": max(0, int(latency_ms)),
+            "error_code": error_code,
+            "metadata": metadata_payload,
+            "route": route_path,
+            "user_id": None,
+            "room_id": None,
+            "version_id": None,
+            "asset_id": None,
+            "workflow_type": "unknown",
+            "action_type": "unknown",
+            "source_trigger": None,
+            "input_tokens": _extract_int_usage_value(
+                usage_data,
+                "prompt_token_count",
+                "prompt_tokens",
+                "input_token_count",
+                "input_tokens",
+            ),
+            "output_tokens": _extract_int_usage_value(
+                usage_data,
+                "candidates_token_count",
+                "completion_token_count",
+                "completion_tokens",
+                "output_token_count",
+                "output_tokens",
+            ),
+            "image_count": _extract_int_usage_value(
+                usage_data,
+                "image_count",
+                "generated_image_count",
+            ),
+            "reference_image_count": None,
+            "estimated_cost_usd": None,
+        }
+        minimal_payload = {
+            "attempt_id": attempt_id,
+            "retry_of_attempt_id": None,
+            "is_retry": False,
+            "request_id": get_request_id() if get_request_id() != "-" else None,
+            "operation_id": get_operation_id(),
+            "provider_request_id": None,
+            "service": "roomprintz-compositor",
+            "provider": "google_gemini",
+            "model": model_name,
+            "status": status,
+            "latency_ms": max(0, int(latency_ms)),
+            "error_code": error_code,
+            "metadata": metadata_payload,
+            "route": route_path,
+            "source_trigger": None,
+            "user_id": None,
+            "room_id": None,
+            "version_id": None,
+            "asset_id": None,
+            "workflow_type": "unknown",
+            "action_type": "unknown",
+            "input_tokens": None,
+            "output_tokens": None,
+            "image_count": None,
+            "reference_image_count": None,
+            "estimated_cost_usd": None,
+        }
+        headers = {
+            "Authorization": f"Bearer {service_key}",
+            "apikey": service_key,
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        write_url = f"{base_url}/rest/v1/vibode_gemini_usage_events?on_conflict=attempt_id"
+        response = requests.post(
+            write_url,
+            headers=headers,
+            json=[full_payload],
+            timeout=SUPABASE_USAGE_WRITE_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            fallback_response = requests.post(
+                write_url,
+                headers=headers,
+                json=[minimal_payload],
+                timeout=SUPABASE_USAGE_WRITE_TIMEOUT_SECONDS,
+            )
+            if fallback_response.status_code < 400:
+                log_event(
+                    "gemini_usage_accounting_write_fallback_succeeded",
+                    attempt_id=attempt_id,
+                    model_name=model_name,
+                    usage_table="public.vibode_gemini_usage_events",
+                )
+                return
+            log_event(
+                "gemini_usage_accounting_write_failed",
+                status_code=response.status_code,
+                body=response.text[:280],
+                fallback_status_code=fallback_response.status_code,
+                fallback_body=fallback_response.text[:280],
+                attempt_id=attempt_id,
+                model_name=model_name,
+                usage_table="public.vibode_gemini_usage_events",
+            )
+    except Exception as e:
+        log_event(
+            "gemini_usage_accounting_write_failed",
+            error=str(e),
+            attempt_id=attempt_id,
+            model_name=model_name,
+            usage_table="public.vibode_gemini_usage_events",
+        )
 
 
 def _run_user_sku_background_removal(image_png_bytes: bytes, model_name: str) -> bytes:
@@ -4653,6 +4931,12 @@ def call_gemini_multimodal(
     aspect_ratio: Optional[str] = None,
 ) -> bytes:
     started_at = time.perf_counter()
+    provider_attempt_id = _next_provider_attempt_id()
+    accounting_status = "failed"
+    accounting_error_code: Optional[str] = None
+    accounting_error_message: Optional[str] = None
+    accounting_usage_metrics: Dict[str, Any] = {}
+    response: Optional[Any] = None
     logged_terminal_failure = False
     log_event(
         "model_call_start",
@@ -4698,6 +4982,7 @@ def call_gemini_multimodal(
             contents=contents,
             config=types.GenerateContentConfig(**config_kwargs),
         )
+        accounting_usage_metrics = _extract_provider_usage_metrics(response)
         try:
             candidate = response.candidates[0]
             part = candidate.content.parts[0]
@@ -4769,8 +5054,13 @@ def call_gemini_multimodal(
             output_png_bytes=len(out_bytes),
             latency_ms=int((time.perf_counter() - started_at) * 1000),
         )
+        accounting_status = "success"
         return out_bytes
     except Exception as e:
+        accounting_error_code = type(e).__name__
+        accounting_error_message = str(e)
+        if response is not None and not accounting_usage_metrics:
+            accounting_usage_metrics = _extract_provider_usage_metrics(response)
         if not logged_terminal_failure:
             log_event(
                 "model_call_failed",
@@ -4783,6 +5073,16 @@ def call_gemini_multimodal(
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
             )
         raise
+    finally:
+        _write_gemini_usage_event_best_effort(
+            attempt_id=provider_attempt_id,
+            model_name=model_name,
+            status=accounting_status,
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+            error_code=accounting_error_code,
+            error_message=accounting_error_message,
+            usage_metrics=accounting_usage_metrics,
+        )
 
 
 # ---------- ROUTES ----------
