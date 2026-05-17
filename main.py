@@ -8,7 +8,7 @@ import inspect
 import time
 from contextvars import ContextVar
 from datetime import datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 from urllib.parse import quote, urlparse
 from typing import Any, Literal, Optional, Tuple, Dict, List
 
@@ -200,9 +200,25 @@ _OPERATION_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_operation_
 _ATTEMPT_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_attempt_id", default=None)
 _ROUTE_PATH_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_route_path", default=None)
 _PROVIDER_ATTEMPT_SEQ_CTX: ContextVar[int] = ContextVar("roomprintz_provider_attempt_seq", default=0)
+_USER_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_user_id", default=None)
+_USER_EMAIL_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_user_email", default=None)
+_ROOM_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_room_id", default=None)
+_VERSION_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_version_id", default=None)
+_ASSET_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_asset_id", default=None)
+_WORKFLOW_TYPE_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_workflow_type", default=None)
+_ACTION_TYPE_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_action_type", default=None)
+_SOURCE_TRIGGER_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_source_trigger", default=None)
 VIBODE_REQUEST_ID_HEADER = "x-vibode-request-id"
 VIBODE_OPERATION_ID_HEADER = "x-vibode-operation-id"
 VIBODE_ATTEMPT_ID_HEADER = "x-vibode-attempt-id"
+VIBODE_USER_ID_HEADER = "x-vibode-user-id"
+VIBODE_USER_EMAIL_HEADER = "x-vibode-user-email"
+VIBODE_ROOM_ID_HEADER = "x-vibode-room-id"
+VIBODE_VERSION_ID_HEADER = "x-vibode-version-id"
+VIBODE_ASSET_ID_HEADER = "x-vibode-asset-id"
+VIBODE_WORKFLOW_TYPE_HEADER = "x-vibode-workflow-type"
+VIBODE_ACTION_TYPE_HEADER = "x-vibode-action-type"
+VIBODE_SOURCE_TRIGGER_HEADER = "x-vibode-source-trigger"
 
 
 def get_request_id() -> str:
@@ -219,6 +235,38 @@ def get_attempt_id() -> Optional[str]:
 
 def get_route_path() -> Optional[str]:
     return _ROUTE_PATH_CTX.get()
+
+
+def get_user_id() -> Optional[str]:
+    return _USER_ID_CTX.get()
+
+
+def get_user_email() -> Optional[str]:
+    return _USER_EMAIL_CTX.get()
+
+
+def get_room_id() -> Optional[str]:
+    return _ROOM_ID_CTX.get()
+
+
+def get_version_id() -> Optional[str]:
+    return _VERSION_ID_CTX.get()
+
+
+def get_asset_id() -> Optional[str]:
+    return _ASSET_ID_CTX.get()
+
+
+def get_workflow_type() -> Optional[str]:
+    return _WORKFLOW_TYPE_CTX.get()
+
+
+def get_action_type() -> Optional[str]:
+    return _ACTION_TYPE_CTX.get()
+
+
+def get_source_trigger() -> Optional[str]:
+    return _SOURCE_TRIGGER_CTX.get()
 
 
 def _next_provider_attempt_id() -> str:
@@ -258,6 +306,25 @@ def _sanitize_vibode_correlation_id(header_value: Optional[str]) -> Optional[str
     if any(ch not in _VIBODE_CORRELATION_ALLOWED_CHARS for ch in candidate):
         return None
     return candidate
+
+
+def _sanitize_optional_header_value(header_value: Optional[str]) -> Optional[str]:
+    if header_value is None:
+        return None
+    candidate = str(header_value).strip()
+    if not candidate:
+        return None
+    return candidate
+
+
+def _sanitize_uuid_header_value(header_value: Optional[str]) -> Optional[str]:
+    candidate = _sanitize_optional_header_value(header_value)
+    if not candidate:
+        return None
+    try:
+        return str(UUID(candidate))
+    except Exception:
+        return None
 
 
 def _log_value(value: Any) -> str:
@@ -859,9 +926,25 @@ async def add_request_id_middleware(request: Request, call_next):
     )
     operation_id = _sanitize_vibode_correlation_id(request.headers.get(VIBODE_OPERATION_ID_HEADER))
     attempt_id = _sanitize_vibode_correlation_id(request.headers.get(VIBODE_ATTEMPT_ID_HEADER))
+    user_id = _sanitize_uuid_header_value(request.headers.get(VIBODE_USER_ID_HEADER))
+    user_email = _sanitize_optional_header_value(request.headers.get(VIBODE_USER_EMAIL_HEADER))
+    room_id = _sanitize_uuid_header_value(request.headers.get(VIBODE_ROOM_ID_HEADER))
+    version_id = _sanitize_uuid_header_value(request.headers.get(VIBODE_VERSION_ID_HEADER))
+    asset_id = _sanitize_uuid_header_value(request.headers.get(VIBODE_ASSET_ID_HEADER))
+    workflow_type = _sanitize_optional_header_value(request.headers.get(VIBODE_WORKFLOW_TYPE_HEADER))
+    action_type = _sanitize_optional_header_value(request.headers.get(VIBODE_ACTION_TYPE_HEADER))
+    source_trigger = _sanitize_optional_header_value(request.headers.get(VIBODE_SOURCE_TRIGGER_HEADER))
     token = _REQUEST_ID_CTX.set(request_id)
     operation_token = _OPERATION_ID_CTX.set(operation_id)
     attempt_token = _ATTEMPT_ID_CTX.set(attempt_id)
+    user_id_token = _USER_ID_CTX.set(user_id)
+    user_email_token = _USER_EMAIL_CTX.set(user_email)
+    room_id_token = _ROOM_ID_CTX.set(room_id)
+    version_id_token = _VERSION_ID_CTX.set(version_id)
+    asset_id_token = _ASSET_ID_CTX.set(asset_id)
+    workflow_type_token = _WORKFLOW_TYPE_CTX.set(workflow_type)
+    action_type_token = _ACTION_TYPE_CTX.set(action_type)
+    source_trigger_token = _SOURCE_TRIGGER_CTX.set(source_trigger)
     route_token = _ROUTE_PATH_CTX.set(request.url.path if request.url and request.url.path else None)
     seq_token = _PROVIDER_ATTEMPT_SEQ_CTX.set(0)
     try:
@@ -871,6 +954,14 @@ async def add_request_id_middleware(request: Request, call_next):
     finally:
         _PROVIDER_ATTEMPT_SEQ_CTX.reset(seq_token)
         _ROUTE_PATH_CTX.reset(route_token)
+        _SOURCE_TRIGGER_CTX.reset(source_trigger_token)
+        _ACTION_TYPE_CTX.reset(action_type_token)
+        _WORKFLOW_TYPE_CTX.reset(workflow_type_token)
+        _ASSET_ID_CTX.reset(asset_id_token)
+        _VERSION_ID_CTX.reset(version_id_token)
+        _ROOM_ID_CTX.reset(room_id_token)
+        _USER_EMAIL_CTX.reset(user_email_token)
+        _USER_ID_CTX.reset(user_id_token)
         _ATTEMPT_ID_CTX.reset(attempt_token)
         _OPERATION_ID_CTX.reset(operation_token)
         _REQUEST_ID_CTX.reset(token)
@@ -2300,6 +2391,9 @@ def _write_gemini_usage_event_best_effort(
             metadata_payload["error_message"] = (error_message or "")[:4000]
         if usage_data:
             metadata_payload["provider_usage"] = usage_data
+        user_email = get_user_email()
+        if user_email:
+            metadata_payload["user_email"] = user_email
         full_payload = {
             "attempt_id": attempt_id,
             "retry_of_attempt_id": None,
@@ -2315,13 +2409,13 @@ def _write_gemini_usage_event_best_effort(
             "error_code": error_code,
             "metadata": metadata_payload,
             "route": route_path,
-            "user_id": None,
-            "room_id": None,
-            "version_id": None,
-            "asset_id": None,
-            "workflow_type": "unknown",
-            "action_type": "unknown",
-            "source_trigger": None,
+            "user_id": get_user_id(),
+            "room_id": get_room_id(),
+            "version_id": get_version_id(),
+            "asset_id": get_asset_id(),
+            "workflow_type": get_workflow_type() or "unknown",
+            "action_type": get_action_type() or "unknown",
+            "source_trigger": get_source_trigger(),
             "input_tokens": _extract_int_usage_value(
                 usage_data,
                 "prompt_token_count",
@@ -2360,13 +2454,13 @@ def _write_gemini_usage_event_best_effort(
             "error_code": error_code,
             "metadata": metadata_payload,
             "route": route_path,
-            "source_trigger": None,
-            "user_id": None,
-            "room_id": None,
-            "version_id": None,
-            "asset_id": None,
-            "workflow_type": "unknown",
-            "action_type": "unknown",
+            "source_trigger": get_source_trigger(),
+            "user_id": get_user_id(),
+            "room_id": get_room_id(),
+            "version_id": get_version_id(),
+            "asset_id": get_asset_id(),
+            "workflow_type": get_workflow_type() or "unknown",
+            "action_type": get_action_type() or "unknown",
             "input_tokens": None,
             "output_tokens": None,
             "image_count": None,
