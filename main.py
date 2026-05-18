@@ -64,6 +64,11 @@ DEBUG_ROOMPRINTZ_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_PROMPT", "0") == "1"
 # Strict Stage 3 prompt dump flag (route-level, exact prompt text).
 DEBUG_ROOMPRINTZ_STAGE3_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_STAGE3_PROMPT", "0") == "1"
 
+# Gate Gemini prompt logging behind explicit env opt-in.
+VIBODE_LOG_GEMINI_PROMPTS = (
+    os.getenv("VIBODE_LOG_GEMINI_PROMPTS", "false").strip().lower() in ("1", "true", "yes", "on")
+)
+
 # Toggle ratio debug return
 DEBUG_ROOMPRINTZ_RATIO = os.getenv("DEBUG_ROOMPRINTZ_RATIO", "0") == "1"
 # Toggle ingest checkpoint image metrics logging (off by default)
@@ -340,6 +345,21 @@ def log_event(event: str, **fields: Any) -> None:
     for key in sorted(fields.keys()):
         parts.append(f"{key}={_log_value(fields[key])}")
     print("[roomprintz]", " ".join(parts))
+
+
+def _log_gemini_prompt_debug(*, function_name: str, model_name: str, prompt: str) -> None:
+    if not VIBODE_LOG_GEMINI_PROMPTS:
+        return
+    route = get_route_path() or "(unknown)"
+    request_id = get_request_id()
+    print(
+        "[roomprintz] "
+        f"event=gemini_prompt_debug route={route} request_id={request_id} "
+        f"model_name={model_name} function={function_name} prompt_chars={len(prompt)}"
+    )
+    print("----- BEGIN GEMINI PROMPT -----")
+    print(prompt)
+    print("----- END GEMINI PROMPT -----")
 
 
 PASTE_TO_PLACE_JOB_ID_HEADER = "x-vibode-paste-to-place-job-id"
@@ -911,6 +931,65 @@ Output requirements:
     return final_prompt
 
 
+def build_stage_room_model_decided_staging_prompt(
+    reference_image_count: int,
+    reference_item_labels: Optional[List[str]] = None,
+    room_type: Optional[str] = None,
+) -> str:
+    item_count = max(1, int(reference_image_count))
+    fragments: List[str] = [
+        "You are an expert interior staging and photorealistic image-editing model.",
+        (
+            "Task:\n"
+            "Stage the provided room photo by adding the provided furniture/product reference images into the room."
+        ),
+        (
+            "Inputs:\n"
+            "- The first image is the room/base image to edit.\n"
+            "- The additional reference images are the furniture/product items to place into the room.\n"
+            f"- You are given {item_count} furniture reference images. Place all {item_count} items into the room exactly once unless an item is physically impossible to fit."
+        ),
+    ]
+    if room_type:
+        key = room_type.strip().lower()
+        hint = ROOM_TYPE_HINTS.get(key) or (
+            "This room has a specific existing function. Preserve that function and "
+            "do not convert it into a different type of room."
+        )
+        fragments.append(f"Room type context:\n- {hint}")
+
+    normalized_labels = [label.strip() for label in (reference_item_labels or []) if isinstance(label, str) and label.strip()]
+    if normalized_labels:
+        fragments.append(
+            "Furniture reference items:\n"
+            + "\n".join(f"- {label}" for label in normalized_labels)
+        )
+
+    fragments.append(
+        (
+            "Placement behavior:\n"
+            "- Decide the best plausible location for each item based on room layout, floor plane, walls, camera perspective, and interior design logic.\n"
+            "- Arrange all provided items naturally as one coherent staged room.\n"
+            "- Prioritize larger anchor furniture first (beds, sofas, dining tables), then place secondary/accent items naturally around them.\n"
+            "- Respect existing architecture and do not change room structure.\n"
+            "- Match each item's scale, perspective, contact with floor/walls, shadows, lighting direction, and occlusion realistically.\n"
+            "- Keep items recognizable and faithful to their reference images."
+        )
+    )
+    fragments.append(
+        (
+            "Important constraints:\n"
+            "- Do not ignore any provided furniture reference image.\n"
+            "- Do not only enhance the room photo; the main task is furniture placement.\n"
+            "- Only add the provided furniture reference items; do not add unrelated new furniture or decor.\n"
+            "- Do not remove or alter structural elements.\n"
+            "- Preserve architecture, camera angle, perspective, windows, doors, walls, floors, ceilings, built-ins, and overall lighting consistency.\n"
+            "- Return one single photorealistic final staged room image."
+        )
+    )
+    return "\n\n".join(fragments)
+
+
 # ---------- FASTAPI APP ----------
 
 app = FastAPI()
@@ -982,6 +1061,8 @@ class StageRoomReferenceImage(BaseModel):
     imageBase64: Optional[str] = None
     mimeType: Optional[str] = None
     sourceUrl: Optional[str] = None
+    label: Optional[str] = None
+    skuId: Optional[str] = None
 
 
 class StageRoomRequest(BaseModel):
@@ -1005,6 +1086,7 @@ class StageRoomRequest(BaseModel):
 
     # ✅ Continuation mode (Continue from this image)
     isContinuation: bool = False
+    placementIntent: Optional[str] = None
     referenceImageUrls: Optional[List[str]] = None
     referenceImageBase64s: Optional[List[str]] = None
     referenceImages: Optional[List[StageRoomReferenceImage]] = None
@@ -1309,6 +1391,11 @@ def call_gemini_with_prompt(
                 )
             )
 
+        _log_gemini_prompt_debug(
+            function_name="call_gemini_with_prompt",
+            model_name=model_name,
+            prompt=prompt,
+        )
         response = client.models.generate_content(
             model=model_name,
             contents=contents,
@@ -1399,17 +1486,32 @@ def run_fusion(
     model_name: str,
     aspect_ratio: Optional[str],
     reference_image_png_bytes_list: Optional[List[bytes]] = None,
+    prompt_override: Optional[str] = None,
+    prompt_intent: str = "default_roomprintz",
+    prompt_version: str = "roomprintz_base_v1",
 ) -> bytes:
-    prompt = build_roomprintz_prompt(
-        enhance_photo=enhance_photo,
-        cleanup_room=cleanup_room,
-        repair_damage=repair_damage,
-        empty_room=empty_room,
-        renovate_room=renovate_room,
-        repaint_walls=repaint_walls,
-        flooring_preset=flooring_preset,
-        style_id=style_id,
-        room_type=room_type,
+    prompt = (
+        prompt_override
+        if isinstance(prompt_override, str) and prompt_override.strip()
+        else build_roomprintz_prompt(
+            enhance_photo=enhance_photo,
+            cleanup_room=cleanup_room,
+            repair_damage=repair_damage,
+            empty_room=empty_room,
+            renovate_room=renovate_room,
+            repaint_walls=repaint_walls,
+            flooring_preset=flooring_preset,
+            style_id=style_id,
+            room_type=room_type,
+        )
+    )
+    prompt_summary = summarize_prompt(prompt)
+    log_event(
+        "stage_room_prompt_dispatch",
+        route="/stage-room",
+        prompt_intent=prompt_intent,
+        prompt_version=prompt_version,
+        **prompt_summary,
     )
 
     return call_gemini_with_prompt(
@@ -1434,6 +1536,9 @@ def run_photo_tools(
     model_name: str,
     aspect_ratio: Optional[str],
     reference_image_png_bytes_list: Optional[List[bytes]] = None,
+    prompt_override: Optional[str] = None,
+    prompt_intent: str = "default_roomprintz",
+    prompt_version: str = "roomprintz_base_v1",
 ) -> bytes:
     return run_fusion(
         image_png_bytes=image_png_bytes,
@@ -1449,6 +1554,9 @@ def run_photo_tools(
         model_name=model_name,
         aspect_ratio=aspect_ratio,
         reference_image_png_bytes_list=reference_image_png_bytes_list,
+        prompt_override=prompt_override,
+        prompt_intent=prompt_intent,
+        prompt_version=prompt_version,
     )
 
 
@@ -5071,6 +5179,11 @@ def call_gemini_multimodal(
                     )
                 )
             )
+        _log_gemini_prompt_debug(
+            function_name="call_gemini_multimodal",
+            model_name=model_name,
+            prompt=prompt,
+        )
         response = client.models.generate_content(
             model=model_name,
             contents=contents,
@@ -5275,6 +5388,49 @@ async def stage_room(req: StageRoomRequest):
     reference_image_base64s_count = len(req.referenceImageBase64s or [])
     reference_images_count = len(req.referenceImages or [])
     reference_image_png_bytes_list = _collect_stage_room_reference_png_bytes(req)
+    placement_intent = (req.placementIntent or "").strip().lower()
+    reference_item_labels: List[str] = []
+    for ref in req.referenceImages or []:
+        candidate_label = (ref.label or ref.skuId or "").strip()
+        if candidate_label:
+            reference_item_labels.append(candidate_label)
+    # Fallback label extraction for legacy-shaped reference image payloads.
+    if not reference_item_labels:
+        for ref in req.referenceImages or []:
+            for field_name in ("name", "title"):
+                raw_value = getattr(ref, field_name, None)
+                if isinstance(raw_value, str) and raw_value.strip():
+                    reference_item_labels.append(raw_value.strip())
+                    break
+
+    stage_room_prompt_override: Optional[str] = None
+    prompt_intent = "default_roomprintz"
+    prompt_version = "roomprintz_base_v1"
+    if placement_intent == "model_decided" and len(reference_image_png_bytes_list) > 0:
+        stage_room_prompt_override = build_stage_room_model_decided_staging_prompt(
+            reference_image_count=len(reference_image_png_bytes_list),
+            reference_item_labels=reference_item_labels,
+            room_type=req.roomType,
+        )
+        prompt_intent = "model_decided_staging"
+        prompt_version = "model_decided_staging_v1"
+
+    resolved_stage_room_prompt = (
+        stage_room_prompt_override
+        if stage_room_prompt_override
+        else build_roomprintz_prompt(
+            enhance_photo=req.enhancePhoto,
+            cleanup_room=req.cleanupRoom,
+            repair_damage=req.repairDamage,
+            empty_room=req.emptyRoom,
+            renovate_room=req.renovateRoom,
+            repaint_walls=req.repaintWalls,
+            flooring_preset=req.flooringPreset,
+            style_id=req.styleId,
+            room_type=req.roomType,
+        )
+    )
+    stage_room_prompt_summary = summarize_prompt(resolved_stage_room_prompt)
     final_multimodal_image_input_count = 1 + len(reference_image_png_bytes_list)
     print(
         "[/stage-room] Reference image debug:",
@@ -5282,9 +5438,13 @@ async def stage_room(req: StageRoomRequest):
             "referenceImageUrlsCount": reference_image_urls_count,
             "referenceImageBase64sCount": reference_image_base64s_count,
             "referenceImagesCount": reference_images_count,
+            "referenceItemLabelCount": len(reference_item_labels),
             "maxAdditionalRefs": STAGE_ROOM_MAX_REFERENCE_IMAGES,
             "acceptedAdditionalRefs": len(reference_image_png_bytes_list),
             "finalMultimodalImageInputCount": final_multimodal_image_input_count,
+            "placementIntent": placement_intent or "(none)",
+            "promptIntent": prompt_intent,
+            "promptVersion": prompt_version,
         },
     )
     if reference_image_urls_count > 0:
@@ -5307,7 +5467,19 @@ async def stage_room(req: StageRoomRequest):
             "sentAspectRatio": aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
             "allowFlashNonSquare": ALLOW_FLASH_NON_SQUARE,
             "maxInputLongEdge": MAX_INPUT_LONG_EDGE_INT,
+            "placementIntent": placement_intent or "(none)",
+            "promptIntent": prompt_intent,
+            "promptVersion": prompt_version,
         },
+    )
+    log_event(
+        "stage_room_prompt_ready",
+        route="/stage-room",
+        placement_intent=placement_intent or "(none)",
+        prompt_intent=prompt_intent,
+        prompt_version=prompt_version,
+        reference_image_count=len(reference_image_png_bytes_list),
+        **stage_room_prompt_summary,
     )
 
     try:
@@ -5326,6 +5498,9 @@ async def stage_room(req: StageRoomRequest):
                 model_name=model_name,
                 aspect_ratio=aspect_ratio_to_send,
                 reference_image_png_bytes_list=reference_image_png_bytes_list,
+                prompt_override=stage_room_prompt_override,
+                prompt_intent=prompt_intent,
+                prompt_version=prompt_version,
             )
         else:
             out_bytes = run_photo_tools(
@@ -5341,6 +5516,9 @@ async def stage_room(req: StageRoomRequest):
                 model_name=model_name,
                 aspect_ratio=aspect_ratio_to_send,
                 reference_image_png_bytes_list=reference_image_png_bytes_list,
+                prompt_override=stage_room_prompt_override,
+                prompt_intent=prompt_intent,
+                prompt_version=prompt_version,
             )
     except Exception as e:
         log_event("stage_room_processing_failed", error=str(e))
