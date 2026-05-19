@@ -1312,6 +1312,7 @@ class VibodeUserSkuIngestRequest(BaseModel):
     imageUrl: Optional[str] = None
     imageBase64: Optional[str] = None
     label: Optional[str] = None
+    model: Optional[str] = None
     normalization: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
@@ -6828,7 +6829,15 @@ async def ingest_user_sku(ingest_req: VibodeUserSkuIngestRequest, http_request: 
     route = "/api/vibode/user-skus/ingest"
     started_at = time.perf_counter()
     user_sku_id = "user_" + uuid4().hex
-    model_name = DEFAULT_MODEL_NAME
+    body_model_raw = (ingest_req.model or "").strip()
+    header_model_raw = (http_request.headers.get("x-roomprintz-ingest-image-model") or "").strip()
+    requested_model_raw = body_model_raw or header_model_raw
+    model_name = resolve_model_name_for_route(route, requested_model_raw or None)
+    model_source = (
+        "body:model"
+        if body_model_raw
+        else ("header:x-roomprintz-ingest-image-model" if header_model_raw else "default")
+    )
     source_url = ingest_req.imageUrl.strip() if ingest_req.imageUrl and ingest_req.imageUrl.strip() else None
     resolved_label = (ingest_req.label or "").strip() or "User Upload"
     preview_bg_override_flags = _extract_user_sku_preview_bg_override_flags(ingest_req, http_request)
@@ -6878,6 +6887,9 @@ async def ingest_user_sku(ingest_req: VibodeUserSkuIngestRequest, http_request: 
     _ingest_log(
         "vibode_user_sku_ingest_started",
         source="imageUrl" if source_url else "imageBase64",
+        model_source=model_source,
+        model_requested=requested_model_raw or None,
+        model_name=model_name,
         status="started",
     )
 
