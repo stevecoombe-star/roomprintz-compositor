@@ -8,7 +8,7 @@ import inspect
 import time
 from contextvars import ContextVar
 from datetime import datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 from urllib.parse import quote, urlparse
 from typing import Any, Literal, Optional, Tuple, Dict, List
 
@@ -64,6 +64,11 @@ DEBUG_ROOMPRINTZ_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_PROMPT", "0") == "1"
 # Strict Stage 3 prompt dump flag (route-level, exact prompt text).
 DEBUG_ROOMPRINTZ_STAGE3_PROMPT = os.getenv("DEBUG_ROOMPRINTZ_STAGE3_PROMPT", "0") == "1"
 
+# Gate Gemini prompt logging behind explicit env opt-in.
+VIBODE_LOG_GEMINI_PROMPTS = (
+    os.getenv("VIBODE_LOG_GEMINI_PROMPTS", "false").strip().lower() in ("1", "true", "yes", "on")
+)
+
 # Toggle ratio debug return
 DEBUG_ROOMPRINTZ_RATIO = os.getenv("DEBUG_ROOMPRINTZ_RATIO", "0") == "1"
 # Toggle ingest checkpoint image metrics logging (off by default)
@@ -75,6 +80,7 @@ MAX_INPUT_LONG_EDGE = os.getenv("ROOMPRINTZ_MAX_INPUT_LONG_EDGE", "2048").strip(
 MAX_INPUT_LONG_EDGE_INT = (
     int(MAX_INPUT_LONG_EDGE) if MAX_INPUT_LONG_EDGE.isdigit() else None
 )
+STAGE_ROOM_MAX_REFERENCE_IMAGES = 8
 
 # ✅ CHANGE: beta testing wants ALL ratios for Gemini 2.5 Flash.
 # We keep the env var, but default it to "1" so Flash is NOT forced to 1:1.
@@ -88,8 +94,10 @@ USER_SKU_FORCED_PREVIEW_BG_RGB = (237, 237, 237)
 USER_SKU_INGEST_TIMEOUT_SECONDS = 10.0
 SUPABASE_SIGNED_URL_TTL_SECONDS = 7 * 24 * 60 * 60
 SUPABASE_STORAGE_UPLOAD_TIMEOUT_SECONDS = 20.0
+SUPABASE_USAGE_WRITE_TIMEOUT_SECONDS = 2.5
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").strip()
 SUPABASE_SERVICE_KEY = (os.getenv("SUPABASE_SERVICE_KEY") or "").strip()
+SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 SUPABASE_STORAGE_BUCKET = (
     os.getenv("SUPABASE_STORAGE_BUCKET")
     or os.getenv("NEXT_PUBLIC_SUPABASE_STORAGE_BUCKET")
@@ -189,10 +197,92 @@ _REQUEST_ID_HEADER_MAX_LEN = 100
 _REQUEST_ID_ALLOWED_CHARS = set(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-:"
 )
+_VIBODE_CORRELATION_ID_MAX_LEN = 140
+_VIBODE_CORRELATION_ALLOWED_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-:"
+)
+_OPERATION_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_operation_id", default=None)
+_ATTEMPT_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_attempt_id", default=None)
+_ROUTE_PATH_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_route_path", default=None)
+_PROVIDER_ATTEMPT_SEQ_CTX: ContextVar[int] = ContextVar("roomprintz_provider_attempt_seq", default=0)
+_USER_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_user_id", default=None)
+_USER_EMAIL_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_user_email", default=None)
+_ROOM_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_room_id", default=None)
+_VERSION_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_version_id", default=None)
+_ASSET_ID_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_asset_id", default=None)
+_WORKFLOW_TYPE_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_workflow_type", default=None)
+_ACTION_TYPE_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_action_type", default=None)
+_SOURCE_TRIGGER_CTX: ContextVar[Optional[str]] = ContextVar("roomprintz_source_trigger", default=None)
+VIBODE_REQUEST_ID_HEADER = "x-vibode-request-id"
+VIBODE_OPERATION_ID_HEADER = "x-vibode-operation-id"
+VIBODE_ATTEMPT_ID_HEADER = "x-vibode-attempt-id"
+VIBODE_USER_ID_HEADER = "x-vibode-user-id"
+VIBODE_USER_EMAIL_HEADER = "x-vibode-user-email"
+VIBODE_ROOM_ID_HEADER = "x-vibode-room-id"
+VIBODE_VERSION_ID_HEADER = "x-vibode-version-id"
+VIBODE_ASSET_ID_HEADER = "x-vibode-asset-id"
+VIBODE_WORKFLOW_TYPE_HEADER = "x-vibode-workflow-type"
+VIBODE_ACTION_TYPE_HEADER = "x-vibode-action-type"
+VIBODE_SOURCE_TRIGGER_HEADER = "x-vibode-source-trigger"
 
 
 def get_request_id() -> str:
     return _REQUEST_ID_CTX.get()
+
+
+def get_operation_id() -> Optional[str]:
+    return _OPERATION_ID_CTX.get()
+
+
+def get_attempt_id() -> Optional[str]:
+    return _ATTEMPT_ID_CTX.get()
+
+
+def get_route_path() -> Optional[str]:
+    return _ROUTE_PATH_CTX.get()
+
+
+def get_user_id() -> Optional[str]:
+    return _USER_ID_CTX.get()
+
+
+def get_user_email() -> Optional[str]:
+    return _USER_EMAIL_CTX.get()
+
+
+def get_room_id() -> Optional[str]:
+    return _ROOM_ID_CTX.get()
+
+
+def get_version_id() -> Optional[str]:
+    return _VERSION_ID_CTX.get()
+
+
+def get_asset_id() -> Optional[str]:
+    return _ASSET_ID_CTX.get()
+
+
+def get_workflow_type() -> Optional[str]:
+    return _WORKFLOW_TYPE_CTX.get()
+
+
+def get_action_type() -> Optional[str]:
+    return _ACTION_TYPE_CTX.get()
+
+
+def get_source_trigger() -> Optional[str]:
+    return _SOURCE_TRIGGER_CTX.get()
+
+
+def _next_provider_attempt_id() -> str:
+    inbound_attempt_id = get_attempt_id()
+    if inbound_attempt_id:
+        next_seq = _PROVIDER_ATTEMPT_SEQ_CTX.get() + 1
+        _PROVIDER_ATTEMPT_SEQ_CTX.set(next_seq)
+        if next_seq == 1:
+            return inbound_attempt_id
+        return f"{inbound_attempt_id}:{next_seq}"
+    return uuid4().hex
 
 
 def _sanitize_inbound_request_id(header_value: Optional[str]) -> Optional[str]:
@@ -210,6 +300,38 @@ def _sanitize_inbound_request_id(header_value: Optional[str]) -> Optional[str]:
     return candidate
 
 
+def _sanitize_vibode_correlation_id(header_value: Optional[str]) -> Optional[str]:
+    if not header_value:
+        return None
+    candidate = str(header_value).strip()
+    if not candidate:
+        return None
+    if len(candidate) > _VIBODE_CORRELATION_ID_MAX_LEN:
+        return None
+    if any(ch not in _VIBODE_CORRELATION_ALLOWED_CHARS for ch in candidate):
+        return None
+    return candidate
+
+
+def _sanitize_optional_header_value(header_value: Optional[str]) -> Optional[str]:
+    if header_value is None:
+        return None
+    candidate = str(header_value).strip()
+    if not candidate:
+        return None
+    return candidate
+
+
+def _sanitize_uuid_header_value(header_value: Optional[str]) -> Optional[str]:
+    candidate = _sanitize_optional_header_value(header_value)
+    if not candidate:
+        return None
+    try:
+        return str(UUID(candidate))
+    except Exception:
+        return None
+
+
 def _log_value(value: Any) -> str:
     if isinstance(value, str):
         return value.replace("\n", "\\n")
@@ -223,6 +345,21 @@ def log_event(event: str, **fields: Any) -> None:
     for key in sorted(fields.keys()):
         parts.append(f"{key}={_log_value(fields[key])}")
     print("[roomprintz]", " ".join(parts))
+
+
+def _log_gemini_prompt_debug(*, function_name: str, model_name: str, prompt: str) -> None:
+    if not VIBODE_LOG_GEMINI_PROMPTS:
+        return
+    route = get_route_path() or "(unknown)"
+    request_id = get_request_id()
+    print(
+        "[roomprintz] "
+        f"event=gemini_prompt_debug route={route} request_id={request_id} "
+        f"model_name={model_name} function={function_name} prompt_chars={len(prompt)}"
+    )
+    print("----- BEGIN GEMINI PROMPT -----")
+    print(prompt)
+    print("----- END GEMINI PROMPT -----")
 
 
 PASTE_TO_PLACE_JOB_ID_HEADER = "x-vibode-paste-to-place-job-id"
@@ -794,6 +931,65 @@ Output requirements:
     return final_prompt
 
 
+def build_stage_room_model_decided_staging_prompt(
+    reference_image_count: int,
+    reference_item_labels: Optional[List[str]] = None,
+    room_type: Optional[str] = None,
+) -> str:
+    item_count = max(1, int(reference_image_count))
+    fragments: List[str] = [
+        "You are an expert interior staging and photorealistic image-editing model.",
+        (
+            "Task:\n"
+            "Stage the provided room photo by adding the provided furniture/product reference images into the room."
+        ),
+        (
+            "Inputs:\n"
+            "- The first image is the room/base image to edit.\n"
+            "- The additional reference images are the furniture/product items to place into the room.\n"
+            f"- You are given {item_count} furniture reference images. Place all {item_count} items into the room exactly once unless an item is physically impossible to fit."
+        ),
+    ]
+    if room_type:
+        key = room_type.strip().lower()
+        hint = ROOM_TYPE_HINTS.get(key) or (
+            "This room has a specific existing function. Preserve that function and "
+            "do not convert it into a different type of room."
+        )
+        fragments.append(f"Room type context:\n- {hint}")
+
+    normalized_labels = [label.strip() for label in (reference_item_labels or []) if isinstance(label, str) and label.strip()]
+    if normalized_labels:
+        fragments.append(
+            "Furniture reference items:\n"
+            + "\n".join(f"- {label}" for label in normalized_labels)
+        )
+
+    fragments.append(
+        (
+            "Placement behavior:\n"
+            "- Decide the best plausible location for each item based on room layout, floor plane, walls, camera perspective, and interior design logic.\n"
+            "- Arrange all provided items naturally as one coherent staged room.\n"
+            "- Prioritize larger anchor furniture first (beds, sofas, dining tables), then place secondary/accent items naturally around them.\n"
+            "- Respect existing architecture and do not change room structure.\n"
+            "- Match each item's scale, perspective, contact with floor/walls, shadows, lighting direction, and occlusion realistically.\n"
+            "- Keep items recognizable and faithful to their reference images."
+        )
+    )
+    fragments.append(
+        (
+            "Important constraints:\n"
+            "- Do not ignore any provided furniture reference image.\n"
+            "- Do not only enhance the room photo; the main task is furniture placement.\n"
+            "- Only add the provided furniture reference items; do not add unrelated new furniture or decor.\n"
+            "- Do not remove or alter structural elements.\n"
+            "- Preserve architecture, camera angle, perspective, windows, doors, walls, floors, ceilings, built-ins, and overall lighting consistency.\n"
+            "- Return one single photorealistic final staged room image."
+        )
+    )
+    return "\n\n".join(fragments)
+
+
 # ---------- FASTAPI APP ----------
 
 app = FastAPI()
@@ -801,13 +997,52 @@ app = FastAPI()
 
 @app.middleware("http")
 async def add_request_id_middleware(request: Request, call_next):
-    request_id = _sanitize_inbound_request_id(request.headers.get("X-Request-Id")) or uuid4().hex[:12]
+    vibode_request_id = _sanitize_vibode_correlation_id(request.headers.get(VIBODE_REQUEST_ID_HEADER))
+    request_id = (
+        vibode_request_id
+        or _sanitize_inbound_request_id(request.headers.get("X-Request-Id"))
+        or uuid4().hex[:12]
+    )
+    operation_id = _sanitize_vibode_correlation_id(request.headers.get(VIBODE_OPERATION_ID_HEADER))
+    attempt_id = _sanitize_vibode_correlation_id(request.headers.get(VIBODE_ATTEMPT_ID_HEADER))
+    user_id = _sanitize_uuid_header_value(request.headers.get(VIBODE_USER_ID_HEADER))
+    user_email = _sanitize_optional_header_value(request.headers.get(VIBODE_USER_EMAIL_HEADER))
+    room_id = _sanitize_uuid_header_value(request.headers.get(VIBODE_ROOM_ID_HEADER))
+    version_id = _sanitize_uuid_header_value(request.headers.get(VIBODE_VERSION_ID_HEADER))
+    asset_id = _sanitize_uuid_header_value(request.headers.get(VIBODE_ASSET_ID_HEADER))
+    workflow_type = _sanitize_optional_header_value(request.headers.get(VIBODE_WORKFLOW_TYPE_HEADER))
+    action_type = _sanitize_optional_header_value(request.headers.get(VIBODE_ACTION_TYPE_HEADER))
+    source_trigger = _sanitize_optional_header_value(request.headers.get(VIBODE_SOURCE_TRIGGER_HEADER))
     token = _REQUEST_ID_CTX.set(request_id)
+    operation_token = _OPERATION_ID_CTX.set(operation_id)
+    attempt_token = _ATTEMPT_ID_CTX.set(attempt_id)
+    user_id_token = _USER_ID_CTX.set(user_id)
+    user_email_token = _USER_EMAIL_CTX.set(user_email)
+    room_id_token = _ROOM_ID_CTX.set(room_id)
+    version_id_token = _VERSION_ID_CTX.set(version_id)
+    asset_id_token = _ASSET_ID_CTX.set(asset_id)
+    workflow_type_token = _WORKFLOW_TYPE_CTX.set(workflow_type)
+    action_type_token = _ACTION_TYPE_CTX.set(action_type)
+    source_trigger_token = _SOURCE_TRIGGER_CTX.set(source_trigger)
+    route_token = _ROUTE_PATH_CTX.set(request.url.path if request.url and request.url.path else None)
+    seq_token = _PROVIDER_ATTEMPT_SEQ_CTX.set(0)
     try:
         response = await call_next(request)
         response.headers["X-Request-Id"] = request_id
         return response
     finally:
+        _PROVIDER_ATTEMPT_SEQ_CTX.reset(seq_token)
+        _ROUTE_PATH_CTX.reset(route_token)
+        _SOURCE_TRIGGER_CTX.reset(source_trigger_token)
+        _ACTION_TYPE_CTX.reset(action_type_token)
+        _WORKFLOW_TYPE_CTX.reset(workflow_type_token)
+        _ASSET_ID_CTX.reset(asset_id_token)
+        _VERSION_ID_CTX.reset(version_id_token)
+        _ROOM_ID_CTX.reset(room_id_token)
+        _USER_EMAIL_CTX.reset(user_email_token)
+        _USER_ID_CTX.reset(user_id_token)
+        _ATTEMPT_ID_CTX.reset(attempt_token)
+        _OPERATION_ID_CTX.reset(operation_token)
         _REQUEST_ID_CTX.reset(token)
 
 
@@ -820,6 +1055,14 @@ class HealthResponse(BaseModel):
 class PasteToPlaceCancelRequest(BaseModel):
     scopeId: str
     jobId: str
+
+
+class StageRoomReferenceImage(BaseModel):
+    imageBase64: Optional[str] = None
+    mimeType: Optional[str] = None
+    sourceUrl: Optional[str] = None
+    label: Optional[str] = None
+    skuId: Optional[str] = None
 
 
 class StageRoomRequest(BaseModel):
@@ -843,6 +1086,10 @@ class StageRoomRequest(BaseModel):
 
     # ✅ Continuation mode (Continue from this image)
     isContinuation: bool = False
+    placementIntent: Optional[str] = None
+    referenceImageUrls: Optional[List[str]] = None
+    referenceImageBase64s: Optional[List[str]] = None
+    referenceImages: Optional[List[StageRoomReferenceImage]] = None
 
 
 class StageRoomResponse(BaseModel):
@@ -1065,6 +1312,7 @@ class VibodeUserSkuIngestRequest(BaseModel):
     imageUrl: Optional[str] = None
     imageBase64: Optional[str] = None
     label: Optional[str] = None
+    model: Optional[str] = None
     normalization: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
@@ -1094,20 +1342,29 @@ def call_gemini_with_prompt(
     prompt: str,
     model_name: str,
     aspect_ratio: Optional[str] = None,
+    additional_image_png_bytes_list: Optional[List[bytes]] = None,
 ) -> bytes:
     """
     If aspect_ratio is None, we OMIT image_config.aspect_ratio entirely
     (premium continuation behavior).
     """
     started_at = time.perf_counter()
+    provider_attempt_id = _next_provider_attempt_id()
+    accounting_status = "failed"
+    accounting_error_code: Optional[str] = None
+    accounting_error_message: Optional[str] = None
+    accounting_usage_metrics: Dict[str, Any] = {}
+    response: Optional[Any] = None
     logged_terminal_failure = False
+    additional_images = additional_image_png_bytes_list or []
     log_event(
         "model_call_start",
         function="call_gemini_with_prompt",
         model_name=model_name,
         modality="image+text",
         aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
-        image_count=1,
+        image_count=1 + len(additional_images),
+        additional_image_count=len(additional_images),
         input_png_bytes=len(image_png_bytes),
     )
     try:
@@ -1116,19 +1373,36 @@ def call_gemini_with_prompt(
         if aspect_ratio:
             config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio)
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[
-                prompt,
+        contents = [
+            prompt,
+            types.Part(
+                inline_data=types.Blob(
+                    data=image_png_bytes,
+                    mime_type="image/png",
+                )
+            ),
+        ]
+        for extra_png_bytes in additional_images:
+            contents.append(
                 types.Part(
                     inline_data=types.Blob(
-                        data=image_png_bytes,
+                        data=extra_png_bytes,
                         mime_type="image/png",
                     )
-                ),
-            ],
+                )
+            )
+
+        _log_gemini_prompt_debug(
+            function_name="call_gemini_with_prompt",
+            model_name=model_name,
+            prompt=prompt,
+        )
+        response = client.models.generate_content(
+            model=model_name,
+            contents=contents,
             config=types.GenerateContentConfig(**config_kwargs),
         )
+        accounting_usage_metrics = _extract_provider_usage_metrics(response)
 
         try:
             candidate = response.candidates[0]
@@ -1168,9 +1442,14 @@ def call_gemini_with_prompt(
             output_png_bytes=len(out_bytes),
             latency_ms=int((time.perf_counter() - started_at) * 1000),
         )
+        accounting_status = "success"
         return out_bytes
 
     except Exception as e:
+        accounting_error_code = type(e).__name__
+        accounting_error_message = str(e)
+        if response is not None and not accounting_usage_metrics:
+            accounting_usage_metrics = _extract_provider_usage_metrics(response)
         if not logged_terminal_failure:
             log_event(
                 "model_call_failed",
@@ -1182,6 +1461,16 @@ def call_gemini_with_prompt(
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
             )
         raise
+    finally:
+        _write_gemini_usage_event_best_effort(
+            attempt_id=provider_attempt_id,
+            model_name=model_name,
+            status=accounting_status,
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+            error_code=accounting_error_code,
+            error_message=accounting_error_message,
+            usage_metrics=accounting_usage_metrics,
+        )
 
 
 def run_fusion(
@@ -1197,20 +1486,42 @@ def run_fusion(
     room_type: Optional[str],
     model_name: str,
     aspect_ratio: Optional[str],
+    reference_image_png_bytes_list: Optional[List[bytes]] = None,
+    prompt_override: Optional[str] = None,
+    prompt_intent: str = "default_roomprintz",
+    prompt_version: str = "roomprintz_base_v1",
 ) -> bytes:
-    prompt = build_roomprintz_prompt(
-        enhance_photo=enhance_photo,
-        cleanup_room=cleanup_room,
-        repair_damage=repair_damage,
-        empty_room=empty_room,
-        renovate_room=renovate_room,
-        repaint_walls=repaint_walls,
-        flooring_preset=flooring_preset,
-        style_id=style_id,
-        room_type=room_type,
+    prompt = (
+        prompt_override
+        if isinstance(prompt_override, str) and prompt_override.strip()
+        else build_roomprintz_prompt(
+            enhance_photo=enhance_photo,
+            cleanup_room=cleanup_room,
+            repair_damage=repair_damage,
+            empty_room=empty_room,
+            renovate_room=renovate_room,
+            repaint_walls=repaint_walls,
+            flooring_preset=flooring_preset,
+            style_id=style_id,
+            room_type=room_type,
+        )
+    )
+    prompt_summary = summarize_prompt(prompt)
+    log_event(
+        "stage_room_prompt_dispatch",
+        route="/stage-room",
+        prompt_intent=prompt_intent,
+        prompt_version=prompt_version,
+        **prompt_summary,
     )
 
-    return call_gemini_with_prompt(image_png_bytes, prompt, model_name, aspect_ratio)
+    return call_gemini_with_prompt(
+        image_png_bytes=image_png_bytes,
+        prompt=prompt,
+        model_name=model_name,
+        aspect_ratio=aspect_ratio,
+        additional_image_png_bytes_list=reference_image_png_bytes_list,
+    )
 
 
 def run_photo_tools(
@@ -1225,6 +1536,10 @@ def run_photo_tools(
     room_type: Optional[str],
     model_name: str,
     aspect_ratio: Optional[str],
+    reference_image_png_bytes_list: Optional[List[bytes]] = None,
+    prompt_override: Optional[str] = None,
+    prompt_intent: str = "default_roomprintz",
+    prompt_version: str = "roomprintz_base_v1",
 ) -> bytes:
     return run_fusion(
         image_png_bytes=image_png_bytes,
@@ -1239,7 +1554,50 @@ def run_photo_tools(
         room_type=room_type,
         model_name=model_name,
         aspect_ratio=aspect_ratio,
+        reference_image_png_bytes_list=reference_image_png_bytes_list,
+        prompt_override=prompt_override,
+        prompt_intent=prompt_intent,
+        prompt_version=prompt_version,
     )
+
+
+def _collect_stage_room_reference_png_bytes(
+    req: StageRoomRequest,
+    max_additional_refs: int = STAGE_ROOM_MAX_REFERENCE_IMAGES,
+) -> List[bytes]:
+    # Preferred source: structured candidate refs from referenceImages[].imageBase64.
+    # Legacy fallback: referenceImageBase64s only when structured refs have no embedded images.
+    structured_payloads: List[str] = []
+    for ref in req.referenceImages or []:
+        payload = (ref.imageBase64 or "").strip()
+        if payload:
+            structured_payloads.append(payload)
+
+    legacy_payloads: List[str] = []
+    if not structured_payloads:
+        for payload in req.referenceImageBase64s or []:
+            trimmed = (payload or "").strip()
+            if trimmed:
+                legacy_payloads.append(trimmed)
+
+    raw_payloads = structured_payloads if structured_payloads else legacy_payloads
+    reference_payloads: List[str] = []
+    seen_payloads: set[str] = set()
+    for payload in raw_payloads:
+        if payload in seen_payloads:
+            continue
+        seen_payloads.add(payload)
+        reference_payloads.append(payload)
+
+    additional_png_bytes: List[bytes] = []
+    for payload in reference_payloads[:max_additional_refs]:
+        try:
+            raw_bytes = _decode_base64_image(payload)
+            additional_png_bytes.append(prepare_sku_png_bytes(raw_bytes))
+        except Exception as e:
+            print("[/stage-room] Skipping invalid embedded reference image:", str(e))
+
+    return additional_png_bytes
 
 
 def make_data_url(image_bytes: bytes, mime_type: str = "image/png") -> str:
@@ -2071,6 +2429,201 @@ def _supabase_storage_create_signed_url(
     return normalized_signed_url
 
 
+def _require_supabase_usage_config() -> Tuple[str, str]:
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL is required.")
+    service_key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SERVICE_KEY
+    if not service_key:
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SERVICE_KEY is required.")
+    return SUPABASE_URL.rstrip("/"), service_key
+
+
+def _usage_value_to_json(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _usage_value_to_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_usage_value_to_json(v) for v in value]
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        try:
+            return _usage_value_to_json(value.model_dump())
+        except Exception:
+            return str(value)
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        try:
+            return _usage_value_to_json(value.to_dict())
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _extract_provider_usage_metrics(response: Any) -> Dict[str, Any]:
+    usage_obj = None
+    if response is not None:
+        usage_obj = getattr(response, "usage_metadata", None) or getattr(response, "usage", None)
+    usage_json = _usage_value_to_json(usage_obj)
+    return usage_json if isinstance(usage_json, dict) else {}
+
+
+def _extract_int_usage_value(usage_metrics: Dict[str, Any], *keys: str) -> Optional[int]:
+    for key in keys:
+        value = usage_metrics.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(float(value))
+            except Exception:
+                continue
+    return None
+
+
+def _write_gemini_usage_event_best_effort(
+    *,
+    attempt_id: str,
+    model_name: str,
+    status: str,
+    latency_ms: int,
+    error_code: Optional[str],
+    error_message: Optional[str],
+    usage_metrics: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        base_url, service_key = _require_supabase_usage_config()
+        usage_data = usage_metrics or {}
+        route_path = get_route_path() or "unknown"
+        metadata_payload: Dict[str, Any] = {}
+        if error_message:
+            metadata_payload["error_message"] = (error_message or "")[:4000]
+        if usage_data:
+            metadata_payload["provider_usage"] = usage_data
+        user_email = get_user_email()
+        if user_email:
+            metadata_payload["user_email"] = user_email
+        full_payload = {
+            "attempt_id": attempt_id,
+            "retry_of_attempt_id": None,
+            "is_retry": False,
+            "request_id": get_request_id() if get_request_id() != "-" else None,
+            "operation_id": get_operation_id(),
+            "provider_request_id": None,
+            "service": "roomprintz-compositor",
+            "provider": "google_gemini",
+            "model": model_name,
+            "status": status,
+            "latency_ms": max(0, int(latency_ms)),
+            "error_code": error_code,
+            "metadata": metadata_payload,
+            "route": route_path,
+            "user_id": get_user_id(),
+            "room_id": get_room_id(),
+            "version_id": get_version_id(),
+            "asset_id": get_asset_id(),
+            "workflow_type": get_workflow_type() or "unknown",
+            "action_type": get_action_type() or "unknown",
+            "source_trigger": get_source_trigger(),
+            "input_tokens": _extract_int_usage_value(
+                usage_data,
+                "prompt_token_count",
+                "prompt_tokens",
+                "input_token_count",
+                "input_tokens",
+            ),
+            "output_tokens": _extract_int_usage_value(
+                usage_data,
+                "candidates_token_count",
+                "completion_token_count",
+                "completion_tokens",
+                "output_token_count",
+                "output_tokens",
+            ),
+            "image_count": _extract_int_usage_value(
+                usage_data,
+                "image_count",
+                "generated_image_count",
+            ),
+            "reference_image_count": None,
+            "estimated_cost_usd": None,
+        }
+        minimal_payload = {
+            "attempt_id": attempt_id,
+            "retry_of_attempt_id": None,
+            "is_retry": False,
+            "request_id": get_request_id() if get_request_id() != "-" else None,
+            "operation_id": get_operation_id(),
+            "provider_request_id": None,
+            "service": "roomprintz-compositor",
+            "provider": "google_gemini",
+            "model": model_name,
+            "status": status,
+            "latency_ms": max(0, int(latency_ms)),
+            "error_code": error_code,
+            "metadata": metadata_payload,
+            "route": route_path,
+            "source_trigger": get_source_trigger(),
+            "user_id": get_user_id(),
+            "room_id": get_room_id(),
+            "version_id": get_version_id(),
+            "asset_id": get_asset_id(),
+            "workflow_type": get_workflow_type() or "unknown",
+            "action_type": get_action_type() or "unknown",
+            "input_tokens": None,
+            "output_tokens": None,
+            "image_count": None,
+            "reference_image_count": None,
+            "estimated_cost_usd": None,
+        }
+        headers = {
+            "Authorization": f"Bearer {service_key}",
+            "apikey": service_key,
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        write_url = f"{base_url}/rest/v1/vibode_gemini_usage_events?on_conflict=attempt_id"
+        response = requests.post(
+            write_url,
+            headers=headers,
+            json=[full_payload],
+            timeout=SUPABASE_USAGE_WRITE_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            fallback_response = requests.post(
+                write_url,
+                headers=headers,
+                json=[minimal_payload],
+                timeout=SUPABASE_USAGE_WRITE_TIMEOUT_SECONDS,
+            )
+            if fallback_response.status_code < 400:
+                log_event(
+                    "gemini_usage_accounting_write_fallback_succeeded",
+                    attempt_id=attempt_id,
+                    model_name=model_name,
+                    usage_table="public.vibode_gemini_usage_events",
+                )
+                return
+            log_event(
+                "gemini_usage_accounting_write_failed",
+                status_code=response.status_code,
+                body=response.text[:280],
+                fallback_status_code=fallback_response.status_code,
+                fallback_body=fallback_response.text[:280],
+                attempt_id=attempt_id,
+                model_name=model_name,
+                usage_table="public.vibode_gemini_usage_events",
+            )
+    except Exception as e:
+        log_event(
+            "gemini_usage_accounting_write_failed",
+            error=str(e),
+            attempt_id=attempt_id,
+            model_name=model_name,
+            usage_table="public.vibode_gemini_usage_events",
+        )
+
+
 def _run_user_sku_background_removal(image_png_bytes: bytes, model_name: str) -> bytes:
     return call_gemini_with_prompt(
         image_png_bytes=image_png_bytes,
@@ -2257,23 +2810,18 @@ def _draw_red_marker_pixels(img: Image.Image, cx: int, cy: int, r: int) -> None:
     if pixels is None:
         return
     width, height = img.size
-    thickness = 3
-    min_x = max(0, cx - r - thickness)
-    max_x = min(width - 1, cx + r + thickness)
-    min_y = max(0, cy - r - thickness)
-    max_y = min(height - 1, cy + r + thickness)
-    r_inner = max(0, r - thickness)
-    r_outer = r + thickness
-    r_inner_sq = r_inner * r_inner
-    r_outer_sq = r_outer * r_outer
+    radius = max(2, int(r))
+    min_x = max(0, cx - radius)
+    max_x = min(width - 1, cx + radius)
+    min_y = max(0, cy - radius)
+    max_y = min(height - 1, cy + radius)
+    radius_sq = radius * radius
     for y in range(min_y, max_y + 1):
         dy = y - cy
-        dy_sq = dy * dy
         for x in range(min_x, max_x + 1):
             dx = x - cx
-            dist_sq = dx * dx + dy_sq
-            if r_inner_sq <= dist_sq <= r_outer_sq:
-                pixels[x, y] = (255, 0, 0)
+            if (dx * dx + dy * dy) <= radius_sq:
+                pixels[x, y] = (220, 36, 36)
 
 
 def order_vibode_placements(placements: List[VibodePlacement]) -> List[VibodePlacement]:
@@ -2309,19 +2857,23 @@ def _draw_marker_label(
     cy: int,
     marker_label: str,
     radius: int,
+    font_scale: float = 0.9,
+    fill: Tuple[int, ...] = (255, 255, 255),
+    stroke_fill: Tuple[int, ...] = (0, 0, 0),
+    stroke_scale: float = 0.12,
 ) -> None:
-    font_size = max(14, int(radius * 0.9))
+    font_size = max(10, int(radius * font_scale))
     font = _load_marker_label_font(font_size)
-    stroke_width = max(1, int(round(radius * 0.12)))
+    stroke_width = max(1, int(round(radius * stroke_scale)))
     try:
         draw.text(
             (cx, cy),
             marker_label,
-            fill=(255, 255, 255),
+            fill=fill,
             font=font,
             anchor="mm",
             stroke_width=stroke_width,
-            stroke_fill=(255, 0, 0),
+            stroke_fill=stroke_fill,
         )
         return
     except Exception:
@@ -2338,37 +2890,67 @@ def _draw_marker_label(
     draw.text(
         (x, y),
         marker_label,
-        fill=(255, 255, 255),
+        fill=fill,
         font=font,
         stroke_width=stroke_width,
-        stroke_fill=(0, 0, 0),
+        stroke_fill=stroke_fill,
     )
 
 
+VIBODE_COMPOSE_MARKER_STYLE = "remove_style_numbered_red_badges_v1"
+VIBODE_COMPOSE_MARKER_RADIUS_PX = 24
+VIBODE_COMPOSE_MARKER_COLOR_FAMILY = "red_white"
+VIBODE_COMPOSE_MARKER_OPACITY = 1.0  # Keep markers fully opaque for deterministic index readability.
+VIBODE_COMPOSE_MARKER_FILL_RGB = (220, 36, 36)
+VIBODE_COMPOSE_MARKER_OUTLINE_RGB = (255, 255, 255)
+VIBODE_COMPOSE_MARKER_LABEL_FILL_RGB = (255, 255, 255)
+VIBODE_COMPOSE_MARKER_LABEL_STROKE_RGB = (0, 0, 0)
+VIBODE_COMPOSE_MARKER_OUTLINE_WIDTH_SCALE = 0.14
+VIBODE_COMPOSE_MARKER_OUTLINE_WIDTH_MIN_PX = 2
+
+
 def draw_red_markers_overlay(image_png_bytes: bytes, placements: List[VibodePlacement]) -> bytes:
+    # Image 2 is a semantic placement instruction map: robust numbered badges are preferred
+    # here to keep marker-index mapping stable across multi-item compose runs.
     img = _safe_open_image(image_png_bytes)
     if img.mode != "RGB":
         img = img.convert("RGB")
     width, height = img.size
     max_radius = max(1, min(width, height) // 4)
+    marker_fill = VIBODE_COMPOSE_MARKER_FILL_RGB
+    marker_outline = VIBODE_COMPOSE_MARKER_OUTLINE_RGB
     if _HAS_IMAGE_DRAW and ImageDraw is not None:
         draw = ImageDraw.Draw(img)
         for idx, placement in enumerate(placements):
-            radius = int(round(placement.rPx)) if placement.rPx else 60
-            radius = max(20, radius)
+            radius = int(round(placement.rPx)) if placement.rPx else VIBODE_COMPOSE_MARKER_RADIUS_PX
+            radius = max(16, radius)
             radius = min(radius, max_radius)
             cx = int(round(placement.cxPx))
             cy = int(round(placement.cyPx))
             cx = max(0, min(cx, width - 1))
             cy = max(0, min(cy, height - 1))
-            bbox = (cx - radius, cy - radius, cx + radius, cy + radius)
-            draw.ellipse(bbox, outline=(255, 0, 0), width=6)
+            badge_bbox = (cx - radius, cy - radius, cx + radius, cy + radius)
+            outline_width = max(
+                VIBODE_COMPOSE_MARKER_OUTLINE_WIDTH_MIN_PX,
+                int(round(radius * VIBODE_COMPOSE_MARKER_OUTLINE_WIDTH_SCALE)),
+            )
+            draw.ellipse(badge_bbox, fill=marker_fill, outline=marker_outline, width=outline_width)
             marker_label = str(idx + 1)
-            _draw_marker_label(draw, cx, cy, marker_label, radius)
+            _draw_marker_label(
+                draw=draw,
+                cx=cx,
+                cy=cy,
+                marker_label=marker_label,
+                radius=radius,
+                font_scale=0.92,
+                fill=VIBODE_COMPOSE_MARKER_LABEL_FILL_RGB,
+                stroke_fill=VIBODE_COMPOSE_MARKER_LABEL_STROKE_RGB,
+                stroke_scale=0.14,
+            )
     else:
         for placement in placements:
-            radius = int(round(placement.rPx)) if placement.rPx else 60
-            radius = max(20, radius)
+            radius = int(round(placement.rPx)) if placement.rPx else VIBODE_COMPOSE_MARKER_RADIUS_PX
+            radius = max(16, radius)
             radius = min(radius, max_radius)
             cx = int(round(placement.cxPx))
             cy = int(round(placement.cyPx))
@@ -3220,28 +3802,51 @@ def build_vibode_compose_prompt(
     enhance_photo: bool,
 ) -> str:
     placements_count = len(placements)
+
+    # Keep Image 1 (pixels) and Image 2 (placement metadata) explicitly separated so the
+    # model preserves room fidelity while still using unambiguous marker indices.
     lines = [
         "You are a professional real-estate photo editor.",
         "",
-        "You are given multiple images in this exact order:",
-        "1) Image 1 is the clean prepared room photo (background reference).",
-        "   Final output must match Image 1's room exactly.",
-        f"2) Image 2 is the same prepared room with numbered red circle markers (1..{placements_count}) for guidance only.",
-        "   Use Image 2 only to locate targets.",
-        "3) Each subsequent image is a single SKU item to insert, ordered by marker number.",
-        "Place SKU image i at marker i. Do not swap indices. Do not invent additional furniture.",
+        "Input images are provided in this exact order:",
+        "1) Image 1 is the clean prepared room photo.",
+        "   Use this as the only visual source for final room pixels.",
+        f"2) Image 2 is the placement instruction map with numbered red circle markers (1..{placements_count}).",
+        "   The placement instruction map is guidance metadata only.",
+        "3) Each subsequent image is a single SKU item to insert.",
         "",
-        "Strict rules:",
-        "- Place each SKU item at its corresponding numbered red marker location on the floor.",
-        "- Use Image 1 as the source of truth for room appearance; keep its background unchanged.",
-        "- Use Image 2 only as placement guidance; do not keep any markers in the final result.",
-        "- Do not move, resize, or rotate the room camera perspective.",
-        "- Do not change existing walls, windows, doors, floors, or lighting.",
-        "- Do not invent extra furniture or decor; only insert the provided SKU items.",
-        "- Add realistic contact shadows so items sit naturally on the floor.",
-        "- Remove all markup in the final image: no circles, numbers, or any text.",
+        "Sequential mapping:",
+        "- marker #1 -> SKU image #3",
+        "- marker #2 -> SKU image #4",
+        "- continue sequentially for all markers and SKU images",
+        "- Do not swap item indices.",
+        "",
+        "Placement rules:",
+        "- Place each SKU item at its corresponding numbered marker location.",
+        "- The center of each red marker is the intended placement location.",
+        "- Markers are identifiers only and are not part of the final scene.",
+        "",
+        "Room preservation rules:",
+        "- Use Image 1 as the only visual source for the room.",
+        "- Preserve the existing room layout, walls, windows, doors, floors, lighting, and camera perspective.",
+        "- Do not move, resize, rotate, or reframe the room camera.",
+        "- Do not invent extra furniture or decor.",
+        "- Only insert the provided SKU items.",
+        "- Add realistic contact shadows so items sit naturally in the room.",
+        "",
+        "Placement-instruction-map rules:",
+        "- The placement instruction map is not a visual source for final pixels.",
+        "- Treat all guide graphics as temporary invisible metadata after placement is understood.",
+        "- Do not render red circles, white numbers, outlines, labels, colors, halos, overlays, or annotation residue.",
+        "- The final image must look like a normal real-estate photograph with no graphic overlays.",
+        "",
+        "Final quality check:",
+        "- Before returning the image, inspect the final result carefully.",
+        "- Ensure every SKU item is placed at its correct corresponding marker location.",
+        "- Remove any remaining guide marks or overlay artifacts completely.",
         "- Do not add text, logos, or watermarks.",
     ]
+
     if enhance_photo:
         lines += [
             "",
@@ -3249,12 +3854,8 @@ def build_vibode_compose_prompt(
             "- Correct white balance and exposure without changing room appearance.",
             "- Improve clarity and reduce noise while staying photorealistic.",
         ]
-    if DEBUG_ROOMPRINTZ_PROMPT:
-        print("\n===== VIBODE COMPOSE PROMPT SENT TO GEMINI =====\n")
-        print("\n".join(lines))
-        print("\n=================================================\n")
-    return "\n".join(lines)
 
+    return "\n".join(lines)
 
 def build_vibode_vibe_prompt(
     eligible_skus: List[VibodeEligibleSku],
@@ -4077,6 +4678,213 @@ def _normalize_remove_label(value: Any) -> Optional[str]:
     return text
 
 
+def _is_guided_remove_mode(params: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(params, dict):
+        return False
+    mode = str(params.get("mode") or "").strip().lower()
+    return mode == "guidance-image"
+
+
+def _extract_guided_remove_prompt_text(params: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(params, dict):
+        return ""
+    candidate = params.get("guidancePromptText")
+    text = str(candidate or "").strip()
+    return text
+
+
+def _extract_guided_remove_prompt_override(params: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(params, dict):
+        return ""
+    candidates = (
+        params.get("guidancePrompt"),
+        params.get("prompt"),
+        params.get("instruction"),
+    )
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _extract_guided_remove_image_data_url(params: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(params, dict):
+        return ""
+    return str(params.get("guidanceImageDataUrl") or "").strip()
+
+
+def _looks_like_supported_guidance_data_url(image_ref: str) -> bool:
+    value = (image_ref or "").strip().lower()
+    return (
+        value.startswith("data:image/png;base64,")
+        or value.startswith("data:image/jpeg;base64,")
+        or value.startswith("data:image/jpg;base64,")
+    )
+
+
+def _extract_guidance_manifest_target_counts(guidance_manifest: Any) -> Dict[str, int]:
+    counts = {"manifest": 0, "detected": 0, "manual": 0}
+    if not isinstance(guidance_manifest, dict):
+        return counts
+
+    targets = guidance_manifest.get("targets")
+    if isinstance(targets, list):
+        counts["manifest"] = len(targets)
+    elif isinstance(guidance_manifest.get("targetCount"), int):
+        counts["manifest"] = max(0, int(guidance_manifest.get("targetCount")))
+
+    detected = guidance_manifest.get("detectedTargetCount")
+    if isinstance(detected, int):
+        counts["detected"] = max(0, int(detected))
+    elif isinstance(guidance_manifest.get("detectedTargets"), list):
+        counts["detected"] = len(guidance_manifest.get("detectedTargets"))
+
+    manual = guidance_manifest.get("manualTargetCount")
+    if isinstance(manual, int):
+        counts["manual"] = max(0, int(manual))
+    elif isinstance(guidance_manifest.get("manualTargets"), list):
+        counts["manual"] = len(guidance_manifest.get("manualTargets"))
+
+    return counts
+
+
+def _sanitize_edit_run_remove_params_for_log(params: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = dict(params or {})
+    guidance_image_data_url = sanitized.get("guidanceImageDataUrl")
+    if isinstance(guidance_image_data_url, str) and guidance_image_data_url:
+        is_data_url = guidance_image_data_url.strip().startswith("data:image/")
+        sanitized["guidanceImageDataUrl"] = (
+            f"(data-url omitted, chars={len(guidance_image_data_url.strip())})"
+            if is_data_url
+            else "(non-data-url value omitted)"
+        )
+    guidance_manifest = sanitized.get("guidanceManifest")
+    if isinstance(guidance_manifest, dict):
+        sanitized["guidanceManifest"] = {
+            "keys": sorted(list(guidance_manifest.keys())),
+            "targetCounts": _extract_guidance_manifest_target_counts(guidance_manifest),
+        }
+    return sanitized
+
+
+def _prompt_length(prompt: str) -> int:
+    return len((prompt or "").strip())
+
+
+def _url_kind_or_safe_path(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "(none)"
+    if text.startswith("data:image/"):
+        return "data-url"
+    parsed = urlparse(text)
+    if parsed.scheme in ("http", "https"):
+        safe_path = parsed.path or "/"
+        return f"remote-url:{safe_path}"
+    return "other"
+
+
+def _summarize_guided_remove_for_log(
+    params: Dict[str, Any],
+    base_image_url_kind: str,
+    prompt: Optional[str] = None,
+    guidance_png_bytes_len: Optional[int] = None,
+) -> Dict[str, Any]:
+    guidance_image_data_url = _extract_guided_remove_image_data_url(params)
+    guidance_manifest = params.get("guidanceManifest")
+    guidance_manifest_target_counts = _extract_guidance_manifest_target_counts(guidance_manifest)
+    manifest_keys: List[str] = []
+    if isinstance(guidance_manifest, dict):
+        manifest_keys = sorted(str(key) for key in guidance_manifest.keys())
+
+    source_version_id = str(
+        params.get("sourceVersionId")
+        or (
+            guidance_manifest.get("sourceVersionId")
+            if isinstance(guidance_manifest, dict)
+            else ""
+        )
+        or ""
+    ).strip()
+    if not source_version_id:
+        source_version_id = "(none)"
+
+    remove_targets = params.get("removeTargets")
+    request_target_count = len(remove_targets) if isinstance(remove_targets, list) else 0
+    prompt_chars = _prompt_length(
+        prompt or _build_guided_remove_prompt(params, guidance_manifest_target_counts)
+    )
+    prompt_present = prompt_chars > 0
+
+    guidance_image_summary = "(none)"
+    if guidance_image_data_url:
+        is_data_url = guidance_image_data_url.startswith("data:image/")
+        guidance_image_summary = (
+            f"(data-url omitted, chars={len(guidance_image_data_url)})"
+            if is_data_url
+            else "(non-data-url value omitted)"
+        )
+
+    summary: Dict[str, Any] = {
+        "mode": str(params.get("mode") or "").strip() or "(none)",
+        "sourceImageUrlKind": _url_kind_or_safe_path(params.get("sourceImageUrl")),
+        "baseImageUrlKind": base_image_url_kind,
+        "sourceVersionId": source_version_id,
+        "guidanceImageDataUrl": guidance_image_summary,
+        "targetCount": (
+            guidance_manifest_target_counts["manifest"]
+            if guidance_manifest_target_counts["manifest"] > 0
+            else request_target_count
+        ),
+        "detectedTargets": guidance_manifest_target_counts["detected"],
+        "manualTargets": guidance_manifest_target_counts["manual"],
+        "promptPresent": prompt_present,
+        "promptChars": prompt_chars,
+        "manifestKeys": manifest_keys,
+    }
+    if guidance_png_bytes_len is not None:
+        summary["guidancePngBytes"] = guidance_png_bytes_len
+    return summary
+
+
+def _build_guided_remove_prompt(
+    params: Dict[str, Any],
+    guidance_manifest_target_counts: Dict[str, int],
+) -> str:
+    prompt_override = _extract_guided_remove_prompt_override(params)
+    if prompt_override:
+        return prompt_override
+
+    guidance_prompt_text = _extract_guided_remove_prompt_text(params)
+    lines = [
+        "Use Image 1 as the source room image.",
+        "Use Image 2 only to identify removal targets.",
+        "Remove the numbered furniture targets listed below.",
+        "If red X markers are present, also remove objects directly under red X markers.",
+        "Do not keep numbers, circles, red Xs, labels, or markers in the final result.",
+        "The final image must be a natural photorealistic room photo matching Image 1.",
+        "Do not output a mask, silhouette, line drawing, segmentation map, colored region map, black-background image, or annotated guidance image.",
+        "Preserve all unmarked furniture and decor.",
+        "Preserve camera angle, room layout, lighting, materials, floor, walls, windows, and remaining objects.",
+        "Reconstruct hidden background naturally.",
+        "Do not redesign, restyle, refurnish, or add new objects.",
+        "If a marker appears on empty wall/floor because of user error, ignore it unless there is a clear object directly under it.",
+    ]
+
+    detected_target_count = int(guidance_manifest_target_counts.get("detected", 0) or 0)
+    manual_target_count = int(guidance_manifest_target_counts.get("manual", 0) or 0)
+    if detected_target_count > 0 and manual_target_count == 0:
+        lines.append(
+            "There are no red X manual markers in Image 2. Remove only the numbered targets listed above. Ignore the black/transparent/annotation styling of Image 2; it is only a target-location guide."
+        )
+
+    if guidance_prompt_text:
+        lines.extend(["", guidance_prompt_text])
+
+    return "\n".join(lines)
+
+
 def build_vibode_edit_run_prompt(
     action: Literal["add", "remove", "swap", "rotate"],
     target_placement: Optional[ScenePlacement],
@@ -4288,6 +5096,7 @@ def _debug_log_vibode_edit_run(
     target_bbox: Optional[ScenePlacementBbox],
     prompt: str,
     sku_images_count: Optional[int] = None,
+    guided_remove_summary: Optional[Dict[str, Any]] = None,
 ) -> None:
     log_event(
         "vibode_edit_run_ready",
@@ -4307,7 +5116,29 @@ def _debug_log_vibode_edit_run(
     print(f"  eligible_skus={eligible_skus_count}")
     print(f"  target_placement_id={target_placement_id if target_placement_id else '(none)'}")
     print(f"  target_sku_id={target_sku_id if target_sku_id else '(none)'}")
-    print(f"  params={params}")
+    if action == "remove" and guided_remove_summary is not None:
+        print(f"  mode={guided_remove_summary.get('mode', '(none)')}")
+        print(f"  sourceImageUrl kind={guided_remove_summary.get('sourceImageUrlKind', '(none)')}")
+        print(f"  sourceVersionId={guided_remove_summary.get('sourceVersionId', '(none)')}")
+        print(
+            f"  guidanceImageDataUrl={guided_remove_summary.get('guidanceImageDataUrl', '(none)')}"
+        )
+        print(f"  targetCount={guided_remove_summary.get('targetCount', 0)}")
+        print(f"  detectedTargets={guided_remove_summary.get('detectedTargets', 0)}")
+        print(f"  manualTargets={guided_remove_summary.get('manualTargets', 0)}")
+        print(f"  prompt_present={'yes' if guided_remove_summary.get('promptPresent') else 'no'}")
+        print(f"  prompt_chars={guided_remove_summary.get('promptChars', 0)}")
+        manifest_keys = guided_remove_summary.get("manifestKeys", [])
+        print(
+            "  manifestKeys="
+            + (",".join(manifest_keys) if isinstance(manifest_keys, list) and manifest_keys else "(none)")
+        )
+        guidance_png_bytes = guided_remove_summary.get("guidancePngBytes")
+        if guidance_png_bytes is not None:
+            print(f"  guidance_png_bytes={guidance_png_bytes}")
+    else:
+        params_for_log = _sanitize_edit_run_remove_params_for_log(params) if action == "remove" else params
+        print(f"  params={params_for_log}")
     if "removeTargets" in params:
         remove_targets = params.get("removeTargets")
         remove_targets_count = len(remove_targets) if isinstance(remove_targets, list) else 0
@@ -4335,9 +5166,11 @@ def _debug_log_vibode_edit_run(
         print(f"  sku_images={sku_images_count}")
     if DEBUG_ROOMPRINTZ_PROMPT:
         request_id = get_request_id()
-        print(f"[roomprintz][prompt] BEGIN request_id={request_id} action={action}")
+        mode = str(params.get("mode") or "").strip().lower()
+        mode_fragment = f" mode={mode}" if mode else ""
+        print(f"[roomprintz][prompt] BEGIN request_id={request_id} action={action}{mode_fragment}")
         print(prompt)
-        print(f"[roomprintz][prompt] END request_id={request_id} action={action}")
+        print(f"[roomprintz][prompt] END request_id={request_id} action={action}{mode_fragment}")
 
 
 def call_gemini_multimodal(
@@ -4349,6 +5182,12 @@ def call_gemini_multimodal(
     aspect_ratio: Optional[str] = None,
 ) -> bytes:
     started_at = time.perf_counter()
+    provider_attempt_id = _next_provider_attempt_id()
+    accounting_status = "failed"
+    accounting_error_code: Optional[str] = None
+    accounting_error_message: Optional[str] = None
+    accounting_usage_metrics: Dict[str, Any] = {}
+    response: Optional[Any] = None
     logged_terminal_failure = False
     log_event(
         "model_call_start",
@@ -4389,16 +5228,48 @@ def call_gemini_multimodal(
                     )
                 )
             )
+        _log_gemini_prompt_debug(
+            function_name="call_gemini_multimodal",
+            model_name=model_name,
+            prompt=prompt,
+        )
         response = client.models.generate_content(
             model=model_name,
             contents=contents,
             config=types.GenerateContentConfig(**config_kwargs),
         )
+        accounting_usage_metrics = _extract_provider_usage_metrics(response)
         try:
             candidate = response.candidates[0]
             part = candidate.content.parts[0]
             out_bytes = part.inline_data.data
         except Exception as e:
+            candidates = getattr(response, "candidates", None)
+            candidate_count = len(candidates) if isinstance(candidates, list) else 0
+            first_candidate_finish_reason = "(none)"
+            first_candidate_part_count = 0
+            first_candidate_image_parts = 0
+            first_candidate_text_parts = 0
+            first_candidate_text_snippet = ""
+            if candidate_count > 0:
+                first_candidate = candidates[0]
+                finish_reason = getattr(first_candidate, "finish_reason", None)
+                if finish_reason is not None:
+                    first_candidate_finish_reason = str(finish_reason)
+                first_content = getattr(first_candidate, "content", None)
+                first_parts = getattr(first_content, "parts", None) if first_content is not None else None
+                if isinstance(first_parts, list):
+                    first_candidate_part_count = len(first_parts)
+                    for response_part in first_parts:
+                        inline_data = getattr(response_part, "inline_data", None)
+                        inline_bytes = getattr(inline_data, "data", None) if inline_data is not None else None
+                        if inline_bytes:
+                            first_candidate_image_parts += 1
+                        text_part = getattr(response_part, "text", None)
+                        if isinstance(text_part, str) and text_part.strip():
+                            first_candidate_text_parts += 1
+                            if not first_candidate_text_snippet:
+                                first_candidate_text_snippet = text_part.strip()[:240]
             log_event(
                 "model_call_extract_failed",
                 function="call_gemini_multimodal",
@@ -4407,6 +5278,12 @@ def call_gemini_multimodal(
                 aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
                 sku_count=len(sku_png_bytes_list),
                 error=str(e),
+                candidate_count=candidate_count,
+                first_candidate_finish_reason=first_candidate_finish_reason,
+                first_candidate_part_count=first_candidate_part_count,
+                first_candidate_image_parts=first_candidate_image_parts,
+                first_candidate_text_parts=first_candidate_text_parts,
+                first_candidate_text_snippet=first_candidate_text_snippet,
             )
             logged_terminal_failure = True
             raise RuntimeError("Could not extract generated image from Gemini response")
@@ -4433,8 +5310,13 @@ def call_gemini_multimodal(
             output_png_bytes=len(out_bytes),
             latency_ms=int((time.perf_counter() - started_at) * 1000),
         )
+        accounting_status = "success"
         return out_bytes
     except Exception as e:
+        accounting_error_code = type(e).__name__
+        accounting_error_message = str(e)
+        if response is not None and not accounting_usage_metrics:
+            accounting_usage_metrics = _extract_provider_usage_metrics(response)
         if not logged_terminal_failure:
             log_event(
                 "model_call_failed",
@@ -4447,6 +5329,16 @@ def call_gemini_multimodal(
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
             )
         raise
+    finally:
+        _write_gemini_usage_event_best_effort(
+            attempt_id=provider_attempt_id,
+            model_name=model_name,
+            status=accounting_status,
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+            error_code=accounting_error_code,
+            error_message=accounting_error_message,
+            usage_metrics=accounting_usage_metrics,
+        )
 
 
 # ---------- ROUTES ----------
@@ -4541,6 +5433,75 @@ async def stage_room(req: StageRoomRequest):
         print("[/stage-room] Error preparing image:", e)
         raise HTTPException(status_code=400, detail="Could not process image")
 
+    reference_image_urls_count = len(req.referenceImageUrls or [])
+    reference_image_base64s_count = len(req.referenceImageBase64s or [])
+    reference_images_count = len(req.referenceImages or [])
+    reference_image_png_bytes_list = _collect_stage_room_reference_png_bytes(req)
+    placement_intent = (req.placementIntent or "").strip().lower()
+    reference_item_labels: List[str] = []
+    for ref in req.referenceImages or []:
+        candidate_label = (ref.label or ref.skuId or "").strip()
+        if candidate_label:
+            reference_item_labels.append(candidate_label)
+    # Fallback label extraction for legacy-shaped reference image payloads.
+    if not reference_item_labels:
+        for ref in req.referenceImages or []:
+            for field_name in ("name", "title"):
+                raw_value = getattr(ref, field_name, None)
+                if isinstance(raw_value, str) and raw_value.strip():
+                    reference_item_labels.append(raw_value.strip())
+                    break
+
+    stage_room_prompt_override: Optional[str] = None
+    prompt_intent = "default_roomprintz"
+    prompt_version = "roomprintz_base_v1"
+    if placement_intent == "model_decided" and len(reference_image_png_bytes_list) > 0:
+        stage_room_prompt_override = build_stage_room_model_decided_staging_prompt(
+            reference_image_count=len(reference_image_png_bytes_list),
+            reference_item_labels=reference_item_labels,
+            room_type=req.roomType,
+        )
+        prompt_intent = "model_decided_staging"
+        prompt_version = "model_decided_staging_v1"
+
+    resolved_stage_room_prompt = (
+        stage_room_prompt_override
+        if stage_room_prompt_override
+        else build_roomprintz_prompt(
+            enhance_photo=req.enhancePhoto,
+            cleanup_room=req.cleanupRoom,
+            repair_damage=req.repairDamage,
+            empty_room=req.emptyRoom,
+            renovate_room=req.renovateRoom,
+            repaint_walls=req.repaintWalls,
+            flooring_preset=req.flooringPreset,
+            style_id=req.styleId,
+            room_type=req.roomType,
+        )
+    )
+    stage_room_prompt_summary = summarize_prompt(resolved_stage_room_prompt)
+    final_multimodal_image_input_count = 1 + len(reference_image_png_bytes_list)
+    print(
+        "[/stage-room] Reference image debug:",
+        {
+            "referenceImageUrlsCount": reference_image_urls_count,
+            "referenceImageBase64sCount": reference_image_base64s_count,
+            "referenceImagesCount": reference_images_count,
+            "referenceItemLabelCount": len(reference_item_labels),
+            "maxAdditionalRefs": STAGE_ROOM_MAX_REFERENCE_IMAGES,
+            "acceptedAdditionalRefs": len(reference_image_png_bytes_list),
+            "finalMultimodalImageInputCount": final_multimodal_image_input_count,
+            "placementIntent": placement_intent or "(none)",
+            "promptIntent": prompt_intent,
+            "promptVersion": prompt_version,
+        },
+    )
+    if reference_image_urls_count > 0:
+        print(
+            "[/stage-room] referenceImageUrls are accepted by schema but ignored in adapter "
+            "(embedded base64 refs are prioritized)."
+        )
+
     print(
         "[/stage-room] Received request:",
         {
@@ -4555,7 +5516,19 @@ async def stage_room(req: StageRoomRequest):
             "sentAspectRatio": aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
             "allowFlashNonSquare": ALLOW_FLASH_NON_SQUARE,
             "maxInputLongEdge": MAX_INPUT_LONG_EDGE_INT,
+            "placementIntent": placement_intent or "(none)",
+            "promptIntent": prompt_intent,
+            "promptVersion": prompt_version,
         },
+    )
+    log_event(
+        "stage_room_prompt_ready",
+        route="/stage-room",
+        placement_intent=placement_intent or "(none)",
+        prompt_intent=prompt_intent,
+        prompt_version=prompt_version,
+        reference_image_count=len(reference_image_png_bytes_list),
+        **stage_room_prompt_summary,
     )
 
     try:
@@ -4573,6 +5546,10 @@ async def stage_room(req: StageRoomRequest):
                 room_type=req.roomType,
                 model_name=model_name,
                 aspect_ratio=aspect_ratio_to_send,
+                reference_image_png_bytes_list=reference_image_png_bytes_list,
+                prompt_override=stage_room_prompt_override,
+                prompt_intent=prompt_intent,
+                prompt_version=prompt_version,
             )
         else:
             out_bytes = run_photo_tools(
@@ -4587,6 +5564,10 @@ async def stage_room(req: StageRoomRequest):
                 room_type=req.roomType,
                 model_name=model_name,
                 aspect_ratio=aspect_ratio_to_send,
+                reference_image_png_bytes_list=reference_image_png_bytes_list,
+                prompt_override=stage_room_prompt_override,
+                prompt_intent=prompt_intent,
+                prompt_version=prompt_version,
             )
     except Exception as e:
         log_event("stage_room_processing_failed", error=str(e))
@@ -4658,6 +5639,35 @@ async def vibode_compose(req: VibodeComposeRequest):
         print("[/vibode/compose] Error drawing markers:", e)
         raise HTTPException(status_code=500, detail="Failed to draw markers")
 
+    try:
+        clean_size = _safe_open_image(room_png_bytes).size
+        marked_size = _safe_open_image(room_overlay_png_bytes).size
+    except Exception as e:
+        print("[/vibode/compose] Error decoding clean/marked image dimensions:", e)
+        raise HTTPException(status_code=500, detail="Failed to validate prepared room images")
+
+    sizes_match = clean_size == marked_size
+    clean_size_str = f"{clean_size[0]}x{clean_size[1]}"
+    marked_size_str = f"{marked_size[0]}x{marked_size[1]}"
+    log_event(
+        "compose_prepared_image_sizes",
+        route="/vibode/compose",
+        clean_size=clean_size_str,
+        marked_size=marked_size_str,
+        sizes_match=sizes_match,
+    )
+    if not sizes_match:
+        print(
+            "[/vibode/compose] WARNING prepared clean/marked dimension mismatch:",
+            {"clean_size": clean_size_str, "marked_size": marked_size_str},
+        )
+        log_event(
+            "compose_prepared_image_size_mismatch",
+            route="/vibode/compose",
+            clean_size=clean_size_str,
+            marked_size=marked_size_str,
+        )
+
     print(
         "[/vibode/compose] VIBODE_DUMP_ANNOTATED_IMAGE:",
         os.getenv("VIBODE_DUMP_ANNOTATED_IMAGE"),
@@ -4694,6 +5704,25 @@ async def vibode_compose(req: VibodeComposeRequest):
     )
 
     prompt = build_vibode_compose_prompt(placements_ordered, enhance_photo=req.enhancePhoto)
+    prompt_chars = len(prompt)
+    prompt_hash = _short_prompt_hash(prompt)
+    log_event(
+        "compose_payload_sanity",
+        route="/vibode/compose",
+        clean_size=clean_size_str,
+        marked_size=marked_size_str,
+        sizes_match=sizes_match,
+        marker_style=VIBODE_COMPOSE_MARKER_STYLE,
+        marker_radius_px=VIBODE_COMPOSE_MARKER_RADIUS_PX,
+        marker_color_family=VIBODE_COMPOSE_MARKER_COLOR_FAMILY,
+        image_count=2 + len(sku_png_bytes_list),
+        sku_count=len(sku_png_bytes_list),
+        placements_count=len(placements_ordered),
+        prompt_chars=prompt_chars,
+        prompt_hash=prompt_hash,
+        model_name=model_name,
+        aspect_ratio=aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
+    )
     try:
         out_bytes = call_gemini_multimodal(
             prompt=prompt,
@@ -5305,6 +6334,9 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
     target_placement_id: Optional[str] = None
     target_sku_id: Optional[str] = None
     target_bbox: Optional[ScenePlacementBbox] = None
+    guided_remove_mode = False
+    guided_remove_overlay_png_bytes: Optional[bytes] = None
+    guided_remove_summary: Optional[Dict[str, Any]] = None
 
     if action == "add":
         target_sku_id = (target.skuId or "").strip()
@@ -5374,14 +6406,65 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
         remove_target_bboxes: List[ScenePlacementBbox] = []
         remove_target_placement_ids: set[str] = set()
         target_placement_id = (target.placementId or "").strip() or None
+        guided_remove_mode = _is_guided_remove_mode(params)
+        guidance_image_data_url = _extract_guided_remove_image_data_url(params)
+        guidance_manifest = params.get("guidanceManifest")
+        guidance_manifest_target_counts = _extract_guidance_manifest_target_counts(guidance_manifest)
+        remove_targets_count = len(remove_targets) if isinstance(remove_targets, list) else 0
 
-        print(
-            "[/api/vibode/edit-run][remove] incoming payload:",
-            {
-                "target": target.model_dump(exclude_none=True),
-                "params": params,
-            },
-        )
+        if guided_remove_mode:
+            guided_remove_summary = _summarize_guided_remove_for_log(
+                params=params,
+                base_image_url_kind=base_image_url_kind,
+            )
+            print("[/api/vibode/edit-run][remove] guided payload summary:")
+            print(f"  mode={guided_remove_summary.get('mode', '(none)')}")
+            print(f"  sourceImageUrl kind={guided_remove_summary.get('sourceImageUrlKind', '(none)')}")
+            print(f"  sourceVersionId={guided_remove_summary.get('sourceVersionId', '(none)')}")
+            print(
+                f"  guidanceImageDataUrl={guided_remove_summary.get('guidanceImageDataUrl', '(none)')}"
+            )
+            print(f"  targetCount={guided_remove_summary.get('targetCount', 0)}")
+            print(f"  detectedTargets={guided_remove_summary.get('detectedTargets', 0)}")
+            print(f"  manualTargets={guided_remove_summary.get('manualTargets', 0)}")
+            print(f"  promptChars={guided_remove_summary.get('promptChars', 0)}")
+            manifest_keys = guided_remove_summary.get("manifestKeys", [])
+            print(
+                "  manifestKeys="
+                + (",".join(manifest_keys) if isinstance(manifest_keys, list) and manifest_keys else "(none)")
+            )
+            print(
+                "[/api/vibode/edit-run][remove] mode:",
+                {
+                    "guided": True,
+                    "hasGuidanceImage": bool(guidance_image_data_url),
+                    "manifestTargetCount": guidance_manifest_target_counts["manifest"],
+                    "detectedTargetCount": guidance_manifest_target_counts["detected"],
+                    "manualTargetCount": guidance_manifest_target_counts["manual"],
+                    "requestRemoveTargetsCount": remove_targets_count,
+                    "modelVersion": model_name,
+                },
+            )
+        else:
+            print(
+                "[/api/vibode/edit-run][remove] incoming payload:",
+                {
+                    "target": target.model_dump(exclude_none=True),
+                    "params": _sanitize_edit_run_remove_params_for_log(params),
+                },
+            )
+            print(
+                "[/api/vibode/edit-run][remove] mode:",
+                {
+                    "guided": False,
+                    "hasGuidanceImage": bool(guidance_image_data_url),
+                    "manifestTargetCount": guidance_manifest_target_counts["manifest"],
+                    "detectedTargetCount": guidance_manifest_target_counts["detected"],
+                    "manualTargetCount": guidance_manifest_target_counts["manual"],
+                    "requestRemoveTargetsCount": remove_targets_count,
+                    "modelVersion": model_name,
+                },
+            )
 
         if isinstance(remove_targets, list):
             for remove_target in remove_targets:
@@ -5436,38 +6519,85 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
         if not remove_target_bboxes and remove_x_norm is not None and remove_y_norm is not None:
             remove_target_bboxes.append(_target_bbox_from_point(remove_x_norm, remove_y_norm))
 
-        if remove_target_bboxes:
-            prompt = build_vibode_edit_run_prompt(
-                action="remove",
-                target_placement=None,
-                params=params,
-                remove_target_bboxes=remove_target_bboxes,
+        if guided_remove_mode:
+            if not guidance_image_data_url:
+                return _vibode_edit_run_error(400, "Guided remove requires guidanceImageDataUrl.")
+            if not _looks_like_supported_guidance_data_url(guidance_image_data_url):
+                return _vibode_edit_run_error(
+                    400,
+                    "Guided remove guidanceImageDataUrl must be a PNG or JPEG data URL.",
+                )
+            try:
+                guidance_raw_bytes, guidance_hint_mime = _decode_base64_image_with_mime(
+                    guidance_image_data_url
+                )
+                guidance_mime = _infer_image_mime_type(
+                    guidance_raw_bytes,
+                    fallback_mime=guidance_hint_mime,
+                )
+            except Exception:
+                return _vibode_edit_run_error(400, "Guided remove guidanceImageDataUrl is invalid.")
+            if guidance_mime not in ("image/png", "image/jpeg", "image/jpg"):
+                return _vibode_edit_run_error(
+                    400,
+                    "Guided remove guidanceImageDataUrl must decode to PNG or JPEG image bytes.",
+                )
+            try:
+                guided_remove_overlay_png_bytes = prepare_passthrough_png_bytes(guidance_raw_bytes)
+            except Exception:
+                return _vibode_edit_run_error(400, "Guided remove guidance image could not be processed.")
+
+            prompt = _build_guided_remove_prompt(params, guidance_manifest_target_counts)
+            target_bbox = remove_target_bboxes[0] if remove_target_bboxes else None
+            print(
+                "[/api/vibode/edit-run][remove] guided remove validated:",
+                {
+                    "guidanceMime": guidance_mime,
+                    "guidancePngBytes": len(guided_remove_overlay_png_bytes),
+                    "removeTargetsCount": len(remove_target_bboxes),
+                    "modelVersion": model_name,
+                    "promptChars": _prompt_length(prompt),
+                },
             )
-            target_bbox = remove_target_bboxes[0]
-        elif target_placement_id:
-            target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
-            if target_idx < 0:
-                return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
-            placement_to_remove = updated_placements[target_idx]
-            prompt = build_vibode_edit_run_prompt(
-                action="remove",
-                target_placement=placement_to_remove,
+            guided_remove_summary = _summarize_guided_remove_for_log(
                 params=params,
-            )
-            target_bbox = placement_to_remove.bbox
-        elif remove_target_placement_ids:
-            prompt = build_vibode_edit_run_prompt(
-                action="remove",
-                target_placement=None,
-                params=params,
-                remove_target_bboxes=[],
+                base_image_url_kind=base_image_url_kind,
+                prompt=prompt,
+                guidance_png_bytes_len=len(guided_remove_overlay_png_bytes),
             )
         else:
-            return _vibode_edit_run_error(
-                400,
-                "remove requires target.xNorm/target.yNorm, target.x/target.y, params.xNorm/params.yNorm, "
-                "target.placementId, or params.removeTargets.",
-            )
+            if remove_target_bboxes:
+                prompt = build_vibode_edit_run_prompt(
+                    action="remove",
+                    target_placement=None,
+                    params=params,
+                    remove_target_bboxes=remove_target_bboxes,
+                )
+                target_bbox = remove_target_bboxes[0]
+            elif target_placement_id:
+                target_idx = _find_scene_placement_index(updated_placements, target_placement_id)
+                if target_idx < 0:
+                    return _vibode_edit_run_error(400, f"placementId={target_placement_id} was not found.")
+                placement_to_remove = updated_placements[target_idx]
+                prompt = build_vibode_edit_run_prompt(
+                    action="remove",
+                    target_placement=placement_to_remove,
+                    params=params,
+                )
+                target_bbox = placement_to_remove.bbox
+            elif remove_target_placement_ids:
+                prompt = build_vibode_edit_run_prompt(
+                    action="remove",
+                    target_placement=None,
+                    params=params,
+                    remove_target_bboxes=[],
+                )
+            else:
+                return _vibode_edit_run_error(
+                    400,
+                    "remove requires target.xNorm/target.yNorm, target.x/target.y, params.xNorm/params.yNorm, "
+                    "target.placementId, or params.removeTargets.",
+                )
 
         if remove_target_placement_ids:
             updated_placements = [
@@ -5702,7 +6832,7 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
     else:
         return _vibode_edit_run_error(400, f"Unsupported action: {action}")
 
-    room_overlay_png_bytes = room_png_bytes
+    room_overlay_png_bytes = guided_remove_overlay_png_bytes or room_png_bytes
     _debug_log_vibode_edit_run(
         action=action,
         model_name=model_name,
@@ -5717,12 +6847,13 @@ async def vibode_edit_run(req: VibodeEditRunRequest, http_request: Request):
         target_bbox=target_bbox,
         prompt=prompt,
         sku_images_count=len(sku_png_bytes_list) if action in ("add", "swap") else None,
+        guided_remove_summary=guided_remove_summary if (action == "remove" and guided_remove_mode) else None,
     )
     early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "model_call")
     if early_exit:
         return early_exit
     try:
-        if action in ("add", "swap"):
+        if action in ("add", "swap") or (action == "remove" and guided_remove_mode):
             gemini_multimodal_sig = inspect.signature(call_gemini_multimodal)
             gemini_multimodal_kwargs: Dict[str, Any] = {
                 "prompt": prompt,
@@ -5794,7 +6925,15 @@ async def ingest_user_sku(ingest_req: VibodeUserSkuIngestRequest, http_request: 
     route = "/api/vibode/user-skus/ingest"
     started_at = time.perf_counter()
     user_sku_id = "user_" + uuid4().hex
-    model_name = DEFAULT_MODEL_NAME
+    body_model_raw = (ingest_req.model or "").strip()
+    header_model_raw = (http_request.headers.get("x-roomprintz-ingest-image-model") or "").strip()
+    requested_model_raw = body_model_raw or header_model_raw
+    model_name = resolve_model_name_for_route(route, requested_model_raw or None)
+    model_source = (
+        "body:model"
+        if body_model_raw
+        else ("header:x-roomprintz-ingest-image-model" if header_model_raw else "default")
+    )
     source_url = ingest_req.imageUrl.strip() if ingest_req.imageUrl and ingest_req.imageUrl.strip() else None
     resolved_label = (ingest_req.label or "").strip() or "User Upload"
     preview_bg_override_flags = _extract_user_sku_preview_bg_override_flags(ingest_req, http_request)
@@ -5844,6 +6983,9 @@ async def ingest_user_sku(ingest_req: VibodeUserSkuIngestRequest, http_request: 
     _ingest_log(
         "vibode_user_sku_ingest_started",
         source="imageUrl" if source_url else "imageBase64",
+        model_source=model_source,
+        model_requested=requested_model_raw or None,
+        model_name=model_name,
         status="started",
     )
 
