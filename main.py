@@ -2810,23 +2810,18 @@ def _draw_red_marker_pixels(img: Image.Image, cx: int, cy: int, r: int) -> None:
     if pixels is None:
         return
     width, height = img.size
-    thickness = 3
-    min_x = max(0, cx - r - thickness)
-    max_x = min(width - 1, cx + r + thickness)
-    min_y = max(0, cy - r - thickness)
-    max_y = min(height - 1, cy + r + thickness)
-    r_inner = max(0, r - thickness)
-    r_outer = r + thickness
-    r_inner_sq = r_inner * r_inner
-    r_outer_sq = r_outer * r_outer
+    radius = max(2, int(r))
+    min_x = max(0, cx - radius)
+    max_x = min(width - 1, cx + radius)
+    min_y = max(0, cy - radius)
+    max_y = min(height - 1, cy + radius)
+    radius_sq = radius * radius
     for y in range(min_y, max_y + 1):
         dy = y - cy
-        dy_sq = dy * dy
         for x in range(min_x, max_x + 1):
             dx = x - cx
-            dist_sq = dx * dx + dy_sq
-            if r_inner_sq <= dist_sq <= r_outer_sq:
-                pixels[x, y] = (255, 0, 0)
+            if (dx * dx + dy * dy) <= radius_sq:
+                pixels[x, y] = (220, 36, 36)
 
 
 def order_vibode_placements(placements: List[VibodePlacement]) -> List[VibodePlacement]:
@@ -2862,19 +2857,23 @@ def _draw_marker_label(
     cy: int,
     marker_label: str,
     radius: int,
+    font_scale: float = 0.9,
+    fill: Tuple[int, ...] = (255, 255, 255),
+    stroke_fill: Tuple[int, ...] = (0, 0, 0),
+    stroke_scale: float = 0.12,
 ) -> None:
-    font_size = max(14, int(radius * 0.9))
+    font_size = max(10, int(radius * font_scale))
     font = _load_marker_label_font(font_size)
-    stroke_width = max(1, int(round(radius * 0.12)))
+    stroke_width = max(1, int(round(radius * stroke_scale)))
     try:
         draw.text(
             (cx, cy),
             marker_label,
-            fill=(255, 255, 255),
+            fill=fill,
             font=font,
             anchor="mm",
             stroke_width=stroke_width,
-            stroke_fill=(255, 0, 0),
+            stroke_fill=stroke_fill,
         )
         return
     except Exception:
@@ -2891,37 +2890,67 @@ def _draw_marker_label(
     draw.text(
         (x, y),
         marker_label,
-        fill=(255, 255, 255),
+        fill=fill,
         font=font,
         stroke_width=stroke_width,
-        stroke_fill=(0, 0, 0),
+        stroke_fill=stroke_fill,
     )
 
 
+VIBODE_COMPOSE_MARKER_STYLE = "remove_style_numbered_red_badges_v1"
+VIBODE_COMPOSE_MARKER_RADIUS_PX = 24
+VIBODE_COMPOSE_MARKER_COLOR_FAMILY = "red_white"
+VIBODE_COMPOSE_MARKER_OPACITY = 1.0  # Keep markers fully opaque for deterministic index readability.
+VIBODE_COMPOSE_MARKER_FILL_RGB = (220, 36, 36)
+VIBODE_COMPOSE_MARKER_OUTLINE_RGB = (255, 255, 255)
+VIBODE_COMPOSE_MARKER_LABEL_FILL_RGB = (255, 255, 255)
+VIBODE_COMPOSE_MARKER_LABEL_STROKE_RGB = (0, 0, 0)
+VIBODE_COMPOSE_MARKER_OUTLINE_WIDTH_SCALE = 0.14
+VIBODE_COMPOSE_MARKER_OUTLINE_WIDTH_MIN_PX = 2
+
+
 def draw_red_markers_overlay(image_png_bytes: bytes, placements: List[VibodePlacement]) -> bytes:
+    # Image 2 is a semantic placement instruction map: robust numbered badges are preferred
+    # here to keep marker-index mapping stable across multi-item compose runs.
     img = _safe_open_image(image_png_bytes)
     if img.mode != "RGB":
         img = img.convert("RGB")
     width, height = img.size
     max_radius = max(1, min(width, height) // 4)
+    marker_fill = VIBODE_COMPOSE_MARKER_FILL_RGB
+    marker_outline = VIBODE_COMPOSE_MARKER_OUTLINE_RGB
     if _HAS_IMAGE_DRAW and ImageDraw is not None:
         draw = ImageDraw.Draw(img)
         for idx, placement in enumerate(placements):
-            radius = int(round(placement.rPx)) if placement.rPx else 60
-            radius = max(20, radius)
+            radius = int(round(placement.rPx)) if placement.rPx else VIBODE_COMPOSE_MARKER_RADIUS_PX
+            radius = max(16, radius)
             radius = min(radius, max_radius)
             cx = int(round(placement.cxPx))
             cy = int(round(placement.cyPx))
             cx = max(0, min(cx, width - 1))
             cy = max(0, min(cy, height - 1))
-            bbox = (cx - radius, cy - radius, cx + radius, cy + radius)
-            draw.ellipse(bbox, outline=(255, 0, 0), width=6)
+            badge_bbox = (cx - radius, cy - radius, cx + radius, cy + radius)
+            outline_width = max(
+                VIBODE_COMPOSE_MARKER_OUTLINE_WIDTH_MIN_PX,
+                int(round(radius * VIBODE_COMPOSE_MARKER_OUTLINE_WIDTH_SCALE)),
+            )
+            draw.ellipse(badge_bbox, fill=marker_fill, outline=marker_outline, width=outline_width)
             marker_label = str(idx + 1)
-            _draw_marker_label(draw, cx, cy, marker_label, radius)
+            _draw_marker_label(
+                draw=draw,
+                cx=cx,
+                cy=cy,
+                marker_label=marker_label,
+                radius=radius,
+                font_scale=0.92,
+                fill=VIBODE_COMPOSE_MARKER_LABEL_FILL_RGB,
+                stroke_fill=VIBODE_COMPOSE_MARKER_LABEL_STROKE_RGB,
+                stroke_scale=0.14,
+            )
     else:
         for placement in placements:
-            radius = int(round(placement.rPx)) if placement.rPx else 60
-            radius = max(20, radius)
+            radius = int(round(placement.rPx)) if placement.rPx else VIBODE_COMPOSE_MARKER_RADIUS_PX
+            radius = max(16, radius)
             radius = min(radius, max_radius)
             cx = int(round(placement.cxPx))
             cy = int(round(placement.cyPx))
@@ -3773,28 +3802,51 @@ def build_vibode_compose_prompt(
     enhance_photo: bool,
 ) -> str:
     placements_count = len(placements)
+
+    # Keep Image 1 (pixels) and Image 2 (placement metadata) explicitly separated so the
+    # model preserves room fidelity while still using unambiguous marker indices.
     lines = [
         "You are a professional real-estate photo editor.",
         "",
-        "You are given multiple images in this exact order:",
-        "1) Image 1 is the clean prepared room photo (background reference).",
-        "   Final output must match Image 1's room exactly.",
-        f"2) Image 2 is the same prepared room with numbered red circle markers (1..{placements_count}) for guidance only.",
-        "   Use Image 2 only to locate targets.",
-        "3) Each subsequent image is a single SKU item to insert, ordered by marker number.",
-        "Place SKU image i at marker i. Do not swap indices. Do not invent additional furniture.",
+        "Input images are provided in this exact order:",
+        "1) Image 1 is the clean prepared room photo.",
+        "   Use this as the only visual source for final room pixels.",
+        f"2) Image 2 is the placement instruction map with numbered red circle markers (1..{placements_count}).",
+        "   The placement instruction map is guidance metadata only.",
+        "3) Each subsequent image is a single SKU item to insert.",
         "",
-        "Strict rules:",
-        "- Place each SKU item at its corresponding numbered red marker location on the floor.",
-        "- Use Image 1 as the source of truth for room appearance; keep its background unchanged.",
-        "- Use Image 2 only as placement guidance; do not keep any markers in the final result.",
-        "- Do not move, resize, or rotate the room camera perspective.",
-        "- Do not change existing walls, windows, doors, floors, or lighting.",
-        "- Do not invent extra furniture or decor; only insert the provided SKU items.",
-        "- Add realistic contact shadows so items sit naturally on the floor.",
-        "- Remove all markup in the final image: no circles, numbers, or any text.",
+        "Sequential mapping:",
+        "- marker #1 -> SKU image #3",
+        "- marker #2 -> SKU image #4",
+        "- continue sequentially for all markers and SKU images",
+        "- Do not swap item indices.",
+        "",
+        "Placement rules:",
+        "- Place each SKU item at its corresponding numbered marker location.",
+        "- The center of each red marker is the intended placement location.",
+        "- Markers are identifiers only and are not part of the final scene.",
+        "",
+        "Room preservation rules:",
+        "- Use Image 1 as the only visual source for the room.",
+        "- Preserve the existing room layout, walls, windows, doors, floors, lighting, and camera perspective.",
+        "- Do not move, resize, rotate, or reframe the room camera.",
+        "- Do not invent extra furniture or decor.",
+        "- Only insert the provided SKU items.",
+        "- Add realistic contact shadows so items sit naturally in the room.",
+        "",
+        "Placement-instruction-map rules:",
+        "- The placement instruction map is not a visual source for final pixels.",
+        "- Treat all guide graphics as temporary invisible metadata after placement is understood.",
+        "- Do not render red circles, white numbers, outlines, labels, colors, halos, overlays, or annotation residue.",
+        "- The final image must look like a normal real-estate photograph with no graphic overlays.",
+        "",
+        "Final quality check:",
+        "- Before returning the image, inspect the final result carefully.",
+        "- Ensure every SKU item is placed at its correct corresponding marker location.",
+        "- Remove any remaining guide marks or overlay artifacts completely.",
         "- Do not add text, logos, or watermarks.",
     ]
+
     if enhance_photo:
         lines += [
             "",
@@ -3802,12 +3854,8 @@ def build_vibode_compose_prompt(
             "- Correct white balance and exposure without changing room appearance.",
             "- Improve clarity and reduce noise while staying photorealistic.",
         ]
-    if DEBUG_ROOMPRINTZ_PROMPT:
-        print("\n===== VIBODE COMPOSE PROMPT SENT TO GEMINI =====\n")
-        print("\n".join(lines))
-        print("\n=================================================\n")
-    return "\n".join(lines)
 
+    return "\n".join(lines)
 
 def build_vibode_vibe_prompt(
     eligible_skus: List[VibodeEligibleSku],
@@ -5591,6 +5639,35 @@ async def vibode_compose(req: VibodeComposeRequest):
         print("[/vibode/compose] Error drawing markers:", e)
         raise HTTPException(status_code=500, detail="Failed to draw markers")
 
+    try:
+        clean_size = _safe_open_image(room_png_bytes).size
+        marked_size = _safe_open_image(room_overlay_png_bytes).size
+    except Exception as e:
+        print("[/vibode/compose] Error decoding clean/marked image dimensions:", e)
+        raise HTTPException(status_code=500, detail="Failed to validate prepared room images")
+
+    sizes_match = clean_size == marked_size
+    clean_size_str = f"{clean_size[0]}x{clean_size[1]}"
+    marked_size_str = f"{marked_size[0]}x{marked_size[1]}"
+    log_event(
+        "compose_prepared_image_sizes",
+        route="/vibode/compose",
+        clean_size=clean_size_str,
+        marked_size=marked_size_str,
+        sizes_match=sizes_match,
+    )
+    if not sizes_match:
+        print(
+            "[/vibode/compose] WARNING prepared clean/marked dimension mismatch:",
+            {"clean_size": clean_size_str, "marked_size": marked_size_str},
+        )
+        log_event(
+            "compose_prepared_image_size_mismatch",
+            route="/vibode/compose",
+            clean_size=clean_size_str,
+            marked_size=marked_size_str,
+        )
+
     print(
         "[/vibode/compose] VIBODE_DUMP_ANNOTATED_IMAGE:",
         os.getenv("VIBODE_DUMP_ANNOTATED_IMAGE"),
@@ -5627,6 +5704,25 @@ async def vibode_compose(req: VibodeComposeRequest):
     )
 
     prompt = build_vibode_compose_prompt(placements_ordered, enhance_photo=req.enhancePhoto)
+    prompt_chars = len(prompt)
+    prompt_hash = _short_prompt_hash(prompt)
+    log_event(
+        "compose_payload_sanity",
+        route="/vibode/compose",
+        clean_size=clean_size_str,
+        marked_size=marked_size_str,
+        sizes_match=sizes_match,
+        marker_style=VIBODE_COMPOSE_MARKER_STYLE,
+        marker_radius_px=VIBODE_COMPOSE_MARKER_RADIUS_PX,
+        marker_color_family=VIBODE_COMPOSE_MARKER_COLOR_FAMILY,
+        image_count=2 + len(sku_png_bytes_list),
+        sku_count=len(sku_png_bytes_list),
+        placements_count=len(placements_ordered),
+        prompt_chars=prompt_chars,
+        prompt_hash=prompt_hash,
+        model_name=model_name,
+        aspect_ratio=aspect_ratio_to_send if aspect_ratio_to_send else "(omitted)",
+    )
     try:
         out_bytes = call_gemini_multimodal(
             prompt=prompt,
