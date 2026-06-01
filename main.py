@@ -564,6 +564,15 @@ def summarize_prompt(prompt: str) -> Dict[str, Any]:
     }
 
 
+def _extract_stage4_prompt_override(req: "VibodeStageRunRequest") -> Optional[str]:
+    # Prefer explicit Stage 4 payload fields from newer clients, while still
+    # supporting generic prompt/instruction fields for compatibility.
+    for candidate in (req.stage4Prompt, req.prompt, req.instruction):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
 def _safe_open_image(image_bytes: bytes) -> Image.Image:
     try:
         return Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -1183,6 +1192,13 @@ class VibodeStageRunRequest(BaseModel):
     flooringPreset: Optional[str] = None
     roomType: Optional[str] = None
     stage4Mode: Optional[Stage4StyleMode] = None
+    stage4Modes: Optional[List[str]] = None
+    stage4Intents: Optional[List[str]] = None
+    stage4ResolvedIntents: Optional[List[str]] = None
+    stage4PromptMode: Optional[str] = None
+    stage4Prompt: Optional[str] = None
+    instruction: Optional[str] = None
+    prompt: Optional[str] = None
     modelVersion: Optional[str] = None
     aspectRatio: Optional[AspectRatio] = "auto"
 
@@ -6118,7 +6134,27 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
         )
     elif req.stage == 4:
         stage4_mode: Stage4StyleMode = req.stage4Mode or "style_room"
-        prompt = build_stage4_styling_prompt_v1(stage4_mode=stage4_mode)
+        incoming_stage4_prompt = _extract_stage4_prompt_override(req)
+        if incoming_stage4_prompt:
+            prompt = incoming_stage4_prompt
+            stage4_prompt_source = "incoming_combined_prompt"
+        else:
+            prompt = build_stage4_styling_prompt_v1(stage4_mode=stage4_mode)
+            stage4_prompt_source = "legacy_stage4_prompt_builder"
+        stage4_prompt_summary = summarize_prompt(prompt)
+        log_event(
+            "vibode_stage4_prompt_resolve",
+            route="/api/vibode/stage-run",
+            stage4Mode=req.stage4Mode or "style_room",
+            stage4Modes=req.stage4Modes or [],
+            stage4Intents=req.stage4Intents or [],
+            stage4ResolvedIntents=req.stage4ResolvedIntents or [],
+            stage4PromptMode=req.stage4PromptMode or "(none)",
+            prompt_source=stage4_prompt_source,
+            prompt_len=stage4_prompt_summary["prompt_len"],
+            prompt_hash=stage4_prompt_summary["prompt_hash"],
+            prompt_first_line=stage4_prompt_summary["prompt_first_line"],
+        )
     else:
         prompt = build_stage5_final_vibe_prompt_v3()
 
@@ -6144,6 +6180,10 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
             "flooringPreset": req.flooringPreset,
             "emptyRoom": req.emptyRoom,
             "stage4Mode": req.stage4Mode or "style_room",
+            "stage4Modes": req.stage4Modes or [],
+            "stage4Intents": req.stage4Intents or [],
+            "stage4ResolvedIntents": req.stage4ResolvedIntents or [],
+            "stage4PromptMode": req.stage4PromptMode or "(none)",
         },
         **prompt_summary,
     )
