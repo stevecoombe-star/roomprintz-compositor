@@ -7,3 +7,8 @@ backend/
 .env.local
 .env.*.local
 tmp/
+
+# Local environment secrets
+.env
+.env.local
+.env.*.local
