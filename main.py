@@ -824,6 +824,22 @@ Change flooring to tile:
 - Preserve thresholds and transitions to other rooms.
 """
 
+# Research-only AFC-SR1 instrument. This is deliberately not a product flooring
+# option: /api/vibode/stage-run admits it only when the matching profile is
+# supplied, and ordinary editor requests never send that profile.
+TILE_GRID_SCAFFOLD_FLOORING_PRESET = "tile_grid_scaffold"
+AFC_SR1_TILE_GRID_SCAFFOLD_PROFILE = "afc-sr1-tile-grid-scaffold/v1"
+FLOORING_TILE_GRID_SCAFFOLD_FRAGMENT = """
+Research-only analytical flooring scaffold — modify flooring only:
+- Replace only the visible floor surface with a clean, straight orthogonal grid installation of neutral medium-light to medium grey / greyscale tiles.
+- Make grout lines clearly visible, evenly spaced, straight, and consistently darker than the tiles. Keep grout physically plausible, not cartoonishly thick.
+- Prefer square tiles, but large rectangular tiles are acceptable when they produce a more stable, clean orthogonal grid in the room's natural perspective.
+- Align the two principal grout-line families to the existing floor perspective. Do not use diagonal installation, herringbone, chevron, hexagonal layouts, mosaic, staggered decorative patterns, random stone, curved grout paths, veining, decorative print, or strong texture.
+- Keep the tile surface matte or low-reflection with minimal patterning; the grout grid must remain the dominant floor signal. Do not use white or near-white tile.
+- Preserve the exact camera viewpoint, framing, image composition, room dimensions, walls, openings, wall-floor intersections, thresholds, baseboards, corners, and all existing architecture.
+- Do not move walls, add or remove openings, restage the room, or add any objects.
+"""
+
 ROOM_TYPE_HINTS = {
     "living-room": "This is a living room / lounge. It must clearly remain a living room with seating and social area, not a bedroom.",
     "family-room": "This is a family room / den. It should remain a casual, comfortable gathering space with seating, not a bedroom.",
@@ -1190,6 +1206,7 @@ class VibodeStageRunRequest(BaseModel):
     renovateRoom: bool = False
     repaintWalls: bool = False
     flooringPreset: Optional[str] = None
+    researchProfile: Optional[Literal["afc-sr1-tile-grid-scaffold/v1"]] = None
     roomType: Optional[str] = None
     stage4Mode: Optional[Stage4StyleMode] = None
     stage4Modes: Optional[List[str]] = None
@@ -3516,6 +3533,26 @@ def _collect_vibode_stage_run_missing_fields(req: VibodeStageRunRequest) -> List
     return missing_fields
 
 
+def _validate_stage2_research_scaffold_policy(req: VibodeStageRunRequest) -> None:
+    preset = (req.flooringPreset or "").strip().lower()
+    scaffold_requested = preset == TILE_GRID_SCAFFOLD_FLOORING_PRESET
+    profile_requested = req.researchProfile is not None
+    if not scaffold_requested and not profile_requested:
+        return
+    if (
+        req.stage != 2
+        or not scaffold_requested
+        or req.researchProfile != AFC_SR1_TILE_GRID_SCAFFOLD_PROFILE
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "tile_grid_scaffold is a research-only Stage 2 preset and requires "
+                f"researchProfile={AFC_SR1_TILE_GRID_SCAFFOLD_PROFILE}."
+            ),
+        )
+
+
 def _collect_vibode_remove_missing_fields(req: VibodeRemoveRequest) -> List[str]:
     missing_fields: List[str] = []
     _append_missing_nonempty_str(missing_fields, "cleanBase64", req.cleanBase64)
@@ -3990,6 +4027,7 @@ def build_stage2_surfaces_prompt_v1(
     repaint_walls: bool,
     flooring_preset: Optional[str],
     room_type: Optional[str] = None,
+    research_profile: Optional[str] = None,
 ) -> str:
     fragments = [BASE_ROOMPRINTZ_INSTRUCTIONS.strip()]
 
@@ -4024,6 +4062,11 @@ def build_stage2_surfaces_prompt_v1(
             fragments.append(FLOORING_HARDWOOD_FRAGMENT.strip())
         elif preset == "tile":
             fragments.append(FLOORING_TILE_FRAGMENT.strip())
+        elif (
+            preset == TILE_GRID_SCAFFOLD_FLOORING_PRESET
+            and research_profile == AFC_SR1_TILE_GRID_SCAFFOLD_PROFILE
+        ):
+            fragments.append(FLOORING_TILE_GRID_SCAFFOLD_FRAGMENT.strip())
 
     fragments.append(
         """
@@ -6020,6 +6063,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
         route,
         _collect_vibode_stage_run_missing_fields(req),
     )
+    _validate_stage2_research_scaffold_policy(req)
 
     model_name = resolve_model_name_for_route(route, req.modelVersion)
 
@@ -6092,6 +6136,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
             repaint_walls=req.repaintWalls,
             flooring_preset=req.flooringPreset,
             room_type=req.roomType,
+            research_profile=req.researchProfile,
         )
     elif req.stage == 3:
         eligible_skus = req.eligibleSkus or []
