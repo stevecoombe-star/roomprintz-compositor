@@ -1,0 +1,107 @@
+{
+  "policyVersion": "afc-sr1-ts2-extractor-policy/v1",
+  "referenceGrid": {
+    "decodedWidth": 1264,
+    "decodedHeight": 848
+  },
+  "negativeControls": [
+    {
+      "room": "C",
+      "label": "RAW EMPTY",
+      "imageSha256": "b7283bb606d09bc7803543bfcbca14aa5f2041cfb91c5eb590d69d167355243f",
+      "roiPolygonSourceNormalized": [[0.045, 1.0], [1.0, 0.82], [0.415, 0.616], [0.077, 0.694]]
+    },
+    {
+      "room": "D",
+      "label": "RAW EMPTY",
+      "imageSha256": "82d72e591c535f8ce5174b9771b47cd007b004817bca6ccd3170a2e4e6387e96",
+      "roiPolygonSourceNormalized": [[0.0, 0.844], [1.0, 0.876], [0.453, 0.626], [0.041, 0.716]]
+    }
+  ],
+  "cases": [
+    {
+      "room": "C",
+      "generation": "T1",
+      "imageSha256": "93c4c40764c863246cd58976c5bc242689f6dfb0e71cb952248872daac76da92",
+      "roiPolygonSourceNormalized": [[0.045, 1.0], [1.0, 0.82], [0.415, 0.616], [0.077, 0.694]],
+      "expectedStatus": "usable",
+      "floorVanishingLinePixel": [0.004509195231282803, 0.9999898335275046, -427.2113127729756],
+      "segmentCounts": {"raw": 823, "admitted": 87},
+      "families": [
+        {"supportCount": 28, "medianResidualPx": 1.4694300267944982, "p90ResidualPx": 2.6624173779097644},
+        {"supportCount": 27, "medianResidualPx": 1.0754893568541775, "p90ResidualPx": 3.1425278556526566}
+      ],
+      "stabilityMaxProbeDistancePx": 1.4396801707106306
+    },
+    {
+      "room": "C",
+      "generation": "T2",
+      "imageSha256": "66aa1803fa3cb45516ae639d0bce22eec0afa4fd89ca92e64d412901ce930056",
+      "roiPolygonSourceNormalized": [[0.045, 1.0], [1.0, 0.82], [0.415, 0.616], [0.077, 0.694]],
+      "expectedStatus": "usable",
+      "floorVanishingLinePixel": [-0.005823037684311108, 0.999983045972344, -424.94728654289406],
+      "segmentCounts": {"raw": 620, "admitted": 73},
+      "families": [
+        {"supportCount": 26, "medianResidualPx": 1.5847425833255855, "p90ResidualPx": 2.604272978216784},
+        {"supportCount": 19, "medianResidualPx": 1.4322076174307767, "p90ResidualPx": 2.906037469384159}
+      ],
+      "stabilityMaxProbeDistancePx": 0.6650865233901868
+    },
+    {
+      "room": "C",
+      "generation": "T3",
+      "imageSha256": "c81e678c1e908d901fea256f56983fcd253e6bb3dbc421c5a492aad5d056d053",
+      "roiPolygonSourceNormalized": [[0.045, 1.0], [1.0, 0.82], [0.415, 0.616], [0.077, 0.694]],
+      "expectedStatus": "usable",
+      "floorVanishingLinePixel": [0.00008001062527088676, 0.9999999967991499, -428.5950730661995],
+      "segmentCounts": {"raw": 783, "admitted": 165},
+      "families": [
+        {"supportCount": 72, "medianResidualPx": 1.6735213061729155, "p90ResidualPx": 3.3269867153003134},
+        {"supportCount": 55, "medianResidualPx": 1.6796493898618792, "p90ResidualPx": 3.424998229271819}
+      ],
+      "stabilityMaxProbeDistancePx": 0.5573649216301533
+    },
+    {
+      "room": "D",
+      "generation": "T1",
+      "imageSha256": "38bbcb5c948a8de27b47a4b832cf6f672416403dc5449946eaaeb13df39bd174",
+      "roiPolygonSourceNormalized": [[0.0, 0.844], [1.0, 0.876], [0.453, 0.626], [0.041, 0.716]],
+      "expectedStatus": "usable",
+      "floorVanishingLinePixel": [-0.004594584970122338, 0.9999894448387704, -408.3800470446939],
+      "segmentCounts": {"raw": 868, "admitted": 107},
+      "families": [
+        {"supportCount": 42, "medianResidualPx": 1.5847641805189028, "p90ResidualPx": 3.7073038816123245},
+        {"supportCount": 27, "medianResidualPx": 1.0328186087716063, "p90ResidualPx": 3.168973199876531}
+      ],
+      "stabilityMaxProbeDistancePx": 2.015297749581464
+    },
+    {
+      "room": "D",
+      "generation": "T2",
+      "imageSha256": "664a3fea09dac5baf123edba871291b1abcb67a9bac5893380c62cb7d77b66c0",
+      "roiPolygonSourceNormalized": [[0.0, 0.844], [1.0, 0.876], [0.453, 0.626], [0.041, 0.716]],
+      "expectedStatus": "usable",
+      "floorVanishingLinePixel": [-0.0025664997730578155, 0.999996706534034, -407.6648509625277],
+      "segmentCounts": {"raw": 803, "admitted": 107},
+      "families": [
+        {"supportCount": 44, "medianResidualPx": 1.4201411563566921, "p90ResidualPx": 3.139101900720408},
+        {"supportCount": 31, "medianResidualPx": 1.969679822006924, "p90ResidualPx": 3.5917236889650894}
+      ],
+      "stabilityMaxProbeDistancePx": 0.9990866170448385
+    },
+    {
+      "room": "D",
+      "generation": "T3",
+      "imageSha256": "802b0126d0714252acc2fe6f15a7b646cd90e7121900d484bf511b989c0e8558",
+      "roiPolygonSourceNormalized": [[0.0, 0.844], [1.0, 0.876], [0.453, 0.626], [0.041, 0.716]],
+      "expectedStatus": "usable",
+      "floorVanishingLinePixel": [0.01735743729146096, 0.9998493483373748, -410.56351820501436],
+      "segmentCounts": {"raw": 1003, "admitted": 118},
+      "families": [
+        {"supportCount": 42, "medianResidualPx": 1.304426877944067, "p90ResidualPx": 3.5644990666119636},
+        {"supportCount": 32, "medianResidualPx": 2.3785317577840033, "p90ResidualPx": 3.5432624827101677}
+      ],
+      "stabilityMaxProbeDistancePx": 1.8173868780268094
+    }
+  ]
+}
