@@ -18,6 +18,9 @@ from research.afc_sr1_tr2_tile_floor_reader_http import (
     POLICY_VERSION,
     RESEARCH_PROFILE,
     RESULT_SCHEMA_VERSION,
+    V2_POLICY_VERSION,
+    V2_RESEARCH_PROFILE,
+    V2_RESULT_SCHEMA_VERSION,
 )
 
 
@@ -72,6 +75,27 @@ class AfcSr1Tr2TileFloorReaderHttpTests(unittest.TestCase):
             payload = dict(self.payload)
             del payload[name]
             self.assertEqual(self.post_enabled(payload).status_code, 422, name)
+
+    def test_v2_pair_rejects_cross_pair_and_below_reference_is_bound(self):
+        cross_pair = {**self.payload, "researchProfile": V2_RESEARCH_PROFILE}
+        self.assertEqual(self.post_enabled(cross_pair).status_code, 422)
+        v2 = {
+            **self.payload,
+            "researchProfile": V2_RESEARCH_PROFILE,
+            "policyVersion": V2_POLICY_VERSION,
+            "imageBase64": base64.b64encode(encoded_png(1000, 800)).decode("ascii"),
+        }
+        response = self.post_enabled(v2)
+        self.assertEqual(response.status_code, 200)
+        receipt = response.json()
+        self.assertEqual(receipt["schemaVersion"], V2_RESULT_SCHEMA_VERSION)
+        self.assertEqual(
+            (receipt["status"], receipt["reason"]), ("rejected", "below_reference_analysis_long_edge")
+        )
+        self.assertEqual(receipt["runtimeIdentity"]["readerModuleVersion"], "afc-sr1-tile-floor-reader/v2")
+        self.assertIn("analysisIdentity", receipt)
+        self.assertEqual(receipt["analysisIdentity"]["resampler"], "identity")
+        self.assert_receipt_is_bound(receipt)
 
     def test_invalid_image_is_a_reader_rejection(self):
         payload = {**self.payload, "imageBase64": base64.b64encode(b"not an image").decode("ascii")}
@@ -170,7 +194,8 @@ class AfcSr1Tr2TileFloorReaderHttpTests(unittest.TestCase):
             self.assertNotIn(forbidden, source, forbidden)
 
     def assert_receipt_is_bound(self, receipt):
-        self.assertEqual(receipt["schemaVersion"], RESULT_SCHEMA_VERSION)
+        expected_schema = V2_RESULT_SCHEMA_VERSION if receipt["policyVersion"] == V2_POLICY_VERSION else RESULT_SCHEMA_VERSION
+        self.assertEqual(receipt["schemaVersion"], expected_schema)
         canonical = receipt["evidenceCanonicalJson"]
         self.assertEqual(
             hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
@@ -181,6 +206,8 @@ class AfcSr1Tr2TileFloorReaderHttpTests(unittest.TestCase):
         self.assertEqual(preimage["image"], receipt["imageIdentity"])
         self.assertEqual(preimage["roi"], receipt["roiIdentity"])
         self.assertEqual(preimage["runtime"], receipt["runtimeIdentity"])
+        if receipt["policyVersion"] == V2_POLICY_VERSION:
+            self.assertEqual(preimage["analysisIdentity"], receipt["analysisIdentity"])
         if receipt["status"] == "usable":
             self.assertEqual(preimage["floorVanishingLinePixel"], receipt["floorVanishingLinePixel"])
         else:

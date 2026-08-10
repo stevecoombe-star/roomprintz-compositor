@@ -25,14 +25,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from research.afc_sr1_tile_floor_reader import (
     POLICY_VERSION,
     READER_MODULE_VERSION,
+    V2_POLICY_VERSION,
+    V2_READER_MODULE_VERSION,
     read_floor_vanishing_line,
 )
 
 RESEARCH_PROFILE = "afc-sr1-tr2-tile-floor-reader/v1"
 RESULT_SCHEMA_VERSION = "afc-sr1-tr2-tile-floor-reader-result/v1"
+V2_RESEARCH_PROFILE = "afc-sr1-tr2-tile-floor-reader/v2"
+V2_RESULT_SCHEMA_VERSION = "afc-sr1-tr2-tile-floor-reader-result/v2"
 ROI_COORDINATE_SPACE = "source-normalized/v1"
-MAX_DECODED_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_BASE64_PAYLOAD_CHARS = 4 * ((MAX_DECODED_IMAGE_BYTES + 2) // 3)
+MAX_DECODED_IMAGE_BYTES_V1 = 8 * 1024 * 1024
+MAX_DECODED_IMAGE_BYTES_V2 = 32 * 1024 * 1024
+# Backward-compatible name for existing v1 tests and callers.
+MAX_DECODED_IMAGE_BYTES = MAX_DECODED_IMAGE_BYTES_V1
+MAX_BASE64_PAYLOAD_CHARS = 4 * ((MAX_DECODED_IMAGE_BYTES_V1 + 2) // 3)
 _DATA_IMAGE_PREFIX = re.compile(r"^data:image/[A-Za-z0-9.+-]+;base64,")
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 logger = logging.getLogger(__name__)
@@ -67,8 +74,12 @@ class TileFloorReaderRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    researchProfile: Literal["afc-sr1-tr2-tile-floor-reader/v1"]
-    policyVersion: Literal["afc-sr1-ts2-extractor-policy/v1"]
+    researchProfile: Literal[
+        "afc-sr1-tr2-tile-floor-reader/v1", "afc-sr1-tr2-tile-floor-reader/v2"
+    ]
+    policyVersion: Literal[
+        "afc-sr1-ts2-extractor-policy/v1", "afc-sr1-ts2-extractor-policy/v2"
+    ]
     imageBase64: str
     roi: ReaderRoiRequest
 
@@ -76,6 +87,12 @@ class TileFloorReaderRequest(BaseModel):
     def reject_empty_image(self) -> "TileFloorReaderRequest":
         if not self.imageBase64.strip():
             raise ValueError("imageBase64 must not be empty.")
+        expected_pairs = {
+            (RESEARCH_PROFILE, POLICY_VERSION),
+            (V2_RESEARCH_PROFILE, V2_POLICY_VERSION),
+        }
+        if (self.researchProfile, self.policyVersion) not in expected_pairs:
+            raise ValueError("researchProfile and policyVersion must be an exact supported pair.")
         return self
 
 
@@ -99,7 +116,7 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _decode_transport_image(image_base64: str) -> bytes:
+def _decode_transport_image(image_base64: str, max_decoded_image_bytes: int) -> bytes:
     """Accepts raw base64 or data:image/...;base64 without altering encoded bytes."""
     value = image_base64.strip()
     if value.startswith("data:"):
@@ -109,20 +126,28 @@ def _decode_transport_image(image_base64: str) -> bytes:
         payload = value[prefix.end():]
     else:
         payload = value
-    if len(payload) > MAX_BASE64_PAYLOAD_CHARS:
-        raise HTTPException(status_code=413, detail="imageBase64 exceeds the 8 MiB decoded image limit.")
+    max_base64_payload_chars = 4 * ((max_decoded_image_bytes + 2) // 3)
+    limit_mib = max_decoded_image_bytes // (1024 * 1024)
+    if len(payload) > max_base64_payload_chars:
+        raise HTTPException(
+            status_code=413, detail=f"imageBase64 exceeds the {limit_mib} MiB decoded image limit."
+        )
     try:
         decoded = base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError) as error:
         raise HTTPException(status_code=400, detail="imageBase64 is not valid base64.") from error
-    if len(decoded) > MAX_DECODED_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="imageBase64 exceeds the 8 MiB decoded image limit.")
+    if len(decoded) > max_decoded_image_bytes:
+        raise HTTPException(
+            status_code=413, detail=f"imageBase64 exceeds the {limit_mib} MiB decoded image limit."
+        )
     return decoded
 
 
-def _runtime_identity() -> dict[str, str]:
+def _runtime_identity(policy_version: str) -> dict[str, str]:
     return {
-        "readerModuleVersion": READER_MODULE_VERSION,
+        "readerModuleVersion": (
+            READER_MODULE_VERSION if policy_version == POLICY_VERSION else V2_READER_MODULE_VERSION
+        ),
         "opencvVersion": cv2.__version__,
         "numpyVersion": np.__version__,
     }
@@ -169,20 +194,31 @@ def _roi_identity(roi: ReaderRoiRequest) -> tuple[list[list[float]], dict[str, A
 def execute_tile_floor_reader(request: TileFloorReaderRequest) -> dict[str, Any]:
     """Runs TR1 once and envelopes its output without changing reader policy or pixels."""
     started = time.perf_counter()
-    image_bytes = _decode_transport_image(request.imageBase64)
+    max_decoded_image_bytes = (
+        MAX_DECODED_IMAGE_BYTES_V2
+        if request.policyVersion == V2_POLICY_VERSION
+        else MAX_DECODED_IMAGE_BYTES_V1
+    )
+    image_bytes = _decode_transport_image(request.imageBase64, max_decoded_image_bytes)
     polygon, roi_identity = _roi_identity(request.roi)
-    result = read_floor_vanishing_line(image_bytes, polygon, POLICY_VERSION)
+    result = read_floor_vanishing_line(image_bytes, polygon, request.policyVersion)
     image_identity = _image_identity(image_bytes, result)
-    runtime_identity = _runtime_identity()
+    runtime_identity = _runtime_identity(request.policyVersion)
     diagnostics = result.get("diagnostics", {})
+    is_v2 = request.policyVersion == V2_POLICY_VERSION
+    research_profile = V2_RESEARCH_PROFILE if is_v2 else RESEARCH_PROFILE
+    result_schema_version = V2_RESULT_SCHEMA_VERSION if is_v2 else RESULT_SCHEMA_VERSION
+    analysis_identity = result.get("analysisIdentity")
+    if analysis_identity is None and isinstance(diagnostics, dict):
+        analysis_identity = diagnostics.get("analysisIdentity")
     status = result.get("status")
     if status not in {"usable", "rejected"}:
         raise RuntimeError("TR1 returned an invalid status.")
 
     preimage: dict[str, Any] = {
-        "schemaVersion": RESULT_SCHEMA_VERSION,
-        "researchProfile": RESEARCH_PROFILE,
-        "policyVersion": POLICY_VERSION,
+        "schemaVersion": result_schema_version,
+        "researchProfile": research_profile,
+        "policyVersion": request.policyVersion,
         "image": image_identity,
         "roi": roi_identity,
         "runtime": runtime_identity,
@@ -190,15 +226,20 @@ def execute_tile_floor_reader(request: TileFloorReaderRequest) -> dict[str, Any]
         "diagnostics": _evidence_diagnostics(diagnostics),
     }
     response: dict[str, Any] = {
-        "schemaVersion": RESULT_SCHEMA_VERSION,
-        "researchProfile": RESEARCH_PROFILE,
-        "policyVersion": POLICY_VERSION,
+        "schemaVersion": result_schema_version,
+        "researchProfile": research_profile,
+        "policyVersion": request.policyVersion,
         "status": status,
         "imageIdentity": image_identity,
         "roiIdentity": roi_identity,
         "runtimeIdentity": runtime_identity,
         "diagnostics": diagnostics,
     }
+    if is_v2:
+        if not isinstance(analysis_identity, dict):
+            raise RuntimeError("TR1 v2 result was missing analysis identity.")
+        response["analysisIdentity"] = analysis_identity
+        preimage["analysisIdentity"] = analysis_identity
     if status == "usable":
         line = result.get("floorVanishingLinePixel")
         if not isinstance(line, dict) or not all(
@@ -225,8 +266,8 @@ def execute_tile_floor_reader(request: TileFloorReaderRequest) -> dict[str, Any]
     response["elapsedMs"] = (time.perf_counter() - started) * 1_000.0
     logger.info(
         "afc_sr1_tr2_tile_reader profile=%s policy=%s image_sha256=%s dimensions=%sx%s status=%s reason=%s elapsed_ms=%.3f",
-        RESEARCH_PROFILE,
-        POLICY_VERSION,
+        research_profile,
+        request.policyVersion,
         image_identity["sha256"],
         image_identity["decodedWidth"],
         image_identity["decodedHeight"],

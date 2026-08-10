@@ -25,13 +25,31 @@ def _sha256(path: Path) -> str:
 
 
 def _paths_by_sha(corpus_root: Path, wanted: set[str]) -> dict[str, Path]:
+    """Resolve only fixture-named C/D inputs; never scan or hash other corpus files."""
     paths: dict[str, Path] = {}
-    for path in sorted(corpus_root.rglob("*.png")):
-        digest = _sha256(path)
+    for digest in sorted(wanted):
+        candidates = [
+            *sorted((corpus_root / "room-c" / "tiles").glob(f"*{digest}.png")),
+            *sorted((corpus_root / "room-d" / "tiles").glob(f"*{digest}.png")),
+        ]
+        if len(candidates) != 1:
+            continue
+        path = candidates[0]
+        actual_digest = _sha256(path)
+        if actual_digest != digest:
+            raise RuntimeError(f"C/D tiled fixture filename digest mismatch: {path}")
+        paths[digest] = path
+    for raw_path in (
+        corpus_root / "room-c" / "raw-empty.png",
+        corpus_root / "room-d" / "raw-empty.png",
+    ):
+        if not raw_path.is_file():
+            continue
+        digest = _sha256(raw_path)
         if digest in wanted:
             if digest in paths:
-                raise RuntimeError(f"multiple corpus PNGs share fixture SHA-256 {digest}")
-            paths[digest] = path
+                raise RuntimeError(f"multiple C/D PNGs share fixture SHA-256 {digest}")
+            paths[digest] = raw_path
     missing = wanted - paths.keys()
     if missing:
         raise RuntimeError(f"missing expected corpus PNG SHA-256 values: {', '.join(sorted(missing))}")

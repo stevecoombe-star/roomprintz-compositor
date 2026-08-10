@@ -1,7 +1,13 @@
-"""Deterministic AFC-SR1 /v1 image-only floor-vanishing-line reader.
+"""Deterministic AFC-SR1 image-only floor-vanishing-line reader.
 
 This research module reads encoded pixels plus a source-normalized analysis ROI.
 It deliberately has no room-corner, endpoint, seam, or compositor-route logic.
+
+The v2 policy uses an aspect-preserving, downscale-only 1264px-long-edge
+analysis raster.  Analysis dimensions use non-negative half-up rounding
+(``floor(value + 0.5)``); the dimension corresponding to the input long edge
+is then set exactly to 1264.  The returned line is mapped from that raster
+back into the decoded-input pixel basis before canonical normalization.
 """
 
 from __future__ import annotations
@@ -16,9 +22,14 @@ import cv2
 import numpy as np
 
 READER_MODULE_VERSION = "afc-sr1-tile-floor-reader/v1"
+V2_READER_MODULE_VERSION = "afc-sr1-tile-floor-reader/v2"
 POLICY_VERSION = "afc-sr1-ts2-extractor-policy/v1"
+V2_POLICY_VERSION = "afc-sr1-ts2-extractor-policy/v2"
 REFERENCE_WIDTH = 1264
 REFERENCE_HEIGHT = 848
+REFERENCE_LONG_EDGE = 1264
+MAX_SOURCE_LONG_EDGE_V2 = 8192
+MAX_SOURCE_PIXELS_V2 = 36_000_000
 HOMOGENEOUS_EPSILON = 1e-8
 POLICY: dict[str, Any] = {
     "version": POLICY_VERSION,
@@ -41,6 +52,51 @@ POLICY: dict[str, Any] = {
     },
     "stability": {"max_floor_line_split_delta_px": 18.0},
 }
+
+
+def _analysis_dimensions(width: int, height: int) -> tuple[int, int]:
+    """Returns v2 aspect-preserving analysis dimensions with a fixed long edge."""
+    long_edge = max(width, height)
+    if long_edge < REFERENCE_LONG_EDGE:
+        raise ValueError("below_reference_analysis_long_edge")
+    if long_edge == REFERENCE_LONG_EDGE:
+        return width, height
+    scale = REFERENCE_LONG_EDGE / long_edge
+    analysis_width = int(math.floor(scale * width + 0.5))
+    analysis_height = int(math.floor(scale * height + 0.5))
+    if width >= height:
+        analysis_width = REFERENCE_LONG_EDGE
+    else:
+        analysis_height = REFERENCE_LONG_EDGE
+    return analysis_width, analysis_height
+
+
+def _analysis_identity(
+    image: np.ndarray, mode: Literal["identity", "downscale_long_edge"], input_width: int, input_height: int
+) -> dict[str, Any]:
+    """Binds the exact BGR uint8 C-order buffer passed to grayscale."""
+    contiguous = np.ascontiguousarray(image, dtype=np.uint8)
+    height, width = contiguous.shape[:2]
+    return {
+        "mode": mode,
+        "analysisWidth": int(width),
+        "analysisHeight": int(height),
+        "scaleX": float(input_width / width),
+        "scaleY": float(input_height / height),
+        "referenceLongEdge": REFERENCE_LONG_EDGE,
+        "resampler": "identity" if mode == "identity" else "opencv-inter-area/v1",
+        "pixelFormat": "bgr8",
+        "pixelBufferSha256": hashlib.sha256(contiguous.tobytes(order="C")).hexdigest(),
+    }
+
+
+def _map_analysis_line_to_input(
+    line: np.ndarray, scale_x: float, scale_y: float
+) -> np.ndarray | None:
+    """Applies H^-T for H=diag(scale_x, scale_y, 1), then canonicalizes."""
+    return _normalize_line(
+        np.asarray([line[0] / scale_x, line[1] / scale_y, line[2]], dtype=np.float64)
+    )
 
 
 @dataclass(frozen=True)
@@ -302,7 +358,7 @@ def read_floor_vanishing_line(
     policy_version: str = POLICY_VERSION,
 ) -> dict[str, Any]:
     """Returns canonical pixel-basis floor-line evidence or a fail-closed rejection."""
-    if policy_version != POLICY_VERSION:
+    if policy_version not in {POLICY_VERSION, V2_POLICY_VERSION}:
         return _rejected("unsupported_policy_version", policy_version, {})
     if not isinstance(image_bytes, bytes) or not image_bytes:
         return _rejected("invalid_input_image", policy_version, {})
@@ -317,19 +373,46 @@ def read_floor_vanishing_line(
         "analysisImage": analysis_image,
         "opencvVersion": cv2.__version__,
     }
-    if (width, height) != (REFERENCE_WIDTH, REFERENCE_HEIGHT):
+    analysis_identity: dict[str, Any] | None = None
+    extraction_image = decoded
+    if policy_version == V2_POLICY_VERSION:
+        if max(width, height) > MAX_SOURCE_LONG_EDGE_V2 or width * height > MAX_SOURCE_PIXELS_V2:
+            # This decoded-raster resource gate precedes both downscale and
+            # every CV stage.  Its identity binds the decoded BGR input.
+            analysis_identity = _analysis_identity(decoded, "identity", width, height)
+            base_diagnostics["analysisIdentity"] = analysis_identity
+            return _rejected("source_raster_too_large", policy_version, base_diagnostics)
+        if max(width, height) < REFERENCE_LONG_EDGE:
+            # Domain rejection has no detector pass.  Its identity still binds
+            # the decoded BGR raster whose size caused that fail-closed result.
+            analysis_identity = _analysis_identity(decoded, "identity", width, height)
+            base_diagnostics["analysisIdentity"] = analysis_identity
+            return _rejected("below_reference_analysis_long_edge", policy_version, base_diagnostics)
+        analysis_width, analysis_height = _analysis_dimensions(width, height)
+        if (analysis_width, analysis_height) == (width, height):
+            analysis_mode: Literal["identity", "downscale_long_edge"] = "identity"
+        else:
+            analysis_mode = "downscale_long_edge"
+            extraction_image = cv2.resize(
+                decoded, (analysis_width, analysis_height), interpolation=cv2.INTER_AREA
+            )
+        extraction_image = np.ascontiguousarray(extraction_image, dtype=np.uint8)
+        analysis_identity = _analysis_identity(extraction_image, analysis_mode, width, height)
+        base_diagnostics["analysisIdentity"] = analysis_identity
+    elif (width, height) != (REFERENCE_WIDTH, REFERENCE_HEIGHT):
         return _rejected("unsupported_analysis_grid", policy_version, base_diagnostics)
     if not _valid_roi_polygon(roi_polygon_source_normalized):
         return _rejected("invalid_roi", policy_version, base_diagnostics)
 
+    analysis_height, analysis_width = extraction_image.shape[:2]
     polygon = np.asarray(
         [
-            [round(float(x) * width), round(float(y) * height)]
+            [round(float(x) * analysis_width), round(float(y) * analysis_height)]
             for x, y in roi_polygon_source_normalized
         ],
         dtype=np.int32,
     )
-    raw_roi = np.zeros((height, width), dtype=np.uint8)
+    raw_roi = np.zeros((analysis_height, analysis_width), dtype=np.uint8)
     cv2.fillPoly(raw_roi, [polygon], 255)
     roi = cv2.erode(raw_roi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (29, 29)))
     raw_mask_pixels = int(np.count_nonzero(raw_roi))
@@ -342,7 +425,7 @@ def read_floor_vanishing_line(
     if eroded_mask_pixels == 0:
         return _rejected("impossible_eroded_roi", policy_version, base_diagnostics)
 
-    grayscale = cv2.cvtColor(decoded, cv2.COLOR_BGR2GRAY)
+    grayscale = cv2.cvtColor(extraction_image, cv2.COLOR_BGR2GRAY)
     enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(grayscale)
     detected = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(enhanced)[0]
     raw_count = 0 if detected is None else len(detected)
@@ -353,7 +436,7 @@ def read_floor_vanishing_line(
             x1, y1, x2, y2 = (float(component) for component in candidate)
             samples = [(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t) for t in np.linspace(0.0, 1.0, 9)]
             inside = [
-                0 <= round(x) < width and 0 <= round(y) < height and roi[round(y), round(x)] > 0
+                0 <= round(x) < analysis_width and 0 <= round(y) < analysis_height and roi[round(y), round(x)] > 0
                 for x, y in samples
             ]
             if sum(inside) >= 7:
@@ -394,7 +477,9 @@ def read_floor_vanishing_line(
     if len(candidates) < POLICY["consensus"]["min_support_count"] * 2:
         return _rejected("insufficient_segments", policy_version, base_diagnostics)
 
-    first, first_vp, first_diagnostics = _discover_family(candidates, width, height, seed_offset=0)
+    first, first_vp, first_diagnostics = _discover_family(
+        candidates, analysis_width, analysis_height, seed_offset=0
+    )
     base_diagnostics["firstFamily"] = first_diagnostics
     if first_vp is None:
         return _rejected("first_family_not_found", policy_version, base_diagnostics)
@@ -403,7 +488,9 @@ def read_floor_vanishing_line(
 
     first_ids = {id(segment) for segment in first}
     remaining = [segment for segment in candidates if id(segment) not in first_ids]
-    second, second_vp, second_diagnostics = _discover_family(remaining, width, height, seed_offset=1)
+    second, second_vp, second_diagnostics = _discover_family(
+        remaining, analysis_width, analysis_height, seed_offset=1
+    )
     base_diagnostics["secondFamily"] = second_diagnostics
     if second_vp is None:
         return _rejected("second_family_not_found", policy_version, base_diagnostics)
@@ -421,18 +508,28 @@ def read_floor_vanishing_line(
     if floor_line is None:
         return _rejected("degenerate_vanishing_line", policy_version, base_diagnostics)
 
-    stability = _floor_line_stability(first, second, floor_line, width, height)
+    stability = _floor_line_stability(
+        first, second, floor_line, analysis_width, analysis_height
+    )
     base_diagnostics["stability"] = stability
     if not stability["stable"]:
         return _rejected("unstable_vanishing_line", policy_version, base_diagnostics)
+    output_floor_line = floor_line
+    if analysis_identity is not None:
+        output_floor_line = _map_analysis_line_to_input(
+            floor_line, analysis_identity["scaleX"], analysis_identity["scaleY"]
+        )
+        if output_floor_line is None:
+            return _rejected("degenerate_vanishing_line", policy_version, base_diagnostics)
     return {
         "status": "usable",
         "policyVersion": policy_version,
         "analysisImage": analysis_image,
+        **({"analysisIdentity": analysis_identity} if analysis_identity is not None else {}),
         "floorVanishingLinePixel": {
-            "a": float(floor_line[0]),
-            "b": float(floor_line[1]),
-            "c": float(floor_line[2]),
+            "a": float(output_floor_line[0]),
+            "b": float(output_floor_line[1]),
+            "c": float(output_floor_line[2]),
         },
         "diagnostics": base_diagnostics,
     }
