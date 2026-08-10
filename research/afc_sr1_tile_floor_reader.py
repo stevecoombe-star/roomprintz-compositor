@@ -15,6 +15,7 @@ from typing import Any, Literal, Sequence
 import cv2
 import numpy as np
 
+READER_MODULE_VERSION = "afc-sr1-tile-floor-reader/v1"
 POLICY_VERSION = "afc-sr1-ts2-extractor-policy/v1"
 REFERENCE_WIDTH = 1264
 REFERENCE_HEIGHT = 848

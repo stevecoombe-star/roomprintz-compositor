@@ -162,6 +162,16 @@ def main() -> None:
             paths[control["imageSha256"]].read_bytes(),
             control["roiPolygonSourceNormalized"],
         )
+        if result["status"] != control["expectedStatus"]:
+            raise AssertionError(
+                f"{control['room']} {control['label']}: expected status "
+                f"{control['expectedStatus']!r}, got {result['status']!r}"
+            )
+        if result.get("reason") != control["expectedReason"]:
+            raise AssertionError(
+                f"{control['room']} {control['label']}: expected reason "
+                f"{control['expectedReason']!r}, got {result.get('reason')!r}"
+            )
         negatives.append(
             {
                 "room": control["room"],

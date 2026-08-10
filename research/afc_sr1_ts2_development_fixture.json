@@ -9,13 +9,17 @@
       "room": "C",
       "label": "RAW EMPTY",
       "imageSha256": "b7283bb606d09bc7803543bfcbca14aa5f2041cfb91c5eb590d69d167355243f",
-      "roiPolygonSourceNormalized": [[0.045, 1.0], [1.0, 0.82], [0.415, 0.616], [0.077, 0.694]]
+      "roiPolygonSourceNormalized": [[0.045, 1.0], [1.0, 0.82], [0.415, 0.616], [0.077, 0.694]],
+      "expectedStatus": "rejected",
+      "expectedReason": "near_identical_vanishing_points"
     },
     {
       "room": "D",
       "label": "RAW EMPTY",
       "imageSha256": "82d72e591c535f8ce5174b9771b47cd007b004817bca6ccd3170a2e4e6387e96",
-      "roiPolygonSourceNormalized": [[0.0, 0.844], [1.0, 0.876], [0.453, 0.626], [0.041, 0.716]]
+      "roiPolygonSourceNormalized": [[0.0, 0.844], [1.0, 0.876], [0.453, 0.626], [0.041, 0.716]],
+      "expectedStatus": "rejected",
+      "expectedReason": "near_identical_vanishing_points"
     }
   ],
   "cases": [

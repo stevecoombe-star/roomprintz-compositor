@@ -17,6 +17,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from PIL import Image, ImageChops, ImageFilter
 import requests
+from research.afc_sr1_tr2_tile_floor_reader_http import (
+    TileFloorReaderRequest,
+    execute_tile_floor_reader,
+    reader_route_enabled,
+)
 try:
     from PIL import ImageDraw
     _HAS_IMAGE_DRAW = True
@@ -5446,6 +5451,14 @@ async def read_root():
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     return HealthResponse(status="ok")
+
+
+@app.post("/api/research/afc-sr1/tile-floor-vanishing-line")
+async def afc_sr1_tr2_tile_floor_vanishing_line(req: TileFloorReaderRequest):
+    """Env-gated research transport for the image-only frozen TR1 reader."""
+    if not reader_route_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return execute_tile_floor_reader(req)
 
 
 @app.post("/api/vibode/paste-to-place/cancel")
