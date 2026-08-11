@@ -21,6 +21,9 @@ from research.afc_sr1_tr2_tile_floor_reader_http import (
     V2_POLICY_VERSION,
     V2_RESEARCH_PROFILE,
     V2_RESULT_SCHEMA_VERSION,
+    V3_POLICY_VERSION,
+    V3_RESEARCH_PROFILE,
+    V3_RESULT_SCHEMA_VERSION,
 )
 
 
@@ -96,6 +99,113 @@ class AfcSr1Tr2TileFloorReaderHttpTests(unittest.TestCase):
         self.assertIn("analysisIdentity", receipt)
         self.assertEqual(receipt["analysisIdentity"]["resampler"], "identity")
         self.assert_receipt_is_bound(receipt)
+
+    def test_v3_pair_is_exact_and_binds_projective_selection_evidence(self):
+        v3 = {**self.payload, "researchProfile": V3_RESEARCH_PROFILE, "policyVersion": V3_POLICY_VERSION}
+        self.assertEqual(self.post_enabled({**v3, "researchProfile": V2_RESEARCH_PROFILE}).status_code, 422)
+        self.assertEqual(self.post_enabled({**self.payload, "policyVersion": V3_POLICY_VERSION}).status_code, 422)
+        reader_result = {
+            "status": "usable",
+            "policyVersion": V3_POLICY_VERSION,
+            "analysisImage": {"decodedWidth": 1264, "decodedHeight": 848},
+            "analysisIdentity": {
+                "mode": "identity", "analysisWidth": 1264, "analysisHeight": 848,
+                "scaleX": 1.0, "scaleY": 1.0, "referenceLongEdge": 1264,
+                "resampler": "identity", "pixelFormat": "bgr8", "pixelBufferSha256": "a" * 64,
+            },
+            "floorVanishingLinePixel": {"a": 0.0, "b": 1.0, "c": -400.0},
+            "diagnostics": {
+                "segmentCounts": {"raw": 20, "admittedAllNineInside": 12},
+                "candidateDiscovery": {"hypothesisStrategy": "exhaustive", "finalFamilies": []},
+                "validFamilyCount": 2, "candidateUnorderedPairCount": 1, "validPairCount": 1,
+                "winningPair": {"basinSupport": 1, "families": [], "stability": {"maxSplitVsFullProbeDistancePx": 1.0}},
+            },
+        }
+        with patch("research.afc_sr1_tr2_tile_floor_reader_http.read_floor_vanishing_line_v3", return_value=reader_result):
+            receipt = self.post_enabled(v3).json()
+        self.assertEqual(receipt["schemaVersion"], V3_RESULT_SCHEMA_VERSION)
+        self.assertEqual(receipt["runtimeIdentity"]["readerModuleVersion"], "afc-sr1-tile-floor-reader/v3")
+        self.assertIn("winningPair", json.loads(receipt["evidenceCanonicalJson"])["diagnostics"])
+        self.assert_receipt_is_bound(receipt)
+
+    def test_v3_invalid_image_early_rejection_may_omit_analysis_identity(self):
+        v3 = {
+            **self.payload,
+            "researchProfile": V3_RESEARCH_PROFILE,
+            "policyVersion": V3_POLICY_VERSION,
+            "imageBase64": base64.b64encode(b"not an image").decode("ascii"),
+        }
+        receipt = self.post_enabled(v3).json()
+        self.assertEqual((receipt["status"], receipt["reason"]), ("rejected", "invalid_input_image"))
+        self.assertNotIn("analysisIdentity", receipt)
+        self.assertNotIn("analysisIdentity", json.loads(receipt["evidenceCanonicalJson"]))
+        self.assert_receipt_is_bound(receipt)
+
+    def test_v3_below_reference_and_source_too_large_rejections_bind_analysis_identity(self):
+        cases = (
+            (encoded_png(1000, 800), "below_reference_analysis_long_edge"),
+            (encoded_png(8193, 2), "source_raster_too_large"),
+        )
+        for image, reason in cases:
+            with self.subTest(reason=reason):
+                v3 = {
+                    **self.payload,
+                    "researchProfile": V3_RESEARCH_PROFILE,
+                    "policyVersion": V3_POLICY_VERSION,
+                    "imageBase64": base64.b64encode(image).decode("ascii"),
+                }
+                receipt = self.post_enabled(v3).json()
+                self.assertEqual((receipt["status"], receipt["reason"]), ("rejected", reason))
+                self.assertIn("analysisIdentity", receipt)
+                self.assertEqual(receipt["analysisIdentity"]["resampler"], "identity")
+                self.assert_receipt_is_bound(receipt)
+
+    def test_v3_rejected_receipt_with_analysis_raster_replays_deterministically(self):
+        v3 = {
+            **self.payload,
+            "researchProfile": V3_RESEARCH_PROFILE,
+            "policyVersion": V3_POLICY_VERSION,
+        }
+        first = self.post_enabled(v3).json()
+        second = self.post_enabled(v3).json()
+        self.assertEqual((first["status"], first["reason"]), ("rejected", "insufficient_segments"))
+        self.assertIn("analysisIdentity", first)
+        self.assertEqual(first["evidenceCanonicalJson"], second["evidenceCanonicalJson"])
+        self.assertEqual(first["evidenceDigest"], second["evidenceDigest"])
+        self.assert_receipt_is_bound(first)
+
+    def test_v3_unsupported_policy_and_malformed_input_fail_closed(self):
+        v3 = {
+            **self.payload,
+            "researchProfile": V3_RESEARCH_PROFILE,
+            "policyVersion": V3_POLICY_VERSION,
+        }
+        self.assertEqual(self.post_enabled({**v3, "policyVersion": "afc-sr1-ts2-extractor-policy/v4"}).status_code, 422)
+        self.assertEqual(self.post_enabled({**v3, "imageBase64": ""}).status_code, 422)
+        self.assertEqual(self.post_enabled({**v3, "unexpected": True}).status_code, 422)
+
+    def test_v3_endpoint_executes_reader_once_without_provider_authority(self):
+        v3 = {
+            **self.payload,
+            "researchProfile": V3_RESEARCH_PROFILE,
+            "policyVersion": V3_POLICY_VERSION,
+        }
+        reader_result = {
+            "status": "rejected",
+            "policyVersion": V3_POLICY_VERSION,
+            "reason": "invalid_roi",
+            "diagnostics": {
+                "analysisImage": {"decodedWidth": 1264, "decodedHeight": 848},
+            },
+        }
+        with patch(
+            "research.afc_sr1_tr2_tile_floor_reader_http.read_floor_vanishing_line_v3",
+            return_value=reader_result,
+        ) as reader:
+            response = self.post_enabled(v3)
+        self.assertEqual(response.status_code, 200)
+        reader.assert_called_once()
+        self.assertEqual(response.json()["status"], "rejected")
 
     def test_invalid_image_is_a_reader_rejection(self):
         payload = {**self.payload, "imageBase64": base64.b64encode(b"not an image").decode("ascii")}
@@ -194,7 +304,11 @@ class AfcSr1Tr2TileFloorReaderHttpTests(unittest.TestCase):
             self.assertNotIn(forbidden, source, forbidden)
 
     def assert_receipt_is_bound(self, receipt):
-        expected_schema = V2_RESULT_SCHEMA_VERSION if receipt["policyVersion"] == V2_POLICY_VERSION else RESULT_SCHEMA_VERSION
+        expected_schema = (
+            V3_RESULT_SCHEMA_VERSION if receipt["policyVersion"] == V3_POLICY_VERSION
+            else V2_RESULT_SCHEMA_VERSION if receipt["policyVersion"] == V2_POLICY_VERSION
+            else RESULT_SCHEMA_VERSION
+        )
         self.assertEqual(receipt["schemaVersion"], expected_schema)
         canonical = receipt["evidenceCanonicalJson"]
         self.assertEqual(
@@ -206,8 +320,10 @@ class AfcSr1Tr2TileFloorReaderHttpTests(unittest.TestCase):
         self.assertEqual(preimage["image"], receipt["imageIdentity"])
         self.assertEqual(preimage["roi"], receipt["roiIdentity"])
         self.assertEqual(preimage["runtime"], receipt["runtimeIdentity"])
-        if receipt["policyVersion"] == V2_POLICY_VERSION:
+        if "analysisIdentity" in receipt:
             self.assertEqual(preimage["analysisIdentity"], receipt["analysisIdentity"])
+        else:
+            self.assertNotIn("analysisIdentity", preimage)
         if receipt["status"] == "usable":
             self.assertEqual(preimage["floorVanishingLinePixel"], receipt["floorVanishingLinePixel"])
         else:
