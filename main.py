@@ -22,6 +22,11 @@ from research.afc_sr1_tr2_tile_floor_reader_http import (
     execute_tile_floor_reader,
     reader_route_enabled,
 )
+from research.afc_sr1_ts0_child_projective_placement_http import (
+    Ts0ChildPlacementRequest,
+    execute_ts0_child_placement,
+    placement_route_enabled,
+)
 try:
     from PIL import ImageDraw
     _HAS_IMAGE_DRAW = True
@@ -5459,6 +5464,14 @@ async def afc_sr1_tr2_tile_floor_vanishing_line(req: TileFloorReaderRequest):
     if not reader_route_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
     return execute_tile_floor_reader(req)
+
+
+@app.post("/api/research/afc-sr1/ts0-child-projective-placement")
+async def afc_sr1_ts0_child_projective_placement(req: Ts0ChildPlacementRequest):
+    """Env-gated transport for the frozen translation-only placement receipt."""
+    if not placement_route_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return execute_ts0_child_placement(req)
 
 
 @app.post("/api/vibode/paste-to-place/cancel")
