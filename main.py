@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from PIL import Image, ImageChops, ImageFilter
 import requests
+from research.afc_sr1_readiness import afc_sr1_readiness
 from research.afc_sr1_tr2_tile_floor_reader_http import (
     TileFloorReaderRequest,
     execute_tile_floor_reader,
@@ -5456,6 +5457,12 @@ async def read_root():
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     return HealthResponse(status="ok")
+
+
+@app.get("/api/research/afc-sr1/readiness")
+async def afc_sr1_research_readiness():
+    """Report non-secret AFC-SR1 route gate state without running science."""
+    return afc_sr1_readiness()
 
 
 @app.post("/api/research/afc-sr1/tile-floor-vanishing-line")
