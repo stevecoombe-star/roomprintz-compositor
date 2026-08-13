@@ -28,6 +28,9 @@ class AfcSr1ReadinessHttpTests(unittest.TestCase):
                 "schemaVersion": AFC_SR1_READINESS_SCHEMA_VERSION,
                 "readerEnabled": False,
                 "placementEnabled": False,
+                "ts0GeneratorReady": False,
+                "ts0GeneratorProfile": "afc-sr1-tile-grid-scaffold/v1",
+                "ts0RequestedModelId": "NBP",
             },
         )
 
@@ -39,12 +42,14 @@ class AfcSr1ReadinessHttpTests(unittest.TestCase):
                     {
                         "AFC_SR1_TR2_READER_ENABLED": value,
                         "AFC_SR1_TS0_CHILD_PLACEMENT_ENABLED": value.upper(),
+                        "GEMINI_API_KEY": "readiness-test",
                     },
                     clear=True,
                 ):
                     readiness = self.client.get(ROUTE).json()
                 self.assertTrue(readiness["readerEnabled"])
                 self.assertTrue(readiness["placementEnabled"])
+                self.assertTrue(readiness["ts0GeneratorReady"])
 
     def test_falsy_values_and_gate_states_are_independent(self):
         for value in ("", "0", "false", "no", "off", "enabled"):
@@ -54,12 +59,14 @@ class AfcSr1ReadinessHttpTests(unittest.TestCase):
                     {
                         "AFC_SR1_TR2_READER_ENABLED": value,
                         "AFC_SR1_TS0_CHILD_PLACEMENT_ENABLED": "true",
+                        "GEMINI_API_KEY": "readiness-test",
                     },
                     clear=True,
                 ):
                     readiness = self.client.get(ROUTE).json()
                 self.assertFalse(readiness["readerEnabled"])
                 self.assertTrue(readiness["placementEnabled"])
+                self.assertTrue(readiness["ts0GeneratorReady"])
 
     def test_readiness_has_no_scientific_side_effects(self):
         with (
@@ -68,6 +75,7 @@ class AfcSr1ReadinessHttpTests(unittest.TestCase):
                 {
                     "AFC_SR1_TR2_READER_ENABLED": "true",
                     "AFC_SR1_TS0_CHILD_PLACEMENT_ENABLED": "true",
+                    "GEMINI_API_KEY": "readiness-test",
                 },
                 clear=True,
             ),
