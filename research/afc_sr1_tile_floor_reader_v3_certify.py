@@ -18,8 +18,8 @@ if __package__ in (None, ""):
 
 from research.afc_sr1_tr2_tile_floor_reader_http import (
     TileFloorReaderRequest,
-    V3_POLICY_VERSION,
-    V3_RESEARCH_PROFILE,
+    V4_POLICY_VERSION,
+    V4_RESEARCH_PROFILE,
     execute_tile_floor_reader,
 )
 
@@ -106,8 +106,8 @@ def main() -> None:
     for label, (digest, roi, anchor) in ROWS.items():
         image_base64 = base64.b64encode(data[digest]).decode("ascii")
         request = TileFloorReaderRequest.model_validate({
-            "researchProfile": V3_RESEARCH_PROFILE,
-            "policyVersion": V3_POLICY_VERSION,
+            "researchProfile": V4_RESEARCH_PROFILE,
+            "policyVersion": V4_POLICY_VERSION,
             "imageBase64": image_base64,
             "roi": {"coordinateSpace": "source-normalized/v1", "polygon": roi},
         })

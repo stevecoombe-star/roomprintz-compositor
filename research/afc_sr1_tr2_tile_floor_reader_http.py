@@ -30,8 +30,8 @@ from research.afc_sr1_tile_floor_reader import (
     read_floor_vanishing_line,
 )
 from research.afc_sr1_tile_floor_reader_v3 import (
-    POLICY_VERSION as V3_POLICY_VERSION,
-    READER_MODULE_VERSION as V3_READER_MODULE_VERSION,
+    POLICY_VERSION as V4_POLICY_VERSION,
+    READER_MODULE_VERSION as V4_READER_MODULE_VERSION,
     read_floor_vanishing_line as read_floor_vanishing_line_v3,
 )
 
@@ -39,8 +39,8 @@ RESEARCH_PROFILE = "afc-sr1-tr2-tile-floor-reader/v1"
 RESULT_SCHEMA_VERSION = "afc-sr1-tr2-tile-floor-reader-result/v1"
 V2_RESEARCH_PROFILE = "afc-sr1-tr2-tile-floor-reader/v2"
 V2_RESULT_SCHEMA_VERSION = "afc-sr1-tr2-tile-floor-reader-result/v2"
-V3_RESEARCH_PROFILE = "afc-sr1-tr2-tile-floor-reader/v3"
-V3_RESULT_SCHEMA_VERSION = "afc-sr1-tr2-tile-floor-reader-result/v3"
+V4_RESEARCH_PROFILE = "afc-sr1-tr2-tile-floor-reader/v4"
+V4_RESULT_SCHEMA_VERSION = "afc-sr1-tr2-tile-floor-reader-result/v4"
 ROI_COORDINATE_SPACE = "source-normalized/v1"
 MAX_DECODED_IMAGE_BYTES_V1 = 8 * 1024 * 1024
 MAX_DECODED_IMAGE_BYTES_V2 = 32 * 1024 * 1024
@@ -83,11 +83,11 @@ class TileFloorReaderRequest(BaseModel):
 
     researchProfile: Literal[
         "afc-sr1-tr2-tile-floor-reader/v1", "afc-sr1-tr2-tile-floor-reader/v2",
-        "afc-sr1-tr2-tile-floor-reader/v3"
+        "afc-sr1-tr2-tile-floor-reader/v4"
     ]
     policyVersion: Literal[
         "afc-sr1-ts2-extractor-policy/v1", "afc-sr1-ts2-extractor-policy/v2",
-        "afc-sr1-ts2-extractor-policy/v3"
+        "afc-sr1-ts2-extractor-policy/v4"
     ]
     imageBase64: str
     roi: ReaderRoiRequest
@@ -99,7 +99,7 @@ class TileFloorReaderRequest(BaseModel):
         expected_pairs = {
             (RESEARCH_PROFILE, POLICY_VERSION),
             (V2_RESEARCH_PROFILE, V2_POLICY_VERSION),
-            (V3_RESEARCH_PROFILE, V3_POLICY_VERSION),
+            (V4_RESEARCH_PROFILE, V4_POLICY_VERSION),
         }
         if (self.researchProfile, self.policyVersion) not in expected_pairs:
             raise ValueError("researchProfile and policyVersion must be an exact supported pair.")
@@ -158,7 +158,7 @@ def _runtime_identity(policy_version: str) -> dict[str, str]:
         "readerModuleVersion": (
             READER_MODULE_VERSION if policy_version == POLICY_VERSION else
             V2_READER_MODULE_VERSION if policy_version == V2_POLICY_VERSION else
-            V3_READER_MODULE_VERSION
+            V4_READER_MODULE_VERSION
         ),
         "opencvVersion": cv2.__version__,
         "numpyVersion": np.__version__,
@@ -205,8 +205,13 @@ def _v3_evidence_diagnostics(diagnostics: Any) -> dict[str, Any]:
         "candidateDiscovery": value.get("candidateDiscovery"),
         "validFamilyCount": value.get("validFamilyCount"),
         "candidateUnorderedPairCount": value.get("candidateUnorderedPairCount"),
+        "stableProjectivelyValidPairCount": value.get("stableProjectivelyValidPairCount"),
+        "eligiblePairCount": value.get("eligiblePairCount"),
         "validPairCount": value.get("validPairCount"),
         "invalidPairs": value.get("invalidPairs"),
+        "independentDirectionEligibilityRejectedPairs": (
+            value.get("independentDirectionEligibilityRejectedPairs")
+        ),
         "validPairUniverse": value.get("validPairUniverse"),
         "finalFamilies": value.get("candidateDiscovery", {}).get("finalFamilies")
         if isinstance(value.get("candidateDiscovery"), dict) else None,
@@ -223,19 +228,19 @@ def _roi_identity(roi: ReaderRoiRequest) -> tuple[list[list[float]], dict[str, A
 def execute_tile_floor_reader(request: TileFloorReaderRequest) -> dict[str, Any]:
     """Runs TR1 once and envelopes its output without changing reader policy or pixels."""
     started = time.perf_counter()
-    max_decoded_image_bytes = MAX_DECODED_IMAGE_BYTES_V2 if request.policyVersion in {V2_POLICY_VERSION, V3_POLICY_VERSION} else MAX_DECODED_IMAGE_BYTES_V1
+    max_decoded_image_bytes = MAX_DECODED_IMAGE_BYTES_V2 if request.policyVersion in {V2_POLICY_VERSION, V4_POLICY_VERSION} else MAX_DECODED_IMAGE_BYTES_V1
     image_bytes = _decode_transport_image(request.imageBase64, max_decoded_image_bytes)
     polygon, roi_identity = _roi_identity(request.roi)
     result = (read_floor_vanishing_line_v3(image_bytes, polygon, request.policyVersion)
-              if request.policyVersion == V3_POLICY_VERSION
+              if request.policyVersion == V4_POLICY_VERSION
               else read_floor_vanishing_line(image_bytes, polygon, request.policyVersion))
     image_identity = _image_identity(image_bytes, result)
     runtime_identity = _runtime_identity(request.policyVersion)
     diagnostics = result.get("diagnostics", {})
     is_v2 = request.policyVersion == V2_POLICY_VERSION
-    is_v3 = request.policyVersion == V3_POLICY_VERSION
-    research_profile = V3_RESEARCH_PROFILE if is_v3 else V2_RESEARCH_PROFILE if is_v2 else RESEARCH_PROFILE
-    result_schema_version = V3_RESULT_SCHEMA_VERSION if is_v3 else V2_RESULT_SCHEMA_VERSION if is_v2 else RESULT_SCHEMA_VERSION
+    is_v4 = request.policyVersion == V4_POLICY_VERSION
+    research_profile = V4_RESEARCH_PROFILE if is_v4 else V2_RESEARCH_PROFILE if is_v2 else RESEARCH_PROFILE
+    result_schema_version = V4_RESULT_SCHEMA_VERSION if is_v4 else V2_RESULT_SCHEMA_VERSION if is_v2 else RESULT_SCHEMA_VERSION
     analysis_identity = result.get("analysisIdentity")
     if analysis_identity is None and isinstance(diagnostics, dict):
         analysis_identity = diagnostics.get("analysisIdentity")
@@ -251,7 +256,7 @@ def execute_tile_floor_reader(request: TileFloorReaderRequest) -> dict[str, Any]
         "roi": roi_identity,
         "runtime": runtime_identity,
         "status": status,
-        "diagnostics": _v3_evidence_diagnostics(diagnostics) if is_v3 else _evidence_diagnostics(diagnostics),
+        "diagnostics": _v3_evidence_diagnostics(diagnostics) if is_v4 else _evidence_diagnostics(diagnostics),
     }
     response: dict[str, Any] = {
         "schemaVersion": result_schema_version,
@@ -263,7 +268,7 @@ def execute_tile_floor_reader(request: TileFloorReaderRequest) -> dict[str, Any]
         "runtimeIdentity": runtime_identity,
         "diagnostics": diagnostics,
     }
-    if is_v2 or (is_v3 and isinstance(analysis_identity, dict)):
+    if is_v2 or (is_v4 and isinstance(analysis_identity, dict)):
         if not isinstance(analysis_identity, dict):
             raise RuntimeError("TR1 v2 result was missing analysis identity.")
         response["analysisIdentity"] = analysis_identity

@@ -29,12 +29,14 @@ from research.afc_sr1_tile_floor_reader import (
     _valid_roi_polygon,
 )
 
-READER_MODULE_VERSION = "afc-sr1-tile-floor-reader/v3"
-POLICY_VERSION = "afc-sr1-ts2-extractor-policy/v3"
+READER_MODULE_VERSION = "afc-sr1-tile-floor-reader/v4"
+POLICY_VERSION = "afc-sr1-ts2-extractor-policy/v4"
+FAMILY_PAIR_INDEPENDENCE_DIAGNOSTICS_VERSION = "afc-sr1-family-pair-independence-diagnostics/v1"
 RHO_INFINITY = 8.0
 TOP_K = 8
 CHORDAL_DELTA_MIN = 0.15
 DIRECTIONAL_SEPARATION_DEGREES = 15.0
+INDEPENDENT_DIRECTION_FIELD_MIN_MEDIAN_DEGREES = 10.0
 STABILITY_MAX_PX = 18.0
 Model = Literal["finite", "directional"]
 
@@ -126,6 +128,379 @@ def _family_diag(family: Family) -> dict[str, Any]:
         "medianResidualPx": float(np.median(family.residuals)),
         "p90ResidualPx": float(np.percentile(family.residuals, 90)),
         "refinement": "two_round_reselect_refit",
+    }
+
+
+def _family_support_geometry(families: Sequence[Family]) -> dict[str, Any]:
+    """Projects final-family supporter endpoints without changing V3 evidence."""
+    segments: dict[int, Segment] = {}
+    memberships: list[dict[str, Any]] = []
+    for family_index, family in enumerate(families):
+        supporter_indices = [item.detector_index for item in family.supporters]
+        assert len(supporter_indices) == len(family.supporters)
+        memberships.append({
+            "familyIndex": family_index,
+            "supporterDetectorIndices": supporter_indices,
+        })
+        for supporter in family.supporters:
+            existing = segments.setdefault(supporter.detector_index, supporter)
+            assert existing is supporter or (
+                np.array_equal(existing.p1, supporter.p1) and
+                np.array_equal(existing.p2, supporter.p2)
+            )
+    return {
+        "coordinateSpace": "analysis-pixel/v1",
+        "authority": "none",
+        "role": "observation_only",
+        "excludedFromCanonicalEvidence": True,
+        "segments": [
+            {
+                "detectorIndex": detector_index,
+                "x1": float(segment.p1[0]),
+                "y1": float(segment.p1[1]),
+                "x2": float(segment.p2[0]),
+                "y2": float(segment.p2[1]),
+            }
+            for detector_index, segment in sorted(segments.items())
+        ],
+        "families": memberships,
+    }
+
+
+def _axial_angle(segment: Segment) -> float:
+    """Returns the segment orientation in RP1, in the half-open range [0, pi)."""
+    return math.atan2(
+        float(segment.p2[1] - segment.p1[1]),
+        float(segment.p2[0] - segment.p1[0]),
+    ) % math.pi
+
+
+def _axial_summary(segments: Sequence[Segment]) -> dict[str, Any]:
+    """Unweighted double-angle descriptive statistics for observed supporters."""
+    angles = np.asarray([_axial_angle(segment) for segment in segments], dtype=np.float64)
+    if not len(angles):
+        return {
+            "supporterCount": 0,
+            "axialMeanDegrees": None,
+            "axialMedianDegrees": None,
+            "axialCircularStdDevDegrees": None,
+            "axialIqrDegrees": None,
+        }
+    cosine = float(np.cos(2.0 * angles).sum())
+    sine = float(np.sin(2.0 * angles).sum())
+    resultant = math.hypot(cosine, sine) / len(angles)
+    if not math.isfinite(resultant) or resultant <= HOMOGENEOUS_EPSILON:
+        return {
+            "supporterCount": len(angles),
+            "axialMeanDegrees": None,
+            "axialMedianDegrees": None,
+            "axialCircularStdDevDegrees": None,
+            "axialIqrDegrees": None,
+        }
+    resultant = min(1.0, resultant)
+    mean = (0.5 * math.atan2(sine, cosine)) % math.pi
+    # Express each RP1 orientation around its double-angle mean before applying
+    # ordinary robust summaries, so the 0/180 degree boundary is not a split.
+    centered = ((angles - mean + math.pi / 2.0) % math.pi) - math.pi / 2.0
+    median = (mean + float(np.median(centered))) % math.pi
+    q25, q75 = np.percentile(centered, (25, 75))
+    return {
+        "supporterCount": len(angles),
+        "axialMeanDegrees": math.degrees(mean),
+        "axialMedianDegrees": math.degrees(median),
+        "axialCircularStdDevDegrees": math.degrees(math.sqrt(-0.5 * math.log(resultant))),
+        "axialIqrDegrees": math.degrees(float(q75 - q25)),
+    }
+
+
+def _residual_summary(segments: Sequence[Segment], model: Model, vp: np.ndarray, diagonal: float) -> dict[str, Any] | None:
+    """Describes residuals using the exact V3 residual implementation."""
+    if not np.all(np.isfinite(vp)):
+        return None
+    if (model == "finite" and abs(float(vp[2])) <= HOMOGENEOUS_EPSILON) or (
+        model == "directional" and np.linalg.norm(vp[:2]) <= HOMOGENEOUS_EPSILON
+    ):
+        return None
+    try:
+        values = _residuals(segments, model, vp, diagonal)
+    except (FloatingPointError, ValueError, ZeroDivisionError):
+        return None
+    if not np.all(np.isfinite(values)):
+        return None
+    return {
+        "supporterCount": len(values),
+        "medianResidualPx": float(np.median(values)) if len(values) else None,
+        "p90ResidualPx": float(np.percentile(values, 90)) if len(values) else None,
+        "withinExistingInlierBandCount": int(
+            np.count_nonzero(values <= POLICY["consensus"]["inlier_residual_px"])
+        ),
+    }
+
+
+def _predicted_direction(segment: Segment, family: Family) -> float | None:
+    """Predicts the local undirected line orientation from an existing V3 model."""
+    try:
+        if family.model == "finite":
+            if abs(float(family.vp[2])) <= HOMOGENEOUS_EPSILON:
+                return None
+            point = family.vp / family.vp[2]
+            dx = float(point[0] - segment.midpoint[0])
+            dy = float(point[1] - segment.midpoint[1])
+        else:
+            dx, dy = float(family.vp[0]), float(family.vp[1])
+        if not math.isfinite(dx) or not math.isfinite(dy) or math.hypot(dx, dy) <= HOMOGENEOUS_EPSILON:
+            return None
+        return math.atan2(dy, dx) % math.pi
+    except (FloatingPointError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _axial_disagreement_degrees(first: float, second: float) -> float:
+    """Returns RP1 angular distance in the inclusive interval [0, 90] degrees."""
+    delta = abs((first - second) % math.pi)
+    return math.degrees(min(delta, math.pi - delta))
+
+
+def _direction_field_disagreement(
+    segments: Sequence[Segment], first: Family, second: Family
+) -> dict[str, Any] | None:
+    values: list[float] = []
+    for segment in segments:
+        first_direction = _predicted_direction(segment, first)
+        second_direction = _predicted_direction(segment, second)
+        if first_direction is None or second_direction is None:
+            return None
+        values.append(_axial_disagreement_degrees(first_direction, second_direction))
+    if not all(math.isfinite(value) and 0.0 <= value <= 90.0 for value in values):
+        return None
+    return {
+        "supporterCount": len(values),
+        "medianDegrees": float(np.median(values)) if values else None,
+        "p90Degrees": float(np.percentile(values, 90)) if values else None,
+    }
+
+
+def _cross_fit_inlier_band_count(
+    supporters: Sequence[Segment], model: Model, vp: np.ndarray, diagonal: float
+) -> int:
+    """Counts cross-fit supporters in the existing V3 consensus inlier band."""
+    values = _residuals(supporters, model, vp, diagonal)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("cross-fit residuals must be finite for a valid pair")
+    return int(np.count_nonzero(values <= POLICY["consensus"]["inlier_residual_px"]))
+
+
+def _pair_independent_direction_measurements(
+    first: Family, second: Family, diagonal: float
+) -> dict[str, Any]:
+    """Computes only the measurements consumed by the eligibility gate."""
+    first_ids = {segment.detector_index for segment in first.supporters}
+    second_ids = {segment.detector_index for segment in second.supporters}
+    first_support_count = len(first.supporters)
+    second_support_count = len(second.supporters)
+    overlap_fraction_of_smaller = (
+        len(first_ids & second_ids) / min(len(first_ids), len(second_ids))
+        if first_ids and second_ids else None
+    )
+    first_inlier_band_count = _cross_fit_inlier_band_count(
+        first.supporters, second.model, second.vp, diagonal
+    )
+    second_inlier_band_count = _cross_fit_inlier_band_count(
+        second.supporters, first.model, first.vp, diagonal
+    )
+    first_field = _direction_field_disagreement(first.supporters, first, second)
+    second_field = _direction_field_disagreement(second.supporters, first, second)
+    first_region_median_degrees = (
+        first_field["medianDegrees"] if first_field is not None else None
+    )
+    second_region_median_degrees = (
+        second_field["medianDegrees"] if second_field is not None else None
+    )
+    strong_region_median_degrees = (
+        max(first_region_median_degrees, second_region_median_degrees)
+        if isinstance(first_region_median_degrees, float)
+        and isinstance(second_region_median_degrees, float)
+        else None
+    )
+    return {
+        "overlapFractionOfSmaller": overlap_fraction_of_smaller,
+        "firstSupportCount": first_support_count,
+        "secondSupportCount": second_support_count,
+        "firstInlierBandCount": first_inlier_band_count,
+        "secondInlierBandCount": second_inlier_band_count,
+        "firstInlierBandFraction": first_inlier_band_count / first_support_count,
+        "secondInlierBandFraction": second_inlier_band_count / second_support_count,
+        "firstRegionMedianDegrees": first_region_median_degrees,
+        "secondRegionMedianDegrees": second_region_median_degrees,
+        "strongRegionMedianDegrees": strong_region_median_degrees,
+    }
+
+
+def evaluate_independent_direction_eligibility(
+    *,
+    overlap_fraction_of_smaller: float | None,
+    first_support_count: int,
+    second_support_count: int,
+    first_inlier_band_count: int,
+    second_inlier_band_count: int,
+    first_region_median_degrees: float | None,
+    second_region_median_degrees: float | None,
+) -> dict[str, Any]:
+    """Applies the frozen Boolean independent-direction eligibility contract."""
+    if first_support_count <= 0 or second_support_count <= 0:
+        raise ValueError("eligibility requires non-empty family support")
+    first_inlier_band_fraction = first_inlier_band_count / first_support_count
+    second_inlier_band_fraction = second_inlier_band_count / second_support_count
+    strong_region_median_degrees = (
+        max(first_region_median_degrees, second_region_median_degrees)
+        if isinstance(first_region_median_degrees, float)
+        and isinstance(second_region_median_degrees, float)
+        else None
+    )
+    stage_one_rejects = (
+        overlap_fraction_of_smaller is not None
+        and overlap_fraction_of_smaller >= 0.5
+        and first_inlier_band_count * 2 >= first_support_count
+        and second_inlier_band_count * 2 >= second_support_count
+    )
+    if stage_one_rejects:
+        eligible = False
+        failed_stage: int | None = 1
+        rejection_reason: str | None = "duplicate_or_interchangeable_families"
+    elif (
+        isinstance(strong_region_median_degrees, float)
+        and math.isfinite(strong_region_median_degrees)
+        and strong_region_median_degrees >= INDEPENDENT_DIRECTION_FIELD_MIN_MEDIAN_DEGREES
+    ):
+        eligible = True
+        failed_stage = None
+        rejection_reason = None
+    else:
+        eligible = False
+        failed_stage = 2
+        rejection_reason = "insufficient_direction_field_separation"
+    return {
+        "eligible": eligible,
+        "failedStage": failed_stage,
+        "rejectionReason": rejection_reason,
+        "overlapFractionOfSmaller": overlap_fraction_of_smaller,
+        "firstSupportCount": first_support_count,
+        "secondSupportCount": second_support_count,
+        "firstInlierBandCount": first_inlier_band_count,
+        "secondInlierBandCount": second_inlier_band_count,
+        "firstInlierBandFraction": first_inlier_band_fraction,
+        "secondInlierBandFraction": second_inlier_band_fraction,
+        "firstRegionMedianDegrees": first_region_median_degrees,
+        "secondRegionMedianDegrees": second_region_median_degrees,
+        "strongRegionMedianDegrees": strong_region_median_degrees,
+    }
+
+
+def _evaluate_pair_independent_direction_eligibility(
+    first: Family, second: Family, diagonal: float
+) -> dict[str, Any]:
+    """Projects science-local pair measurements into canonical eligibility evidence."""
+    measurements = _pair_independent_direction_measurements(first, second, diagonal)
+    return evaluate_independent_direction_eligibility(
+        overlap_fraction_of_smaller=measurements["overlapFractionOfSmaller"],
+        first_support_count=measurements["firstSupportCount"],
+        second_support_count=measurements["secondSupportCount"],
+        first_inlier_band_count=measurements["firstInlierBandCount"],
+        second_inlier_band_count=measurements["secondInlierBandCount"],
+        first_region_median_degrees=measurements["firstRegionMedianDegrees"],
+        second_region_median_degrees=measurements["secondRegionMedianDegrees"],
+    )
+
+
+def _family_pair_independence_diagnostics(
+    families: Sequence[Family], diagonal: float
+) -> dict[str, Any]:
+    """Projects final-family observations only; no selection path reads this."""
+    orientations = [
+        {"familyIndex": family_index, **_axial_summary(family.supporters)}
+        for family_index, family in enumerate(families)
+    ]
+    pairs: list[dict[str, Any]] = []
+    for first_index, first in enumerate(families):
+        first_by_detector = {segment.detector_index: segment for segment in first.supporters}
+        for second_index, second in enumerate(families[first_index + 1:], first_index + 1):
+            second_by_detector = {segment.detector_index: segment for segment in second.supporters}
+            first_ids = set(first_by_detector)
+            second_ids = set(second_by_detector)
+            shared_ids = first_ids & second_ids
+            union_ids = first_ids | second_ids
+            first_only_ids = first_ids - second_ids
+            second_only_ids = second_ids - first_ids
+            # Retain first-family order, then append B-only evidence, for a
+            # deterministic union midpoint set without serializing endpoints.
+            union_segments = [
+                segment for segment in first.supporters
+                if segment.detector_index in union_ids
+            ] + [
+                segment for segment in second.supporters
+                if segment.detector_index in second_only_ids
+            ]
+            shared_segments = [
+                segment for segment in first.supporters
+                if segment.detector_index in shared_ids
+            ]
+            pairs.append({
+                "familyIndices": [first_index, second_index],
+                "overlap": {
+                    "sharedSupporterCount": len(shared_ids),
+                    "unionSupporterCount": len(union_ids),
+                    "jaccard": len(shared_ids) / len(union_ids) if union_ids else None,
+                    "overlapFractionOfSmaller": (
+                        len(shared_ids) / min(len(first_ids), len(second_ids))
+                        if first_ids and second_ids else None
+                    ),
+                    "familyASupporterCount": len(first.supporters),
+                    "familyBSupporterCount": len(second.supporters),
+                },
+                "exclusiveSupport": {
+                    "sharedSupportLengthPx": float(
+                        sum(first_by_detector[index].length for index in shared_ids)
+                    ),
+                    "firstOnlySupporterCount": len(first_only_ids),
+                    "secondOnlySupporterCount": len(second_only_ids),
+                    "firstOnlySupportLengthPx": float(
+                        sum(first_by_detector[index].length for index in first_only_ids)
+                    ),
+                    "secondOnlySupportLengthPx": float(
+                        sum(second_by_detector[index].length for index in second_only_ids)
+                    ),
+                },
+                "crossFit": {
+                    "firstSupportersAgainstSecond": _residual_summary(
+                        first.supporters, second.model, second.vp, diagonal
+                    ),
+                    "secondSupportersAgainstFirst": _residual_summary(
+                        second.supporters, first.model, first.vp, diagonal
+                    ),
+                },
+                "predictedDirectionFieldDisagreement": {
+                    "onFirstSupporterMidpoints": _direction_field_disagreement(
+                        first.supporters, first, second
+                    ),
+                    "onSecondSupporterMidpoints": _direction_field_disagreement(
+                        second.supporters, first, second
+                    ),
+                    "onUnionSupporterMidpoints": _direction_field_disagreement(
+                        union_segments, first, second
+                    ),
+                    "onSharedSupporterMidpoints": _direction_field_disagreement(
+                        shared_segments, first, second
+                    ),
+                },
+            })
+    return {
+        "contractVersion": FAMILY_PAIR_INDEPENDENCE_DIAGNOSTICS_VERSION,
+        "coordinateSpace": "analysis-pixel/v1",
+        "authority": "none",
+        "role": "observation_only",
+        "excludedFromCanonicalEvidence": True,
+        "familyOrientationSummaries": orientations,
+        "pairs": pairs,
     }
 
 
@@ -298,14 +673,25 @@ def _pair_evidence(pair: dict[str, Any]) -> dict[str, Any]:
         "basinSupport": pair["basinSupport"],
         "stability": pair["stability"],
         "distinctness": pair["distinctness"],
+        "independentDirectionEligibility": pair["independentDirectionEligibility"],
     }
 
 
 def _select_pair(candidates: Sequence[Segment], width: int, height: int) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     families, discovery = _discover_families(candidates, width, height)
-    diagnostics: dict[str, Any] = {"candidateDiscovery": discovery, "validFamilyCount": len(families), "candidateUnorderedPairCount": len(families) * (len(families) - 1) // 2}
+    diagnostics: dict[str, Any] = {
+        "candidateDiscovery": discovery,
+        "familySupportGeometry": _family_support_geometry(families),
+        "familyPairIndependenceDiagnostics": _family_pair_independence_diagnostics(
+            families, math.hypot(width, height)
+        ),
+        "validFamilyCount": len(families),
+        "candidateUnorderedPairCount": len(families) * (len(families) - 1) // 2,
+    }
     pairs: list[dict[str, Any]] = []
     invalid: list[dict[str, Any]] = []
+    eligibility_rejected: list[dict[str, Any]] = []
+    stable_projectively_valid_pair_count = 0
     diagonal = math.hypot(width, height)
     for i, first in enumerate(families):
         for j, second in enumerate(families[i + 1:], i + 1):
@@ -321,12 +707,35 @@ def _select_pair(candidates: Sequence[Segment], width: int, height: int) -> tupl
             if not stability["stable"]:
                 invalid.append({"familyIndices": [i, j], "reason": stability.get("reason", "unstable_vanishing_line"), "stability": stability})
                 continue
-            pairs.append({"i": i, "j": j, "first": first, "second": second, "line": line, "stability": stability, "distinctness": detail})
+            stable_projectively_valid_pair_count += 1
+            eligibility = _evaluate_pair_independent_direction_eligibility(
+                first, second, diagonal
+            )
+            pair = {
+                "i": i,
+                "j": j,
+                "first": first,
+                "second": second,
+                "line": line,
+                "stability": stability,
+                "distinctness": detail,
+                "independentDirectionEligibility": eligibility,
+            }
+            if eligibility["eligible"]:
+                pairs.append(pair)
+            else:
+                eligibility_rejected.append({
+                    "familyIndices": [i, j],
+                    **eligibility,
+                })
     for pair in pairs:
         pair["basinSupport"] = sum(line_distance(pair["line"], other["line"], width, height) <= STABILITY_MAX_PX for other in pairs)
     diagnostics.update({
+        "stableProjectivelyValidPairCount": stable_projectively_valid_pair_count,
+        "eligiblePairCount": len(pairs),
         "validPairCount": len(pairs),
         "invalidPairs": invalid,
+        "independentDirectionEligibilityRejectedPairs": eligibility_rejected,
         "validPairUniverse": [_pair_evidence(pair) for pair in pairs],
     })
     if not pairs:
@@ -398,7 +807,12 @@ def read_floor_vanishing_line(image_bytes: bytes, roi_polygon_source_normalized:
     winner, selection = _select_pair(candidates, raster.shape[1], raster.shape[0])
     diagnostics.update(selection)
     if winner is None:
-        return {"status": "rejected", "policyVersion": policy_version, "reason": "no_stable_valid_pair", "diagnostics": diagnostics}
+        reason = (
+            "no_independent_direction_pair"
+            if selection["stableProjectivelyValidPairCount"] > 0
+            else "no_stable_valid_pair"
+        )
+        return {"status": "rejected", "policyVersion": policy_version, "reason": reason, "diagnostics": diagnostics}
     mapped = _map_analysis_line_to_input(winner["line"], diagnostics["analysisIdentity"]["scaleX"], diagnostics["analysisIdentity"]["scaleY"])
     if mapped is None:
         return {"status": "rejected", "policyVersion": policy_version, "reason": "degenerate_vanishing_line", "diagnostics": diagnostics}
