@@ -23,6 +23,10 @@ from research.afc_sr1_tr2_tile_floor_reader_http import (
     execute_tile_floor_reader,
     reader_route_enabled,
 )
+from research.afc_sr1_tiled_perspective_reader_http import (
+    TiledPerspectiveReaderRequest,
+    execute_tiled_perspective_reader,
+)
 from research.afc_sr1_ts0_child_projective_placement_http import (
     Ts0ChildPlacementRequest,
     execute_ts0_child_placement,
@@ -5471,6 +5475,17 @@ async def afc_sr1_tr2_tile_floor_vanishing_line(req: TileFloorReaderRequest):
     if not reader_route_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
     return execute_tile_floor_reader(req)
+
+
+@app.post("/api/research/afc-sr1/tiled-perspective-reader")
+async def afc_sr1_tiled_perspective_reader(req: TiledPerspectiveReaderRequest):
+    """Exact-bytes transport for the certified S1 TILED perspective reader."""
+    try:
+        return execute_tiled_perspective_reader(req)
+    except ValueError as error:
+        if str(error).startswith("tiled_perspective_transport_identity_failure:"):
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        raise
 
 
 @app.post("/api/research/afc-sr1/ts0-child-projective-placement")
