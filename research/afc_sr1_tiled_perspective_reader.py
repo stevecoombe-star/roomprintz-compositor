@@ -585,7 +585,12 @@ def _extract_s1_quad_candidates(image: np.ndarray) -> list[np.ndarray]:
         _S1_CANNY_LOW,
         _S1_CANNY_HIGH,
     )
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    closed_edges = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    contours, _ = cv2.findContours(closed_edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     minimum_area = max(16.0, width * height * _MIN_AREA_FRACTION)
     candidates: list[np.ndarray] = []
     for contour in contours:
@@ -899,9 +904,19 @@ def _fit_shared_homography(
 
 
 def _semantic_core_quad(raw_quad: np.ndarray, minimum_area: float) -> np.ndarray:
-    """Map lattice-boundary pairs to AFC NL, NR, FR, FL by boundary centroids."""
-    first_boundary = raw_quad[[0, 1]]
-    second_boundary = raw_quad[[3, 2]]
+    """Map the strongest image-depth core-boundary pair to AFC semantics."""
+    i_boundaries = (raw_quad[[0, 1]], raw_quad[[3, 2]])
+    j_boundaries = (raw_quad[[1, 2]], raw_quad[[0, 3]])
+
+    def depth_span(boundaries: tuple[np.ndarray, np.ndarray]) -> float:
+        return abs(float(np.mean(boundaries[0][:, 1])) - float(np.mean(boundaries[1][:, 1])))
+
+    # A D4-normalized lattice does not reserve either axis for image depth.
+    # Ties retain the prior i-boundary convention deterministically.
+    i_span = depth_span(i_boundaries)
+    j_span = depth_span(j_boundaries)
+    boundaries = j_boundaries if j_span > i_span + _GEOMETRY_EPSILON else i_boundaries
+    first_boundary, second_boundary = boundaries
     first_mean_y = float(np.mean(first_boundary[:, 1]))
     second_mean_y = float(np.mean(second_boundary[:, 1]))
     if abs(first_mean_y - second_mean_y) <= _GEOMETRY_EPSILON:
