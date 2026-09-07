@@ -847,7 +847,7 @@ AFC_SR1_TILE_GRID_SCAFFOLD_PROFILE = "afc-sr1-tile-grid-scaffold/v1"
 FLOORING_TILE_GRID_SCAFFOLD_FRAGMENT = """
 Research-only analytical flooring scaffold — modify flooring only:
 - Replace only the visible floor surface with a clean, straight orthogonal grid installation of neutral medium-light to medium grey / greyscale tiles.
-- Make grout lines clearly visible, evenly spaced, straight, and consistently darker than the tiles. Keep grout physically plausible, not cartoonishly thick.
+- Make grout lines clearly visible, evenly spaced, straight, and consistently darker than the tiles. Use dark charcoal or dark-neutral grout with strong contrast against the tiles across the entire visible floor. Do not use white, off-white, or low-contrast grout. Keep grout physically plausible, not cartoonishly thick.
 - Prefer square tiles, but large rectangular tiles are acceptable when they produce a more stable, clean orthogonal grid in the room's natural perspective.
 - Align the two principal grout-line families to the existing floor perspective. Do not use diagonal installation, herringbone, chevron, hexagonal layouts, mosaic, staggered decorative patterns, random stone, curved grout paths, veining, decorative print, or strong texture.
 - Keep the tile surface matte or low-reflection with minimal patterning; the grout grid must remain the dominant floor signal. Do not use white or near-white tile.

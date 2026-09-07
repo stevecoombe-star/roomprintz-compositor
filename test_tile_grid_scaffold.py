@@ -1,4 +1,7 @@
+import os
 import unittest
+
+os.environ.setdefault("GEMINI_API_KEY", "test-no-provider-call")
 
 from fastapi import HTTPException
 
@@ -55,6 +58,10 @@ class TileGridScaffoldPromptTests(unittest.TestCase):
             "grey / greyscale tiles",
             "clearly visible",
             "darker than the tiles",
+            "dark charcoal or dark-neutral grout",
+            "strong contrast",
+            "Do not use white, off-white, or low-contrast grout",
+            "not cartoonishly thick",
             "low-reflection",
             "Do not use white or near-white tile",
             "Do not use diagonal installation",
@@ -67,6 +74,7 @@ class TileGridScaffoldPromptTests(unittest.TestCase):
         ):
             self.assertIn(required, prompt)
         self.assertNotIn(FLOORING_TILE_FRAGMENT.strip(), prompt)
+        self.assertNotIn("pure black", prompt)
 
     def test_scaffold_requires_its_explicit_stage_two_research_profile(self):
         valid = VibodeStageRunRequest(
