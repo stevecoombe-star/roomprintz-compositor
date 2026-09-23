@@ -12,3 +12,6 @@ tmp/
 .env
 .env.local
 .env.*.local
+
+# Local disposable research artifacts
+/.local/

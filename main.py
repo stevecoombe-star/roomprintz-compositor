@@ -17,6 +17,21 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from PIL import Image, ImageChops, ImageFilter
 import requests
+from research.afc_sr1_readiness import afc_sr1_readiness
+from research.afc_sr1_tr2_tile_floor_reader_http import (
+    TileFloorReaderRequest,
+    execute_tile_floor_reader,
+    reader_route_enabled,
+)
+from research.afc_sr1_tiled_perspective_reader_http import (
+    TiledPerspectiveReaderRequest,
+    execute_tiled_perspective_reader,
+)
+from research.afc_sr1_ts0_child_projective_placement_http import (
+    Ts0ChildPlacementRequest,
+    execute_ts0_child_placement,
+    placement_route_enabled,
+)
 try:
     from PIL import ImageDraw
     _HAS_IMAGE_DRAW = True
@@ -824,6 +839,22 @@ Change flooring to tile:
 - Preserve thresholds and transitions to other rooms.
 """
 
+# Research-only AFC-SR1 instrument. This is deliberately not a product flooring
+# option: /api/vibode/stage-run admits it only when the matching profile is
+# supplied, and ordinary editor requests never send that profile.
+TILE_GRID_SCAFFOLD_FLOORING_PRESET = "tile_grid_scaffold"
+AFC_SR1_TILE_GRID_SCAFFOLD_PROFILE = "afc-sr1-tile-grid-scaffold/v1"
+FLOORING_TILE_GRID_SCAFFOLD_FRAGMENT = """
+Research-only analytical flooring scaffold — modify flooring only:
+- Replace only the visible floor surface with a clean, straight orthogonal grid installation of neutral medium-light to medium grey / greyscale tiles.
+- Make grout lines clearly visible, evenly spaced, straight, and consistently darker than the tiles. Use dark charcoal or dark-neutral grout with strong contrast against the tiles across the entire visible floor. Do not use white, off-white, or low-contrast grout. Keep grout physically plausible, not cartoonishly thick.
+- Prefer square tiles, but large rectangular tiles are acceptable when they produce a more stable, clean orthogonal grid in the room's natural perspective.
+- Align the two principal grout-line families to the existing floor perspective. Do not use diagonal installation, herringbone, chevron, hexagonal layouts, mosaic, staggered decorative patterns, random stone, curved grout paths, veining, decorative print, or strong texture.
+- Keep the tile surface matte or low-reflection with minimal patterning; the grout grid must remain the dominant floor signal. Do not use white or near-white tile.
+- Preserve the exact camera viewpoint, framing, image composition, room dimensions, walls, openings, wall-floor intersections, thresholds, baseboards, corners, and all existing architecture.
+- Do not move walls, add or remove openings, restage the room, or add any objects.
+"""
+
 ROOM_TYPE_HINTS = {
     "living-room": "This is a living room / lounge. It must clearly remain a living room with seating and social area, not a bedroom.",
     "family-room": "This is a family room / den. It should remain a casual, comfortable gathering space with seating, not a bedroom.",
@@ -1190,6 +1221,7 @@ class VibodeStageRunRequest(BaseModel):
     renovateRoom: bool = False
     repaintWalls: bool = False
     flooringPreset: Optional[str] = None
+    researchProfile: Optional[Literal["afc-sr1-tile-grid-scaffold/v1"]] = None
     roomType: Optional[str] = None
     stage4Mode: Optional[Stage4StyleMode] = None
     stage4Modes: Optional[List[str]] = None
@@ -1424,6 +1456,9 @@ def call_gemini_with_prompt(
             candidate = response.candidates[0]
             part = candidate.content.parts[0]
             out_bytes = part.inline_data.data
+            provider_output_mime = _sanitize_provider_image_mime(
+                getattr(part.inline_data, "mime_type", None)
+            )
         except Exception as e:
             log_event(
                 "model_call_extract_failed",
@@ -1455,7 +1490,8 @@ def call_gemini_with_prompt(
             model_name=model_name,
             modality="image+text",
             aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
-            output_png_bytes=len(out_bytes),
+            provider_output_mime=provider_output_mime,
+            output_bytes=len(out_bytes),
             latency_ms=int((time.perf_counter() - started_at) * 1000),
         )
         accounting_status = "success"
@@ -1734,10 +1770,38 @@ def _infer_image_mime_type(image_bytes: bytes, fallback_mime: Optional[str] = No
     return "application/octet-stream"
 
 
+def _sanitize_provider_image_mime(value: Any) -> Optional[str]:
+    """Keep provider MIME diagnostics bounded; byte inspection remains authoritative."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip().lower()
+    if not trimmed or len(trimmed) > 64:
+        return None
+    if not all(char.isalnum() or char in "/.+-" for char in trimmed):
+        return None
+    return trimmed
+
+
 def _convert_image_bytes_to_png(image_bytes: bytes) -> bytes:
     with Image.open(io.BytesIO(image_bytes)) as img:
         rgba = img.convert("RGBA")
         return image_to_png_bytes(rgba)
+
+
+def _normalize_stage_run_output_png(image_bytes: bytes) -> Tuple[bytes, str, bool]:
+    """
+    Enforce the stage-run response contract: returned data-URL bytes are PNG.
+    The detected byte format, not the provider MIME declaration, is authority.
+    """
+    provider_output_mime = _infer_image_mime_type(image_bytes)
+    conversion_occurred = False
+    if provider_output_mime != "image/png":
+        image_bytes = _convert_image_bytes_to_png(image_bytes)
+        conversion_occurred = True
+    normalized_output_mime = _infer_image_mime_type(image_bytes)
+    if normalized_output_mime != "image/png":
+        raise RuntimeError("Stage-run output could not be normalized to PNG.")
+    return image_bytes, provider_output_mime, conversion_occurred
 
 
 def _has_transparency(png_bytes: bytes) -> bool:
@@ -3484,6 +3548,26 @@ def _collect_vibode_stage_run_missing_fields(req: VibodeStageRunRequest) -> List
     return missing_fields
 
 
+def _validate_stage2_research_scaffold_policy(req: VibodeStageRunRequest) -> None:
+    preset = (req.flooringPreset or "").strip().lower()
+    scaffold_requested = preset == TILE_GRID_SCAFFOLD_FLOORING_PRESET
+    profile_requested = req.researchProfile is not None
+    if not scaffold_requested and not profile_requested:
+        return
+    if (
+        req.stage != 2
+        or not scaffold_requested
+        or req.researchProfile != AFC_SR1_TILE_GRID_SCAFFOLD_PROFILE
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "tile_grid_scaffold is a research-only Stage 2 preset and requires "
+                f"researchProfile={AFC_SR1_TILE_GRID_SCAFFOLD_PROFILE}."
+            ),
+        )
+
+
 def _collect_vibode_remove_missing_fields(req: VibodeRemoveRequest) -> List[str]:
     missing_fields: List[str] = []
     _append_missing_nonempty_str(missing_fields, "cleanBase64", req.cleanBase64)
@@ -3958,6 +4042,7 @@ def build_stage2_surfaces_prompt_v1(
     repaint_walls: bool,
     flooring_preset: Optional[str],
     room_type: Optional[str] = None,
+    research_profile: Optional[str] = None,
 ) -> str:
     fragments = [BASE_ROOMPRINTZ_INSTRUCTIONS.strip()]
 
@@ -3992,6 +4077,11 @@ def build_stage2_surfaces_prompt_v1(
             fragments.append(FLOORING_HARDWOOD_FRAGMENT.strip())
         elif preset == "tile":
             fragments.append(FLOORING_TILE_FRAGMENT.strip())
+        elif (
+            preset == TILE_GRID_SCAFFOLD_FLOORING_PRESET
+            and research_profile == AFC_SR1_TILE_GRID_SCAFFOLD_PROFILE
+        ):
+            fragments.append(FLOORING_TILE_GRID_SCAFFOLD_FRAGMENT.strip())
 
     fragments.append(
         """
@@ -5259,6 +5349,9 @@ def call_gemini_multimodal(
             candidate = response.candidates[0]
             part = candidate.content.parts[0]
             out_bytes = part.inline_data.data
+            provider_output_mime = _sanitize_provider_image_mime(
+                getattr(part.inline_data, "mime_type", None)
+            )
         except Exception as e:
             candidates = getattr(response, "candidates", None)
             candidate_count = len(candidates) if isinstance(candidates, list) else 0
@@ -5323,7 +5416,8 @@ def call_gemini_multimodal(
             modality="multimodal",
             aspect_ratio=aspect_ratio if aspect_ratio else "(omitted)",
             sku_count=len(sku_png_bytes_list),
-            output_png_bytes=len(out_bytes),
+            provider_output_mime=provider_output_mime,
+            output_bytes=len(out_bytes),
             latency_ms=int((time.perf_counter() - started_at) * 1000),
         )
         accounting_status = "success"
@@ -5367,6 +5461,39 @@ async def read_root():
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     return HealthResponse(status="ok")
+
+
+@app.get("/api/research/afc-sr1/readiness")
+async def afc_sr1_research_readiness():
+    """Report non-secret AFC-SR1 route gate state without running science."""
+    return afc_sr1_readiness()
+
+
+@app.post("/api/research/afc-sr1/tile-floor-vanishing-line")
+async def afc_sr1_tr2_tile_floor_vanishing_line(req: TileFloorReaderRequest):
+    """Env-gated research transport for the image-only frozen TR1 reader."""
+    if not reader_route_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return execute_tile_floor_reader(req)
+
+
+@app.post("/api/research/afc-sr1/tiled-perspective-reader")
+async def afc_sr1_tiled_perspective_reader(req: TiledPerspectiveReaderRequest):
+    """Exact-bytes transport for the certified S1 TILED perspective reader."""
+    try:
+        return execute_tiled_perspective_reader(req)
+    except ValueError as error:
+        if str(error).startswith("tiled_perspective_transport_identity_failure:"):
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        raise
+
+
+@app.post("/api/research/afc-sr1/ts0-child-projective-placement")
+async def afc_sr1_ts0_child_projective_placement(req: Ts0ChildPlacementRequest):
+    """Env-gated transport for the frozen translation-only placement receipt."""
+    if not placement_route_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return execute_ts0_child_placement(req)
 
 
 @app.post("/api/vibode/paste-to-place/cancel")
@@ -5984,6 +6111,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
         route,
         _collect_vibode_stage_run_missing_fields(req),
     )
+    _validate_stage2_research_scaffold_policy(req)
 
     model_name = resolve_model_name_for_route(route, req.modelVersion)
 
@@ -6056,6 +6184,7 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
             repaint_walls=req.repaintWalls,
             flooring_preset=req.flooringPreset,
             room_type=req.roomType,
+            research_profile=req.researchProfile,
         )
     elif req.stage == 3:
         eligible_skus = req.eligibleSkus or []
@@ -6290,6 +6419,25 @@ async def vibode_stage_run(req: VibodeStageRunRequest, http_request: Request):
 
     if not out_bytes:
         raise HTTPException(status_code=500, detail="Stage run returned empty image")
+
+    try:
+        out_bytes, pre_normalization_mime, conversion_occurred = _normalize_stage_run_output_png(
+            out_bytes
+        )
+    except Exception as e:
+        log_event(
+            "vibode_stage_run_output_normalize_failed",
+            error_type=type(e).__name__,
+        )
+        raise HTTPException(status_code=500, detail="Stage run returned invalid image bytes")
+
+    log_event(
+        "vibode_stage_run_output_normalized",
+        pre_normalization_mime=pre_normalization_mime,
+        normalized_output_mime="image/png",
+        conversion_occurred=conversion_occurred,
+        output_png_bytes=len(out_bytes),
+    )
 
     early_exit = _ensure_paste_to_place_job_active(paste_to_place_control, route, "final_response")
     if early_exit:
