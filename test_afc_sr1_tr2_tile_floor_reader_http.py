@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 from fastapi.testclient import TestClient
 
+from compositor_test_auth import auth_headers
 from main import app
 from research.afc_sr1_tr2_tile_floor_reader_http import (
     MAX_BASE64_PAYLOAD_CHARS,
@@ -38,7 +39,7 @@ def encoded_png(width: int, height: int) -> bytes:
 
 class AfcSr1Tr2TileFloorReaderHttpTests(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(app)
+        self.client = TestClient(app, headers=auth_headers())
         self.image = encoded_png(1264, 848)
         self.payload = {
             "researchProfile": RESEARCH_PROFILE,

@@ -10,6 +10,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-no-provider-call")
 
 from fastapi.testclient import TestClient
 
+from compositor_test_auth import auth_headers
 from main import app
 from research.afc_sr1_tiled_perspective_reader import TiledPerspectiveLatticeFailure
 from research.afc_sr1_tiled_perspective_reader_http import RESEARCH_PROFILE
@@ -41,7 +42,7 @@ def payload(encoded: bytes) -> dict[str, object]:
 class AfcSr1TiledPerspectiveReaderHttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.client = TestClient(app)
+        cls.client = TestClient(app, headers=auth_headers())
         root = Path(__file__).resolve().parent / "research/fixtures"
         cls.fixture_bytes = tuple((root / fixture).read_bytes() for fixture in FIXTURES)
 

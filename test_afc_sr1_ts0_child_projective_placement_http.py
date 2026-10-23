@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 from fastapi.testclient import TestClient
 
+from compositor_test_auth import auth_headers
 from main import app
 from research.afc_sr1_ts0_child_projective_placement import (
     MASK_ROLE,
@@ -36,7 +37,7 @@ def identity(data: bytes) -> dict:
 
 class AfcSr1Ts0ChildPlacementHttpTests(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(app)
+        self.client = TestClient(app, headers=auth_headers())
         self.parent = encoded_png(0)
         self.child = encoded_png(1)
         self.payload = {

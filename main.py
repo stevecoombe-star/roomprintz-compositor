@@ -45,6 +45,7 @@ except Exception:
 
 from google import genai
 from google.genai import types
+from compositor_server_auth import compositor_server_auth_middleware
 
 # ---------- GEMINI / NANO BANANA CONFIG ----------
 
@@ -1084,6 +1085,12 @@ async def add_request_id_middleware(request: Request, call_next):
         _ATTEMPT_ID_CTX.reset(attempt_token)
         _OPERATION_ID_CTX.reset(operation_token)
         _REQUEST_ID_CTX.reset(token)
+
+
+@app.middleware("http")
+async def require_compositor_server_auth(request: Request, call_next):
+    # Registered after the request-id middleware so this gate runs first.
+    return await compositor_server_auth_middleware(request, call_next)
 
 
 # ---------- MODELS ----------

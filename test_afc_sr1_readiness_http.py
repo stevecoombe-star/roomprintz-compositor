@@ -6,6 +6,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-no-provider-call")
 
 from fastapi.testclient import TestClient
 
+from compositor_test_auth import auth_headers, with_auth_env
 from main import app
 from research.afc_sr1_readiness import AFC_SR1_READINESS_SCHEMA_VERSION
 
@@ -16,10 +17,10 @@ TRUTHY_VALUES = ("1", "true", "yes", "on")
 
 class AfcSr1ReadinessHttpTests(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(app)
+        self.client = TestClient(app, headers=auth_headers())
 
     def test_missing_gates_report_false(self):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, with_auth_env(), clear=True):
             response = self.client.get(ROUTE)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -39,11 +40,13 @@ class AfcSr1ReadinessHttpTests(unittest.TestCase):
             with self.subTest(value=value):
                 with patch.dict(
                     os.environ,
-                    {
-                        "AFC_SR1_TR2_READER_ENABLED": value,
-                        "AFC_SR1_TS0_CHILD_PLACEMENT_ENABLED": value.upper(),
-                        "GEMINI_API_KEY": "readiness-test",
-                    },
+                    with_auth_env(
+                        {
+                            "AFC_SR1_TR2_READER_ENABLED": value,
+                            "AFC_SR1_TS0_CHILD_PLACEMENT_ENABLED": value.upper(),
+                            "GEMINI_API_KEY": "readiness-test",
+                        }
+                    ),
                     clear=True,
                 ):
                     readiness = self.client.get(ROUTE).json()
@@ -56,11 +59,13 @@ class AfcSr1ReadinessHttpTests(unittest.TestCase):
             with self.subTest(value=value):
                 with patch.dict(
                     os.environ,
-                    {
-                        "AFC_SR1_TR2_READER_ENABLED": value,
-                        "AFC_SR1_TS0_CHILD_PLACEMENT_ENABLED": "true",
-                        "GEMINI_API_KEY": "readiness-test",
-                    },
+                    with_auth_env(
+                        {
+                            "AFC_SR1_TR2_READER_ENABLED": value,
+                            "AFC_SR1_TS0_CHILD_PLACEMENT_ENABLED": "true",
+                            "GEMINI_API_KEY": "readiness-test",
+                        }
+                    ),
                     clear=True,
                 ):
                     readiness = self.client.get(ROUTE).json()
@@ -72,11 +77,13 @@ class AfcSr1ReadinessHttpTests(unittest.TestCase):
         with (
             patch.dict(
                 os.environ,
-                {
-                    "AFC_SR1_TR2_READER_ENABLED": "true",
-                    "AFC_SR1_TS0_CHILD_PLACEMENT_ENABLED": "true",
-                    "GEMINI_API_KEY": "readiness-test",
-                },
+                with_auth_env(
+                    {
+                        "AFC_SR1_TR2_READER_ENABLED": "true",
+                        "AFC_SR1_TS0_CHILD_PLACEMENT_ENABLED": "true",
+                        "GEMINI_API_KEY": "readiness-test",
+                    }
+                ),
                 clear=True,
             ),
             patch("main.execute_tile_floor_reader") as reader,
